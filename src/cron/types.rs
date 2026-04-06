@@ -150,6 +150,10 @@ pub struct CronJob {
     /// When `None`, all tools are available (backward compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// Whether to recall and inject memory context before this job runs.
+    /// Defaults to true for backwards compatibility.
+    #[serde(default = "default_true")]
+    pub uses_memory: bool,
     /// How the job was created: `"imperative"` (CLI/API) or `"declarative"` (config).
     #[serde(default = "default_source")]
     pub source: String,
@@ -183,6 +187,7 @@ pub struct CronJobPatch {
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
+    pub uses_memory: Option<bool>,
 }
 
 #[cfg(test)]
@@ -240,5 +245,32 @@ mod tests {
     fn job_type_try_from_rejects_invalid_values() {
         assert!(JobType::try_from("").is_err());
         assert!(JobType::try_from("unknown").is_err());
+    }
+
+    #[test]
+    fn uses_memory_defaults_to_true_when_field_absent() {
+        // Deserialize a minimal CronJob JSON without the `uses_memory` field.
+        let json = serde_json::json!({
+            "id": "test",
+            "expression": "* * * * *",
+            "schedule": {"kind": "cron", "expr": "* * * * *"},
+            "command": "echo hi",
+            "prompt": null,
+            "name": null,
+            "job_type": "shell",
+            "session_target": "isolated",
+            "model": null,
+            "enabled": true,
+            "delivery": {"mode": "none", "best_effort": true},
+            "delete_after_run": false,
+            "source": "imperative",
+            "created_at": "2024-01-01T00:00:00Z",
+            "next_run": "2024-01-01T00:01:00Z",
+            "last_run": null,
+            "last_status": null,
+            "last_output": null
+        });
+        let job: CronJob = serde_json::from_value(json).unwrap();
+        assert!(job.uses_memory, "uses_memory should default to true");
     }
 }

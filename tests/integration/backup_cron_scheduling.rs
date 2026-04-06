@@ -35,6 +35,7 @@ fn backup_cron_job_synced_when_schedule_set() {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -87,6 +88,7 @@ fn backup_cron_job_removed_when_schedule_cleared() {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -128,6 +130,7 @@ fn backup_cron_job_schedule_updated() {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -155,6 +158,7 @@ fn backup_cron_job_schedule_updated() {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -236,6 +240,7 @@ fn backup_cron_job_command_is_backup_create() {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -267,6 +272,7 @@ fn backup_cron_job_type_is_shell() {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -298,6 +304,7 @@ fn backup_cron_job_source_is_declarative() {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };

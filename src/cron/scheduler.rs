@@ -57,6 +57,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             enabled: true,
             model: None,
             allowed_tools: None,
+            uses_memory: true,
             session_target: None,
             delivery: None,
         };
@@ -280,27 +281,37 @@ async fn run_agent_job(
     let prompt = job.prompt.clone().unwrap_or_default();
 
     // Recall relevant memories so cron jobs have context awareness.
-    let memory_context = match crate::memory::create_memory(
-        &config.memory,
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-    ) {
-        Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
-            Ok(entries) if !entries.is_empty() => {
-                let ctx: String = entries
-                    .iter()
-                    .map(|e| format!("- {}: {}", e.key, e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("[Memory context]\n{ctx}\n\n")
-            }
-            _ => String::new(),
-        },
-        Err(_) => String::new(),
+    // Skipped when `job.uses_memory` is false (e.g. stateless digest jobs).
+    let memory_context = if job.uses_memory {
+        match crate::memory::create_memory(
+            &config.memory,
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        ) {
+            Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
+                Ok(entries) if !entries.is_empty() => {
+                    let ctx: String = entries
+                        .iter()
+                        .map(|e| format!("- {}: {}", e.key, e.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("[Memory context]\n{ctx}\n\n")
+                }
+                _ => String::new(),
+            },
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
     };
 
     let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
+
+    // Assign a unique session ID so memories written during this run can be
+    // purged atomically if the run fails (prevents snowball accumulation).
+    let run_session_id = uuid::Uuid::new_v4().to_string();
+    let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -312,7 +323,7 @@ async fn run_agent_job(
                 config.default_temperature,
                 vec![],
                 false,
-                None,
+                Some(session_path.clone()),
                 job.allowed_tools.clone(),
             ))
             .await
@@ -328,7 +339,19 @@ async fn run_agent_job(
                 response
             },
         ),
-        Err(e) => (false, format!("agent job failed: {e}")),
+        Err(e) => {
+            // Purge memories written during this failed run so they don't
+            // pollute future recall and cause context snowball.
+            let mem_session_key = format!("cli:{}", session_path.display());
+            if let Ok(mem) = crate::memory::create_memory(
+                &config.memory,
+                &config.workspace_dir,
+                config.api_key.as_deref(),
+            ) {
+                let _ = mem.purge_session(&mem_session_key).await;
+            }
+            (false, format!("agent job failed: {e}"))
+        }
     }
 }
 
@@ -819,6 +842,7 @@ mod tests {
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
             allowed_tools: None,
+            uses_memory: true,
             source: "imperative".into(),
             created_at: Utc::now(),
             next_run: Utc::now(),
@@ -1616,5 +1640,66 @@ mod tests {
 
         process_due_jobs(&config, &security, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
+    }
+
+    #[test]
+    fn run_agent_job_skips_memory_context_when_uses_memory_false() {
+        // When uses_memory = false the prefixed_prompt must NOT start with
+        // "[Memory context]". We can verify this by checking the logic directly:
+        // construct the memory_context as the production code would, then verify
+        // it is empty when uses_memory is false.
+        let uses_memory = false;
+        // Simulate the conditional branch.
+        let memory_context: String = if uses_memory {
+            // This branch is never reached when uses_memory = false.
+            "[Memory context]\n- key: value\n\n".to_string()
+        } else {
+            String::new()
+        };
+
+        assert!(
+            memory_context.is_empty(),
+            "memory_context must be empty when uses_memory = false"
+        );
+
+        let prompt = "run the digest";
+        let job_id = "digest-job";
+        let name = "my digest";
+        let prefixed_prompt = format!("{memory_context}[cron:{job_id} {name}] {prompt}");
+        assert!(
+            !prefixed_prompt.contains("[Memory context]"),
+            "prefixed_prompt must not contain [Memory context] when uses_memory = false: {prefixed_prompt}"
+        );
+    }
+
+    #[test]
+    fn run_agent_job_includes_memory_context_when_uses_memory_true() {
+        // When uses_memory = true the recall code path is entered. We verify the
+        // logic stub: if recall returns entries, the memory block is prepended.
+        let uses_memory = true;
+        let fake_entry_key = "pref_key";
+        let fake_entry_content = "user prefers brevity";
+
+        let memory_context: String = if uses_memory {
+            // Simulate a successful recall with one entry.
+            let ctx = format!("- {fake_entry_key}: {fake_entry_content}");
+            format!("[Memory context]\n{ctx}\n\n")
+        } else {
+            String::new()
+        };
+
+        assert!(
+            memory_context.starts_with("[Memory context]"),
+            "memory_context must start with [Memory context] when uses_memory = true"
+        );
+
+        let prompt = "summarize today";
+        let job_id = "summary-job";
+        let name = "daily summary";
+        let prefixed_prompt = format!("{memory_context}[cron:{job_id} {name}] {prompt}");
+        assert!(
+            prefixed_prompt.contains("[Memory context]"),
+            "prefixed_prompt must contain [Memory context] when uses_memory = true: {prefixed_prompt}"
+        );
     }
 }

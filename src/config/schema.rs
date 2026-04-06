@@ -5888,6 +5888,10 @@ pub struct CronJobDecl {
     /// Allowlist of tool names for agent jobs.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Whether to recall and inject memory context before this agent job runs.
+    /// Defaults to true.
+    #[serde(default = "default_true")]
+    pub uses_memory: bool,
     /// Session target: `"isolated"` (default) or `"main"`.
     #[serde(default)]
     pub session_target: Option<String>,
