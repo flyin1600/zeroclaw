@@ -2,6 +2,7 @@
 //! but are needed by the config schema. Moved here to break circular dependencies.
 
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
+#[cfg(feature = "schema-export")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -10,7 +11,8 @@ use zeroclaw_macros::Configurable;
 // ── Agent config types ──────────────────────────────────────────
 
 /// How deeply the model should reason for a given message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     Off,
@@ -41,7 +43,8 @@ impl ThinkingLevel {
 }
 
 /// Configuration for thinking/reasoning level control.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.thinking"]
 pub struct ThinkingConfig {
     #[serde(default)]
@@ -66,7 +69,8 @@ fn default_collapse() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.history-pruning"]
 pub struct HistoryPrunerConfig {
     #[serde(default)]
@@ -94,7 +98,8 @@ fn default_cost_optimized_hint() -> String {
     "cost-optimized".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.auto-classify"]
 pub struct AutoClassifyConfig {
     #[serde(default)]
@@ -125,7 +130,8 @@ fn default_eval_max_retries() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.eval"]
 pub struct EvalConfig {
     #[serde(default)]
@@ -177,7 +183,8 @@ fn default_tool_result_retrim_chars() -> usize {
     2_000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent.context-compression"]
 pub struct ContextCompressionConfig {
     #[serde(default = "default_cc_enabled")]
@@ -234,7 +241,8 @@ fn default_browser_task_timeout() -> u64 {
     120
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "browser-delegate"]
 pub struct BrowserDelegateConfig {
     #[serde(default)]
@@ -282,7 +290,8 @@ fn default_success_boost() -> f64 {
     0.01
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "trust"]
 pub struct TrustConfig {
     #[serde(default = "default_initial_score")]
@@ -333,7 +342,8 @@ fn default_max_attachment_bytes() -> usize {
     25 * 1024 * 1024
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, zeroclaw_macros::Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
 pub struct EmailConfig {
     pub imap_host: String,
@@ -393,7 +403,8 @@ fn default_label_filter() -> Vec<String> {
     vec!["INBOX".into()]
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, zeroclaw_macros::Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.gmail"]
 pub struct GmailPushConfig {
     #[serde(default)]
@@ -436,8 +447,9 @@ impl Default for GmailPushConfig {
 }
 
 #[derive(
-    Debug, Clone, Default, Serialize, Deserialize, JsonSchema, zeroclaw_macros::Configurable,
+    Debug, Clone, Default, Serialize, Deserialize, zeroclaw_macros::Configurable,
 )]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.clawdtalk"]
 pub struct ClawdTalkConfig {
     #[serde(default)]
@@ -463,7 +475,8 @@ impl ChannelConfig for ClawdTalkConfig {
 }
 
 /// Which telephony provider to use.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceProvider {
     #[default]
@@ -493,7 +506,8 @@ fn default_max_call_duration() -> u64 {
     3600
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.voice-call"]
 pub struct VoiceCallConfig {
     #[serde(default)]

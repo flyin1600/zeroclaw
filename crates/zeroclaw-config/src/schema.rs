@@ -4,6 +4,7 @@ use crate::autonomy::AutonomyLevel;
 use crate::domain_matcher::DomainMatcher;
 use anyhow::{Context, Result};
 use directories::UserDirs;
+#[cfg(feature = "schema-export")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -65,7 +66,8 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 /// Top-level ZeroClaw configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct Config {
     /// Workspace directory - computed from home, not serialized
     #[serde(skip)]
@@ -508,7 +510,8 @@ pub struct Config {
 /// When enabled, each client engagement gets an isolated workspace with
 /// separate memory, audit, secrets, and tool restrictions.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "workspace"]
 pub struct WorkspaceConfig {
     /// Enable workspace isolation. Default: false.
@@ -553,7 +556,8 @@ impl Default for WorkspaceConfig {
 }
 
 /// Named provider profile definition compatible with Codex app-server style config.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelProviderConfig {
     /// Optional provider type/name override (e.g. "openai", "openai-codex", or custom profile id).
     #[serde(default)]
@@ -597,7 +601,8 @@ pub struct ModelProviderConfig {
 // ── Delegate Tool Configuration ─────────────────────────────────
 
 /// Global delegate tool configuration for default timeout values.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate"]
 pub struct DelegateToolConfig {
     /// Default timeout in seconds for non-agentic sub-agent provider calls.
@@ -624,7 +629,8 @@ impl Default for DelegateToolConfig {
 // ── Delegate Agents ──────────────────────────────────────────────
 
 /// Configuration for a delegate sub-agent used by the `delegate` tool.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "delegate-agent"]
 pub struct DelegateAgentConfig {
     /// Provider name (e.g. "ollama", "openrouter", "anthropic")
@@ -683,7 +689,8 @@ fn default_delegate_agentic_timeout_secs() -> u64 {
 // ── Swarms ──────────────────────────────────────────────────────
 
 /// Orchestration strategy for a swarm of agents.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SwarmStrategy {
     /// Run agents sequentially; each agent's output feeds into the next.
@@ -695,7 +702,8 @@ pub enum SwarmStrategy {
 }
 
 /// Configuration for a swarm of coordinated agents.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SwarmConfig {
     /// Ordered list of agent names (must reference keys in `agents`).
     pub agents: Vec<String>,
@@ -796,7 +804,8 @@ fn default_max_tool_iterations() -> usize {
 // ── Hardware Config (wizard-driven) ─────────────────────────────
 
 /// Hardware transport mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum HardwareTransport {
     #[default]
     None,
@@ -817,7 +826,8 @@ impl std::fmt::Display for HardwareTransport {
 }
 
 /// Wizard-driven hardware configuration for physical world interaction.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hardware"]
 pub struct HardwareConfig {
     /// Whether hardware access is enabled
@@ -898,7 +908,8 @@ fn default_google_stt_language_code() -> String {
 ///
 /// The top-level `api_url`, `model`, and `api_key` fields remain for backward
 /// compatibility with existing Groq-based configurations.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription"]
 pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
@@ -980,7 +991,8 @@ impl Default for TranscriptionConfig {
 // ── MCP ─────────────────────────────────────────────────────────
 
 /// Transport type for MCP server connections.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
     /// Spawn a local process and communicate over stdin/stdout.
@@ -993,7 +1005,8 @@ pub enum McpTransport {
 }
 
 /// Configuration for a single external MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct McpServerConfig {
     /// Display name used as a tool prefix (`<server>__<tool>`).
     pub name: String,
@@ -1021,7 +1034,8 @@ pub struct McpServerConfig {
 }
 
 /// External MCP client configuration (`[mcp]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "mcp"]
 pub struct McpConfig {
     /// Enable MCP tool loading.
@@ -1053,7 +1067,8 @@ impl Default for McpConfig {
 }
 
 /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "verifiable-intent"]
 pub struct VerifiableIntentConfig {
     /// Enable VI credential verification on commerce tool calls (default: false).
@@ -1086,7 +1101,8 @@ impl Default for VerifiableIntentConfig {
 ///
 /// When enabled, external processes/devices can connect via WebSocket
 /// at `/ws/nodes` and advertise their capabilities at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "nodes"]
 pub struct NodesConfig {
     /// Enable dynamic node discovery endpoint.
@@ -1165,7 +1181,8 @@ fn default_piper_tts_api_url() -> String {
 }
 
 /// Text-to-Speech configuration (`[tts]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts"]
 pub struct TtsConfig {
     /// Enable TTS synthesis.
@@ -1223,7 +1240,8 @@ impl Default for TtsConfig {
 }
 
 /// OpenAI TTS provider configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts.openai"]
 pub struct OpenAiTtsConfig {
     /// API key for OpenAI TTS.
@@ -1239,7 +1257,8 @@ pub struct OpenAiTtsConfig {
 }
 
 /// ElevenLabs TTS provider configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts.elevenlabs"]
 pub struct ElevenLabsTtsConfig {
     /// API key for ElevenLabs.
@@ -1258,7 +1277,8 @@ pub struct ElevenLabsTtsConfig {
 }
 
 /// Google Cloud TTS provider configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts.google"]
 pub struct GoogleTtsConfig {
     /// API key for Google Cloud TTS.
@@ -1271,7 +1291,8 @@ pub struct GoogleTtsConfig {
 }
 
 /// Edge TTS provider configuration (free, subprocess-based).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts.edge"]
 pub struct EdgeTtsConfig {
     /// Path to the `edge-tts` binary (default `"edge-tts"`).
@@ -1288,7 +1309,8 @@ impl Default for EdgeTtsConfig {
 }
 
 /// Piper TTS provider configuration (local GPU-accelerated, OpenAI-compatible endpoint).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tts.piper"]
 pub struct PiperTtsConfig {
     /// Base URL for the Piper TTS HTTP server (e.g. `"http://127.0.0.1:5000/v1/audio/speech"`).
@@ -1305,7 +1327,8 @@ impl Default for PiperTtsConfig {
 }
 
 /// Determines when a `ToolFilterGroup` is active.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolFilterGroupMode {
     /// Tools in this group are always included in every turn.
@@ -1335,7 +1358,8 @@ pub enum ToolFilterGroupMode {
 /// tools = ["mcp_browser_*"]
 /// keywords = ["browse", "website", "url", "search"]
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ToolFilterGroup {
     /// Activation mode: `"always"` or `"dynamic"`.
     #[serde(default)]
@@ -1353,7 +1377,8 @@ pub struct ToolFilterGroup {
 }
 
 /// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.openai"]
 pub struct OpenAiSttConfig {
     /// OpenAI API key for Whisper transcription.
@@ -1366,7 +1391,8 @@ pub struct OpenAiSttConfig {
 }
 
 /// Deepgram STT provider configuration (`[transcription.deepgram]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.deepgram"]
 pub struct DeepgramSttConfig {
     /// Deepgram API key.
@@ -1379,7 +1405,8 @@ pub struct DeepgramSttConfig {
 }
 
 /// AssemblyAI STT provider configuration (`[transcription.assemblyai]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.assemblyai"]
 pub struct AssemblyAiSttConfig {
     /// AssemblyAI API key.
@@ -1389,7 +1416,8 @@ pub struct AssemblyAiSttConfig {
 }
 
 /// Google Cloud Speech-to-Text provider configuration (`[transcription.google]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.google"]
 pub struct GoogleSttConfig {
     /// Google Cloud API key.
@@ -1404,7 +1432,8 @@ pub struct GoogleSttConfig {
 /// Local/self-hosted Whisper-compatible STT endpoint (`[transcription.local_whisper]`).
 ///
 /// Configures a self-hosted STT endpoint. Can be on localhost, a private network host, or any reachable URL.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.local-whisper"]
 pub struct LocalWhisperConfig {
     /// HTTP or HTTPS endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
@@ -1435,7 +1464,8 @@ fn default_local_whisper_timeout_secs() -> u64 {
 }
 
 /// Agent orchestration configuration (`[agent]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "agent"]
 pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
@@ -1579,7 +1609,8 @@ impl Default for AgentConfig {
 /// All fields are optional and default to values that preserve existing
 /// behavior. When set, they extend — not replace — the existing timeout
 /// and loop-detection subsystems.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "pacing"]
 pub struct PacingConfig {
     /// Per-step timeout in seconds: the maximum time allowed for a single
@@ -1652,7 +1683,8 @@ impl Default for PacingConfig {
 }
 
 /// Skills loading configuration (`[skills]` section).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
     /// Inline full skill instructions and tool metadata into the system prompt.
@@ -1671,7 +1703,8 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
 }
 
 /// Skills loading configuration (`[skills]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills"]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
@@ -1701,7 +1734,8 @@ pub struct SkillsConfig {
 }
 
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills.skill-creation"]
 #[serde(default)]
 pub struct SkillCreationConfig {
@@ -1727,7 +1761,8 @@ impl Default for SkillCreationConfig {
 }
 
 /// Skill self-improvement configuration (`[skills.auto_improve]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills.skill-improvement"]
 pub struct SkillImprovementConfig {
     /// Enable automatic skill improvement after successful skill usage.
@@ -1754,7 +1789,8 @@ impl Default for SkillImprovementConfig {
 }
 
 /// Pipeline tool configuration (`[pipeline]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "pipeline"]
 pub struct PipelineConfig {
     /// Enable the `execute_pipeline` meta-tool.
@@ -1786,7 +1822,8 @@ impl Default for PipelineConfig {
 }
 
 /// Multimodal (image) handling configuration (`[multimodal]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "multimodal"]
 pub struct MultimodalConfig {
     /// Maximum number of image attachments accepted per request.
@@ -1846,7 +1883,8 @@ impl Default for MultimodalConfig {
 /// pre-processed before reaching the agent: audio is transcribed, images are
 /// annotated, and videos are summarised.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "media-pipeline"]
 pub struct MediaPipelineConfig {
     /// Master toggle for the media pipeline (default: false).
@@ -1882,7 +1920,8 @@ impl Default for MediaPipelineConfig {
 /// Identity format configuration (`[identity]` section).
 ///
 /// Supports `"openclaw"` (default) or `"aieos"` identity documents.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "identity"]
 pub struct IdentityConfig {
     /// Identity format: "openclaw" (default) or "aieos"
@@ -1913,7 +1952,8 @@ impl Default for IdentityConfig {
 // ── Cost tracking and budget enforcement ───────────────────────────
 
 /// Cost tracking and budget enforcement configuration (`[cost]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cost"]
 pub struct CostConfig {
     /// Enable cost tracking (default: true)
@@ -1947,7 +1987,8 @@ pub struct CostConfig {
 }
 
 /// Configuration for cost enforcement behavior when budget limits are reached.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cost.enforcement"]
 pub struct CostEnforcementConfig {
     /// Enforcement mode: "warn", "block", or "route_down".
@@ -1980,7 +2021,8 @@ impl Default for CostEnforcementConfig {
 }
 
 /// Per-model pricing entry (USD per 1M tokens).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelPricing {
     /// Input price per 1M tokens
     #[serde(default)]
@@ -2102,7 +2144,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 /// Peripheral board integration configuration (`[peripherals]` section).
 ///
 /// Boards become agent tools when enabled.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "peripherals"]
 pub struct PeripheralsConfig {
     /// Enable peripheral support (boards become agent tools)
@@ -2118,7 +2161,8 @@ pub struct PeripheralsConfig {
 }
 
 /// Configuration for a single peripheral board (e.g. STM32, RPi GPIO).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct PeripheralBoardConfig {
     /// Board type: "nucleo-f401re", "rpi-gpio", "esp32", etc.
     pub board: String,
@@ -2157,7 +2201,8 @@ impl Default for PeripheralBoardConfig {
 /// Gateway server configuration (`[gateway]` section).
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct GatewayConfig {
@@ -2288,7 +2333,8 @@ impl Default for GatewayConfig {
 }
 
 /// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.pairing-dashboard"]
 pub struct PairingDashboardConfig {
     /// Length of pairing codes (default: 8)
@@ -2337,7 +2383,8 @@ impl Default for PairingDashboardConfig {
 }
 
 /// TLS configuration for the gateway server (`[gateway.tls]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.tls"]
 pub struct GatewayTlsConfig {
     /// Enable TLS for the gateway (default: false).
@@ -2354,7 +2401,8 @@ pub struct GatewayTlsConfig {
 }
 
 /// Client certificate authentication (mTLS) configuration (`[gateway.tls.client_auth]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.tls.client-auth"]
 pub struct GatewayClientAuthConfig {
     /// Enable client certificate verification (default: false).
@@ -2384,7 +2432,8 @@ impl Default for GatewayClientAuthConfig {
 }
 
 /// Secure transport configuration for inter-node communication (`[node_transport]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "node-transport"]
 pub struct NodeTransportConfig {
     /// Enable the secure transport layer.
@@ -2450,7 +2499,8 @@ impl Default for NodeTransportConfig {
 /// Composio managed OAuth tools integration (`[composio]` section).
 ///
 /// Provides access to 1000+ OAuth-connected tools via the Composio platform.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "composio"]
 pub struct ComposioConfig {
     /// Enable Composio integration for 1000+ OAuth tools
@@ -2485,7 +2535,8 @@ impl Default for ComposioConfig {
 ///
 /// Provides access to Outlook mail, Teams messages, Calendar events,
 /// OneDrive files, and SharePoint search.
-#[derive(Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "ms365"]
 pub struct Microsoft365Config {
     /// Enable Microsoft 365 integration
@@ -2556,7 +2607,8 @@ impl Default for Microsoft365Config {
 // ── Secrets (encrypted credential store) ────────────────────────
 
 /// Secrets encryption configuration (`[secrets]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "secrets"]
 pub struct SecretsConfig {
     /// Enable encryption for API keys and tokens in config.toml
@@ -2575,7 +2627,8 @@ impl Default for SecretsConfig {
 /// Computer-use sidecar configuration (`[browser.computer_use]` section).
 ///
 /// Delegates OS-level mouse, keyboard, and screenshot actions to a local sidecar.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "browser.computer-use"]
 pub struct BrowserComputerUseConfig {
     /// Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot)
@@ -2627,7 +2680,8 @@ impl Default for BrowserComputerUseConfig {
 /// Browser automation configuration (`[browser]` section).
 ///
 /// Controls the `browser_open` tool and browser automation backends.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "browser"]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
@@ -2691,7 +2745,8 @@ impl Default for BrowserConfig {
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts, which is the default). If `allowed_domains` is empty, all
 /// requests are rejected.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "http-request"]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
@@ -2740,7 +2795,8 @@ fn default_http_timeout_secs() -> u64 {
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts). `blocked_domains` takes priority over `allowed_domains`.
 /// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web-fetch"]
 pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
@@ -2768,7 +2824,8 @@ pub struct WebFetchConfig {
 }
 
 /// Firecrawl fallback mode: scrape a single page or crawl linked pages.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum FirecrawlMode {
     #[default]
@@ -2784,7 +2841,8 @@ pub enum FirecrawlMode {
 /// When enabled, if the standard web fetch fails (HTTP error, empty body, or
 /// body shorter than 100 characters suggesting a JS-only page), the tool
 /// falls back to the Firecrawl API for stealth content extraction.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web-fetch.firecrawl"]
 pub struct FirecrawlConfig {
     /// Enable Firecrawl fallback
@@ -2854,7 +2912,8 @@ impl Default for WebFetchConfig {
 /// summarised. The summary is prepended to the message before the agent
 /// processes it, giving the LLM context about linked pages without an
 /// explicit tool call.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "link-enricher"]
 pub struct LinkEnricherConfig {
     /// Enable the link enricher pipeline stage (default: false)
@@ -2892,7 +2951,8 @@ impl Default for LinkEnricherConfig {
 ///
 /// Uses text-based browsers (lynx, links, w3m) to render web pages as plain
 /// text. Designed for headless/SSH environments without graphical browsers.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "text-browser"]
 pub struct TextBrowserConfig {
     /// Enable `text_browser` tool
@@ -2927,7 +2987,8 @@ impl Default for TextBrowserConfig {
 /// Controls the behaviour of the `shell` execution tool. The main
 /// tunable is `timeout_secs` — the maximum wall-clock time a single
 /// shell command may run before it is killed.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "shell-tool"]
 pub struct ShellToolConfig {
     /// Maximum shell command execution time in seconds (default: 60).
@@ -2950,7 +3011,8 @@ impl Default for ShellToolConfig {
 // ── Web search ───────────────────────────────────────────────────
 
 /// Web search tool configuration (`[web_search]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web-search"]
 pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
@@ -3002,7 +3064,8 @@ impl Default for WebSearchConfig {
 // ── Project Intelligence ────────────────────────────────────────
 
 /// Project delivery intelligence configuration (`[project_intel]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "project-intel"]
 pub struct ProjectIntelConfig {
     /// Enable the project_intel tool. Default: false.
@@ -3061,7 +3124,8 @@ impl Default for ProjectIntelConfig {
 // ── Backup ──────────────────────────────────────────────────────
 
 /// Backup tool configuration (`[backup]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "backup"]
 pub struct BackupConfig {
     /// Enable the `backup` tool.
@@ -3125,7 +3189,8 @@ impl Default for BackupConfig {
 // ── Data Retention ──────────────────────────────────────────────
 
 /// Data retention and purge configuration (`[data_retention]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "data-retention"]
 pub struct DataRetentionConfig {
     /// Enable the `data_management` tool.
@@ -3209,7 +3274,8 @@ pub const DEFAULT_GWS_SERVICES: &[&str] = &[
 /// To revert, remove the `[google_workspace]` section from the config file (or
 /// set `enabled = false`). No data migration is required; the tool simply stops
 /// being registered.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct GoogleWorkspaceAllowedOperation {
     /// Google Workspace service ID (for example `gmail` or `drive`).
     pub service: String,
@@ -3250,7 +3316,8 @@ pub struct GoogleWorkspaceAllowedOperation {
 /// To revert, remove the `[google_workspace]` section from the config file (or
 /// set `enabled = false`). No data migration is required; the tool simply stops
 /// being registered.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "google-workspace"]
 pub struct GoogleWorkspaceConfig {
     /// Enable the `google_workspace` tool. Default: `false`.
@@ -3329,7 +3396,8 @@ impl Default for GoogleWorkspaceConfig {
 
 /// Knowledge graph configuration for capturing and reusing expertise.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "knowledge"]
 pub struct KnowledgeConfig {
     /// Enable the knowledge graph tool. Default: false.
@@ -3379,7 +3447,8 @@ impl Default for KnowledgeConfig {
 ///
 /// When enabled, the `linkedin` tool is registered in the agent tool surface.
 /// Requires `LINKEDIN_*` credentials in the workspace `.env` file.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "linkedin"]
 pub struct LinkedInConfig {
     /// Enable the LinkedIn tool.
@@ -3417,7 +3486,8 @@ fn default_linkedin_api_version() -> String {
 }
 
 /// Plugin system configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins"]
 pub struct PluginsConfig {
     /// Enable the plugin system (default: false)
@@ -3444,7 +3514,8 @@ pub struct PluginsConfig {
 /// In `strict` mode, only plugins signed by a trusted publisher key are loaded.
 /// In `permissive` mode, unsigned or untrusted plugins produce warnings but are
 /// still loaded. In `disabled` mode (the default), no signature checking occurs.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.security"]
 pub struct PluginSecurityConfig {
     /// Signature enforcement mode: "disabled", "permissive", or "strict".
@@ -3492,7 +3563,8 @@ impl Default for PluginsConfig {
 ///
 /// The agent reads this via the `linkedin get_content_strategy` action to know
 /// what feeds to check, which repos to highlight, and how to write posts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "linkedin.content"]
 pub struct LinkedInContentConfig {
     /// RSS feed URLs to monitor for topic inspiration (titles only).
@@ -3521,7 +3593,8 @@ pub struct LinkedInContentConfig {
 }
 
 /// Image generation configuration for LinkedIn posts (`[linkedin.image]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "linkedin.image"]
 pub struct LinkedInImageConfig {
     /// Enable image generation for posts.
@@ -3599,7 +3672,8 @@ impl Default for LinkedInImageConfig {
 }
 
 /// Stability AI image generation settings (`[linkedin.image.stability]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "linkedin.image.stability"]
 pub struct ImageProviderStabilityConfig {
     /// Environment variable name holding the API key.
@@ -3627,7 +3701,8 @@ impl Default for ImageProviderStabilityConfig {
 }
 
 /// Google Imagen (Vertex AI) settings (`[linkedin.image.imagen]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "linkedin.image.imagen"]
 pub struct ImageProviderImagenConfig {
     /// Environment variable name holding the API key.
@@ -3662,7 +3737,8 @@ impl Default for ImageProviderImagenConfig {
 }
 
 /// OpenAI DALL-E settings (`[linkedin.image.dalle]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "linkedin.image.dalle"]
 pub struct ImageProviderDalleConfig {
     /// Environment variable name holding the OpenAI API key.
@@ -3697,7 +3773,8 @@ impl Default for ImageProviderDalleConfig {
 }
 
 /// Flux (fal.ai) image generation settings (`[linkedin.image.flux]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "linkedin.image.flux"]
 pub struct ImageProviderFluxConfig {
     /// Environment variable name holding the fal.ai API key.
@@ -3731,7 +3808,8 @@ impl Default for ImageProviderFluxConfig {
 /// When enabled, registers an `image_gen` tool that generates images via
 /// fal.ai's synchronous API (Flux / Nano Banana models) and saves them
 /// to the workspace `images/` directory.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "image-gen"]
 pub struct ImageGenConfig {
     /// Enable the standalone image generation tool. Default: false.
@@ -3772,7 +3850,8 @@ impl Default for ImageGenConfig {
 /// Delegates coding tasks to the `claude -p` CLI. Authentication uses the
 /// binary's own OAuth session (Max subscription) by default — no API key
 /// needed unless `env_passthrough` includes `ANTHROPIC_API_KEY`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "claude-code"]
 pub struct ClaudeCodeConfig {
     /// Enable the `claude_code` tool
@@ -3827,7 +3906,8 @@ impl Default for ClaudeCodeConfig {
 /// Spawns Claude Code in a tmux session with HTTP hooks that POST tool
 /// execution events back to ZeroClaw's gateway, updating a Slack message
 /// in-place with progress plus an SSH handoff link.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "claude-code-runner"]
 pub struct ClaudeCodeRunnerConfig {
     /// Enable the `claude_code_runner` tool
@@ -3870,7 +3950,8 @@ impl Default for ClaudeCodeRunnerConfig {
 /// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `OPENAI_API_KEY`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "codex-cli"]
 pub struct CodexCliConfig {
     /// Enable the `codex_cli` tool
@@ -3913,7 +3994,8 @@ impl Default for CodexCliConfig {
 /// Delegates coding tasks to the `gemini -p` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `GOOGLE_API_KEY`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gemini-cli"]
 pub struct GeminiCliConfig {
     /// Enable the `gemini_cli` tool
@@ -3956,7 +4038,8 @@ impl Default for GeminiCliConfig {
 /// Delegates coding tasks to the `opencode run` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes provider-specific keys.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "opencode-cli"]
 pub struct OpenCodeCliConfig {
     /// Enable the `opencode_cli` tool
@@ -3995,7 +4078,8 @@ impl Default for OpenCodeCliConfig {
 // ── Proxy ───────────────────────────────────────────────────────
 
 /// Proxy application scope — determines which outbound traffic uses the proxy.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyScope {
     /// Use system environment proxy variables only.
@@ -4008,7 +4092,8 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]
 pub struct ProxyConfig {
     /// Enable proxy support for selected scope.
@@ -4949,7 +5034,8 @@ fn parse_proxy_enabled(raw: &str) -> Option<bool> {
 // ── Memory ───────────────────────────────────────────────────
 
 /// Persistent storage configuration (`[storage]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage"]
 pub struct StorageConfig {
     /// Storage provider settings (e.g. sqlite, postgres).
@@ -4959,7 +5045,8 @@ pub struct StorageConfig {
 }
 
 /// Wrapper for the storage provider configuration section.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage.provider"]
 pub struct StorageProviderSection {
     /// Storage provider backend settings.
@@ -4969,7 +5056,8 @@ pub struct StorageProviderSection {
 }
 
 /// Storage provider backend configuration for remote storage backends.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "storage.provider"]
 pub struct StorageProviderConfig {
     /// Storage engine key (e.g. "sqlite", "qdrant").
@@ -5026,7 +5114,8 @@ impl Default for StorageProviderConfig {
 /// and memory snapshot/hydration.
 /// Configuration for Qdrant vector database backend (`[memory.qdrant]`).
 /// Used when `[memory].backend = "qdrant"`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory.qdrant"]
 pub struct QdrantConfig {
     /// Qdrant server URL (e.g. "http://localhost:6333").
@@ -5058,7 +5147,8 @@ impl Default for QdrantConfig {
 }
 
 /// Search strategy for memory recall.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
     /// Pure keyword search (FTS5 BM25)
@@ -5070,7 +5160,8 @@ pub enum SearchMode {
     Hybrid,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -5200,7 +5291,8 @@ pub struct MemoryConfig {
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "memory.policy"]
 pub struct MemoryPolicyConfig {
     /// Maximum entries per namespace (0 = unlimited).
@@ -5326,7 +5418,8 @@ impl Default for MemoryConfig {
 // ── Observability ─────────────────────────────────────────────────
 
 /// Observability backend configuration (`[observability]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "observability"]
 pub struct ObservabilityConfig {
     /// "none" | "log" | "verbose" | "prometheus" | "otel"
@@ -5381,7 +5474,8 @@ fn default_runtime_trace_max_entries() -> usize {
 
 // ── Hooks ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hooks"]
 pub struct HooksConfig {
     /// Enable lifecycle hook execution.
@@ -5403,7 +5497,8 @@ impl Default for HooksConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hooks.builtin"]
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
@@ -5422,7 +5517,8 @@ pub struct BuiltinHooksConfig {
 /// Sends an HTTP POST with a JSON body to an external endpoint each time
 /// a tool call matches one of the configured patterns. Useful for
 /// centralised audit logging, SIEM ingestion, or compliance pipelines.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hooks.builtin.webhook-audit"]
 pub struct WebhookAuditConfig {
     /// Enable the webhook-audit hook. Default: `false`.
@@ -5470,7 +5566,8 @@ impl Default for WebhookAuditConfig {
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
 /// risk approval gates, and per-policy budgets.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "autonomy"]
 #[serde(default)]
 pub struct AutonomyConfig {
@@ -5636,7 +5733,8 @@ impl Default for AutonomyConfig {
 // ── Runtime ──────────────────────────────────────────────────────
 
 /// Runtime adapter configuration (`[runtime]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "runtime"]
 pub struct RuntimeConfig {
     /// Runtime kind (`native` | `docker`).
@@ -5660,7 +5758,8 @@ pub struct RuntimeConfig {
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "runtime.docker"]
 pub struct DockerRuntimeConfig {
     /// Runtime image used to execute shell commands.
@@ -5742,7 +5841,8 @@ impl Default for RuntimeConfig {
 /// Reliability and supervision configuration (`[reliability]` section).
 ///
 /// Controls provider retries, fallback chains, API key rotation, and channel restart backoff.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "reliability"]
 pub struct ReliabilityConfig {
     /// Retries per provider before failing over.
@@ -5819,7 +5919,8 @@ impl Default for ReliabilityConfig {
 // ── Scheduler ────────────────────────────────────────────────────
 
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "scheduler"]
 pub struct SchedulerConfig {
     /// Enable the built-in scheduler loop.
@@ -5872,7 +5973,8 @@ impl Default for SchedulerConfig {
 /// ```
 ///
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
@@ -5899,7 +6001,8 @@ pub struct ModelRouteConfig {
 /// [memory]
 /// embedding_model = "hint:semantic"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
     pub hint: String,
@@ -5919,7 +6022,8 @@ pub struct EmbeddingRouteConfig {
 
 /// Automatic query classification — classifies user messages by keyword/pattern
 /// and routes to the appropriate model hint. Disabled by default.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "query-classification"]
 pub struct QueryClassificationConfig {
     /// Enable automatic query classification. Default: `false`.
@@ -5931,7 +6035,8 @@ pub struct QueryClassificationConfig {
 }
 
 /// A single classification rule mapping message patterns to a model hint.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ClassificationRule {
     /// Must match a `[[model_routes]]` hint value.
     pub hint: String,
@@ -5955,7 +6060,8 @@ pub struct ClassificationRule {
 // ── Heartbeat ────────────────────────────────────────────────────
 
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "heartbeat"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HeartbeatConfig {
@@ -6068,7 +6174,8 @@ impl Default for HeartbeatConfig {
 // ── Cron ────────────────────────────────────────────────────────
 
 /// Cron job configuration (`[cron]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cron"]
 pub struct CronConfig {
     /// Enable the cron subsystem. Default: `true`.
@@ -6098,7 +6205,8 @@ pub struct CronConfig {
 }
 
 /// A declarative cron job definition for the `[[cron.jobs]]` config array.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct CronJobDecl {
     /// Stable identifier used for merge semantics across syncs.
     pub id: String,
@@ -6134,7 +6242,8 @@ pub struct CronJobDecl {
 }
 
 /// Schedule variant for declarative cron jobs.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum CronScheduleDecl {
     /// Classic cron expression.
@@ -6150,7 +6259,8 @@ pub enum CronScheduleDecl {
 }
 
 /// Delivery configuration for declarative cron jobs.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DeliveryConfigDecl {
     /// Delivery mode: `"none"` or `"announce"`.
     #[serde(default = "default_delivery_mode")]
@@ -6194,7 +6304,8 @@ impl Default for CronConfig {
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
 ///
 /// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, `"custom"`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel"]
 pub struct TunnelConfig {
     /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, or `"custom"`. Default: `"none"`.
@@ -6245,7 +6356,8 @@ impl Default for TunnelConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.cloudflare"]
 pub struct CloudflareTunnelConfig {
     /// Cloudflare Tunnel token (from Zero Trust dashboard)
@@ -6254,7 +6366,8 @@ pub struct CloudflareTunnelConfig {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.tailscale"]
 pub struct TailscaleTunnelConfig {
     /// Use Tailscale Funnel (public internet) vs Serve (tailnet only)
@@ -6265,7 +6378,8 @@ pub struct TailscaleTunnelConfig {
     pub hostname: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.ngrok"]
 pub struct NgrokTunnelConfig {
     /// ngrok auth token
@@ -6284,7 +6398,8 @@ pub struct NgrokTunnelConfig {
 /// the `[tunnel.openvpn]` block) cleanly reverts to no-tunnel mode.
 ///
 /// Defaults: `connect_timeout_secs = 30`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.openvpn"]
 pub struct OpenVpnTunnelConfig {
     /// Path to `.ovpn` configuration file (must not be empty).
@@ -6320,7 +6435,8 @@ impl Default for OpenVpnTunnelConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.pinggy"]
 pub struct PinggyTunnelConfig {
     /// Pinggy access token (optional — free tier works without one).
@@ -6332,7 +6448,8 @@ pub struct PinggyTunnelConfig {
     pub region: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "tunnel.custom"]
 pub struct CustomTunnelConfig {
     /// Command template to start the tunnel. Use {port} and {host} placeholders.
@@ -6371,7 +6488,8 @@ impl<T: ChannelConfig> crate::traits::ConfigHandle for ConfigWrapper<T> {
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
 /// setting it to `Some(...)` enables that channel.
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels"]
 pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
@@ -6706,7 +6824,8 @@ impl Default for ChannelsConfig {
 }
 
 /// Streaming mode for channels that support progressive message updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum StreamMode {
     /// No streaming -- send the complete response as a single message (default).
@@ -6732,7 +6851,8 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 }
 
 /// Telegram bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.telegram"]
 pub struct TelegramConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -6778,7 +6898,8 @@ impl ChannelConfig for TelegramConfig {
 }
 
 /// Discord bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.discord"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct DiscordConfig {
@@ -6838,7 +6959,8 @@ impl ChannelConfig for DiscordConfig {
 }
 
 /// Discord history channel — logs ALL messages to discord.db and forwards @mentions to the agent.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.discord-history"]
 pub struct DiscordHistoryConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -6876,7 +6998,8 @@ impl ChannelConfig for DiscordHistoryConfig {
 }
 
 /// Slack bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.slack"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SlackConfig {
@@ -6947,7 +7070,8 @@ impl ChannelConfig for SlackConfig {
 }
 
 /// Mattermost bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mattermost"]
 pub struct MattermostConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -6994,7 +7118,8 @@ impl ChannelConfig for MattermostConfig {
 ///
 /// Receives messages via HTTP POST and sends replies to a configurable outbound URL.
 /// This is the "universal adapter" for any system that supports webhooks.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.webhook"]
 pub struct WebhookConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7029,7 +7154,8 @@ impl ChannelConfig for WebhookConfig {
 }
 
 /// iMessage channel configuration (macOS only).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.imessage"]
 pub struct IMessageConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7049,7 +7175,8 @@ impl ChannelConfig for IMessageConfig {
 }
 
 /// Matrix channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.matrix"]
 pub struct MatrixConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7104,7 +7231,8 @@ impl ChannelConfig for MatrixConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.signal"]
 pub struct SignalConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7150,7 +7278,8 @@ impl ChannelConfig for SignalConfig {
 /// incoming messages that pass the DM/group/self-chat policy filters.
 /// `Business` (default) responds to all incoming messages, subject only to the
 /// `allowed_numbers` allowlist.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppWebMode {
     /// Respond to all messages passing the allowlist (default).
@@ -7162,7 +7291,8 @@ pub enum WhatsAppWebMode {
 
 /// Policy for a particular WhatsApp chat type (DMs or groups) when
 /// `mode = "personal"`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppChatPolicy {
     /// Only respond to senders on the `allowed_numbers` list (default).
@@ -7177,7 +7307,8 @@ pub enum WhatsAppChatPolicy {
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.whatsapp"]
 pub struct WhatsAppConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7266,7 +7397,8 @@ impl ChannelConfig for WhatsAppConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.linq"]
 pub struct LinqConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7296,7 +7428,8 @@ impl ChannelConfig for LinqConfig {
 }
 
 /// WATI WhatsApp Business API channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.wati"]
 pub struct WatiConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7334,7 +7467,8 @@ impl ChannelConfig for WatiConfig {
 }
 
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nextcloud-talk"]
 pub struct NextcloudTalkConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7410,7 +7544,8 @@ impl WhatsAppConfig {
 ///
 /// Subscribes to MQTT topics and dispatches incoming messages
 /// to the SOP engine for processing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mqtt"]
 pub struct MqttConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7512,7 +7647,8 @@ fn default_mqtt_keep_alive_secs() -> u64 {
 }
 
 /// IRC channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.irc"]
 pub struct IrcConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7563,7 +7699,8 @@ fn default_irc_port() -> u16 {
 ///
 /// - `websocket` (default) — persistent WSS long-connection; no public URL required.
 /// - `webhook`             — HTTP callback server; requires a public HTTPS endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum LarkReceiveMode {
     #[default]
@@ -7573,7 +7710,8 @@ pub enum LarkReceiveMode {
 
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.lark"]
 pub struct LarkConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7625,7 +7763,8 @@ impl ChannelConfig for LarkConfig {
 }
 
 /// Feishu configuration for messaging integration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.feishu"]
 pub struct FeishuConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -7672,7 +7811,8 @@ impl ChannelConfig for FeishuConfig {
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
 pub struct SecurityConfig {
     /// Sandbox configuration
@@ -7715,7 +7855,8 @@ pub struct SecurityConfig {
 ///
 /// Enables registration and authentication via hardware security keys
 /// (YubiKey, SoloKey, etc.) and platform authenticators (Touch ID, Windows Hello).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.webauthn"]
 pub struct WebAuthnConfig {
     /// Enable WebAuthn authentication. Default: false.
@@ -7756,7 +7897,8 @@ fn default_webauthn_rp_name() -> String {
 }
 
 /// OTP validation strategy.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum OtpMethod {
     /// Time-based one-time password (RFC 6238).
@@ -7769,7 +7911,8 @@ pub enum OtpMethod {
 }
 
 /// Security OTP configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.otp"]
 #[serde(deny_unknown_fields)]
 pub struct OtpConfig {
@@ -7844,7 +7987,8 @@ impl Default for OtpConfig {
 }
 
 /// Emergency stop configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.estop"]
 #[serde(deny_unknown_fields)]
 pub struct EstopConfig {
@@ -7879,7 +8023,8 @@ impl Default for EstopConfig {
 ///
 /// When `enabled` is true, ZeroClaw validates incoming requests against a Nevis
 /// Security Suite instance and maps Nevis roles to tool/workspace permissions.
-#[derive(Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.nevis"]
 #[serde(deny_unknown_fields)]
 pub struct NevisConfig {
@@ -8019,7 +8164,8 @@ impl Default for NevisConfig {
 }
 
 /// Maps a Nevis role to ZeroClaw tool permissions and workspace access.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct NevisRoleMappingConfig {
     /// Nevis role name (case-insensitive).
@@ -8035,7 +8181,8 @@ pub struct NevisRoleMappingConfig {
 }
 
 /// Sandbox configuration for OS-level isolation
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.sandbox"]
 pub struct SandboxConfig {
     /// Enable sandboxing (None = auto-detect, Some = explicit)
@@ -8062,7 +8209,8 @@ impl Default for SandboxConfig {
 }
 
 /// Sandbox backend selection
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxBackend {
     /// Auto-detect best available (default)
@@ -8084,7 +8232,8 @@ pub enum SandboxBackend {
 }
 
 /// Resource limits for command execution
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.resources"]
 pub struct ResourceLimitsConfig {
     /// Maximum memory in MB per command
@@ -8132,7 +8281,8 @@ impl Default for ResourceLimitsConfig {
 }
 
 /// Audit logging configuration
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.audit"]
 pub struct AuditConfig {
     /// Enable audit logging
@@ -8176,7 +8326,8 @@ impl Default for AuditConfig {
 }
 
 /// DingTalk configuration for Stream Mode messaging
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.dingtalk"]
 pub struct DingTalkConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -8206,7 +8357,8 @@ impl ChannelConfig for DingTalkConfig {
 }
 
 /// WeCom (WeChat Enterprise) Bot Webhook configuration
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.wecom"]
 pub struct WeComConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -8230,7 +8382,8 @@ impl ChannelConfig for WeComConfig {
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.qq"]
 pub struct QQConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -8260,7 +8413,8 @@ impl ChannelConfig for QQConfig {
 }
 
 /// X/Twitter channel configuration (Twitter API v2)
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.twitter"]
 pub struct TwitterConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -8284,7 +8438,8 @@ impl ChannelConfig for TwitterConfig {
 }
 
 /// Mochat channel configuration (Mochat customer service API)
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mochat"]
 pub struct MochatConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -8317,7 +8472,8 @@ impl ChannelConfig for MochatConfig {
 }
 
 /// Reddit channel configuration (OAuth2 bot).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.reddit"]
 pub struct RedditConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -8349,7 +8505,8 @@ impl ChannelConfig for RedditConfig {
 }
 
 /// Bluesky channel configuration (AT Protocol).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.bluesky"]
 pub struct BlueskyConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
@@ -8377,7 +8534,8 @@ impl ChannelConfig for BlueskyConfig {
 /// then captures the following utterance and transcribes it via the
 /// existing transcription API.
 #[cfg(feature = "voice-wake")]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct VoiceWakeConfig {
     /// Wake word phrase to listen for (case-insensitive substring match).
     /// Default: `"hey zeroclaw"`.
@@ -8441,7 +8599,8 @@ impl ChannelConfig for VoiceWakeConfig {
 
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
 #[cfg(feature = "channel-nostr")]
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.nostr"]
 pub struct NostrConfig {
     /// Private key in hex or nsec bech32 format
@@ -8482,7 +8641,8 @@ pub fn default_nostr_relays() -> Vec<String> {
 /// When `enabled = true`, the agent polls a Notion database for pending tasks
 /// and exposes a `notion` tool for querying, reading, creating, and updating pages.
 /// Requires `api_key` (or the `NOTION_API_KEY` env var) and `database_id`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "notion"]
 pub struct NotionConfig {
     #[serde(default)]
@@ -8556,7 +8716,8 @@ impl Default for NotionConfig {
 /// ## Auth
 /// Jira Cloud uses HTTP Basic auth: `email` + `api_token`.
 /// `api_token` is stored encrypted at rest; set it here or via `JIRA_API_TOKEN`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "jira"]
 pub struct JiraConfig {
     /// Enable the `jira` tool. Default: `false`.
@@ -8606,7 +8767,8 @@ impl Default for JiraConfig {
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "cloud-ops"]
 pub struct CloudOpsConfig {
     /// Enable cloud operations tools. Default: false.
@@ -8727,7 +8889,8 @@ fn default_conversational_ai_timeout_secs() -> u64 {
 ///
 /// **Status: Reserved for future use.** This configuration is parsed but not yet
 /// consumed by the runtime. Setting `enabled = true` will produce a startup warning.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "conversational-ai"]
 pub struct ConversationalAiConfig {
     /// Enable conversational AI features. Default: false.
@@ -8789,7 +8952,8 @@ impl Default for ConversationalAiConfig {
 // ── Security ops config ─────────────────────────────────────────
 
 /// Managed Cybersecurity Service (MCSS) dashboard agent configuration (`[security_ops]`).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security-ops"]
 pub struct SecurityOpsConfig {
     /// Enable security operations tools.
@@ -8949,6 +9113,7 @@ fn default_config_and_workspace_dirs() -> Result<(PathBuf, PathBuf)> {
 const ACTIVE_WORKSPACE_STATE_FILE: &str = "active_workspace.toml";
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 struct ActiveWorkspaceState {
     config_dir: String,
 }
@@ -10770,7 +10935,8 @@ async fn sync_directory(path: &Path) -> Result<()> {
 /// The `default_execution_mode` field uses the `SopExecutionMode` type from
 /// `sop::types` (re-exported via `sop::SopExecutionMode`). To avoid circular
 /// module references, config stores it using the same enum definition.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
@@ -11000,6 +11166,7 @@ mod tests {
 
     #[test]
     async fn config_schema_export_contains_expected_contract_shape() {
+        #[cfg(feature = "schema-export")]
         let schema = schemars::schema_for!(Config);
         let schema_json = serde_json::to_value(&schema).expect("schema should serialize to json");
 

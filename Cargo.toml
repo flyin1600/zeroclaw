@@ -37,7 +37,7 @@ path = "src/lib.rs"
 # Internal workspace crates
 zeroclaw-api = { path = "crates/zeroclaw-api" }
 zeroclaw-infra = { path = "crates/zeroclaw-infra" }
-zeroclaw-config = { path = "crates/zeroclaw-config" }
+zeroclaw-config = { path = "crates/zeroclaw-config", default-features = false }
 zeroclaw-providers = { path = "crates/zeroclaw-providers" }
 zeroclaw-memory = { path = "crates/zeroclaw-memory" }
 zeroclaw-channels = { path = "crates/zeroclaw-channels", default-features = false }
@@ -253,7 +253,7 @@ libc = "0.2"
 
 [features]
 default = [
-    "gateway", "tui-onboarding",
+    "gateway", "tui-onboarding", "schema-export",
     "observability-prometheus", "skill-creation",
     "channel-email", "channel-telegram", "channel-lark",
     "channel-discord", "channel-slack", "channel-signal",
@@ -268,6 +268,7 @@ default = [
 
 # Tier 1 — major subsystems
 gateway = ["zeroclaw-misc/gateway"]
+schema-export = ["zeroclaw-misc/schema-export", "zeroclaw-config/schema-export"]
 tui-onboarding = ["zeroclaw-misc/tui-onboarding"]
 
 # Tier 2 — channels (root → misc → channels forwarding chain)
@@ -329,7 +330,7 @@ webauthn = []
 # Meta-feature for CI: all features except those requiring system C libraries
 # not available on standard CI runners (e.g., voice-wake needs libasound2-dev).
 ci-all = [
-    "gateway", "tui-onboarding",
+    "gateway", "tui-onboarding", "schema-export",
     # All 28 channels
     "channel-email", "channel-telegram", "channel-lark", "channel-nostr",
     "channel-matrix", "channel-discord", "channel-slack", "channel-signal",

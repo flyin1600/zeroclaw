@@ -1,3 +1,4 @@
+#[cfg(feature = "schema-export")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -31,7 +32,8 @@ impl fmt::Display for SopPriority {
 // ── Execution Mode ──────────────────────────────────────────────
 
 /// How much autonomy the agent has when executing an SOP.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SopExecutionMode {
     /// Execute all steps without human approval.

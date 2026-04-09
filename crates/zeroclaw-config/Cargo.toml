@@ -20,7 +20,7 @@ rand = "0.10"
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = "0.23"
-schemars = "1.2"
+schemars = { version = "1.2", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
@@ -41,3 +41,7 @@ webpki-roots = "1.0.6"
 [dev-dependencies]
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = ["schema-export"]
+schema-export = ["dep:schemars"]

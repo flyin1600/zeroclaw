@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 /// A single client workspace profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct WorkspaceProfile {
     /// Human-readable workspace name (also used as directory name).
     pub name: String,

@@ -3,7 +3,9 @@
 use crate::traits::{PropFieldInfo, PropKind};
 
 /// Return a comma-separated string of valid enum variant names for display in error messages.
+#[cfg(feature = "schema-export")]
 pub fn enum_variants<T: schemars::JsonSchema>() -> String {
+    #[cfg(feature = "schema-export")]
     let schema = schemars::schema_for!(T);
     let json = match serde_json::to_value(&schema) {
         Ok(v) => v,
