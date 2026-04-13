@@ -16124,4 +16124,41 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_eq!(config.enforcement.mode, "warn");
         assert_eq!(config.enforcement.reserve_percent, 10);
     }
+
+    // ── CronJobDecl: uses_memory field ────────────────────────
+
+    #[test]
+    async fn cron_job_decl_uses_memory_defaults_to_true_when_absent() {
+        // When a [[cron.jobs]] entry in config.toml omits `uses_memory`, the
+        // field must default to true so existing jobs keep their current behaviour.
+        let json = serde_json::json!({
+            "id": "morning-digest",
+            "job_type": "agent",
+            "schedule": { "kind": "cron", "expr": "0 6 * * *" },
+            "prompt": "Good morning!"
+        });
+        let decl: CronJobDecl = serde_json::from_value(json).unwrap();
+        assert!(
+            decl.uses_memory,
+            "uses_memory must default to true when absent from config"
+        );
+    }
+
+    #[test]
+    async fn cron_job_decl_uses_memory_explicit_false_is_respected() {
+        // Setting `uses_memory = false` in config must be honoured so that
+        // stateless digest jobs opt out of memory recall and avoid the snowball.
+        let json = serde_json::json!({
+            "id": "stateless-digest",
+            "job_type": "agent",
+            "schedule": { "kind": "cron", "expr": "0 6 * * *" },
+            "prompt": "Fetch the weather.",
+            "uses_memory": false
+        });
+        let decl: CronJobDecl = serde_json::from_value(json).unwrap();
+        assert!(
+            !decl.uses_memory,
+            "uses_memory = false must be preserved after deserialization"
+        );
+    }
 }

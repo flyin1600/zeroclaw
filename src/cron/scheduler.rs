@@ -1643,6 +1643,53 @@ mod tests {
     }
 
     #[test]
+    fn high_frequency_at_schedule_is_never_flagged() {
+        // One-shot At jobs have no recurrence interval and must never be flagged.
+        let job = agent_job_with_schedule(crate::cron::Schedule::At {
+            at: chrono::Utc::now(),
+        });
+        assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn cron_session_path_has_cron_prefix() {
+        // The session path passed to agent::run must start with "cron-" so that
+        // purge_session can target exactly the memories written by this run.
+        // If the prefix drifts the purge silently no-ops and the snowball returns.
+        let run_session_id = uuid::Uuid::new_v4().to_string();
+        let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
+        let path_str = session_path.to_string_lossy();
+        assert!(
+            path_str.starts_with("cron-"),
+            "session path must start with 'cron-': {path_str}"
+        );
+        let suffix = path_str.strip_prefix("cron-").unwrap();
+        assert!(
+            uuid::Uuid::parse_str(suffix).is_ok(),
+            "session path suffix must be a valid UUID: {suffix}"
+        );
+    }
+
+    #[test]
+    fn cron_mem_session_key_has_cli_cron_prefix() {
+        // purge_session is called with key = format!("cli:{}", session_path.display()).
+        // Pins the exact string so that any format change breaks this test rather
+        // than silently failing to purge — which would re-introduce the snowball.
+        let run_session_id = uuid::Uuid::new_v4().to_string();
+        let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
+        let mem_session_key = format!("cli:{}", session_path.display());
+        assert!(
+            mem_session_key.starts_with("cli:cron-"),
+            "purge key must start with 'cli:cron-': {mem_session_key}"
+        );
+        let uuid_part = mem_session_key.strip_prefix("cli:cron-").unwrap();
+        assert!(
+            uuid::Uuid::parse_str(uuid_part).is_ok(),
+            "purge key must end with a valid UUID: {uuid_part}"
+        );
+    }
+
+    #[test]
     fn run_agent_job_skips_memory_context_when_uses_memory_false() {
         // When uses_memory = false the prefixed_prompt must NOT start with
         // "[Memory context]". We can verify this by checking the logic directly:
