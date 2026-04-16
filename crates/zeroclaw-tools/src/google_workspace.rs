@@ -79,6 +79,16 @@ impl GoogleWorkspaceTool {
         }
     }
 
+    /// Returns `["--account", account]` when `account` is `Some`, or an empty vec when `None`.
+    /// These args must be placed **before** all positional subcommand args because `--account` is
+    /// a global flag in the `gws` CLI.
+    fn account_prefix_args(account: Option<&str>) -> Vec<String> {
+        match account {
+            Some(acc) => vec!["--account".to_string(), acc.to_string()],
+            None => vec![],
+        }
+    }
+
     /// Build the positional `gws` arguments: `[service, resource, (sub_resource,)? method]`.
     fn positional_cmd_args(
         service: &str,
@@ -380,10 +390,7 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         let mut cmd = tokio::process::Command::new("gws");
-        // --account is a global flag and must precede the subcommand positional args.
-        if let Some(ref account) = self.default_account {
-            cmd.args(["--account", account]);
-        }
+        cmd.args(Self::account_prefix_args(self.default_account.as_deref()));
         cmd.args(&cmd_args);
         cmd.env_clear();
         // gws needs PATH to find itself and HOME/APPDATA for credential storage
@@ -1070,5 +1077,35 @@ mod tests {
     fn pagination_neither_appends_nothing() {
         let flags = GoogleWorkspaceTool::build_pagination_args(false, None);
         assert!(flags.is_empty());
+    }
+
+    // ── --account flag ordering ──────────────────────────────
+
+    #[test]
+    fn account_prefix_precedes_positional_args() {
+        // Regression: --account was previously appended after service/resource/method,
+        // causing gws to reject it on every call when default_account is configured.
+        let prefix = GoogleWorkspaceTool::account_prefix_args(Some("user@example.com"));
+        let positional =
+            GoogleWorkspaceTool::positional_cmd_args("drive", "files", None, "list");
+        let full: Vec<String> = prefix.iter().chain(positional.iter()).cloned().collect();
+        let account_idx = full.iter().position(|a| a == "--account").unwrap();
+        let service_idx = full.iter().position(|a| a == "drive").unwrap();
+        assert!(
+            account_idx < service_idx,
+            "--account must precede service positional arg; got: {full:?}"
+        );
+    }
+
+    #[test]
+    fn account_prefix_contains_correct_value() {
+        let prefix = GoogleWorkspaceTool::account_prefix_args(Some("admin@corp.com"));
+        assert_eq!(prefix, vec!["--account", "admin@corp.com"]);
+    }
+
+    #[test]
+    fn account_prefix_absent_when_none() {
+        let prefix = GoogleWorkspaceTool::account_prefix_args(None);
+        assert!(prefix.is_empty());
     }
 }
