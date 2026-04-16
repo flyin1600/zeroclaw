@@ -380,6 +380,10 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         let mut cmd = tokio::process::Command::new("gws");
+        // --account is a global flag and must precede the subcommand positional args.
+        if let Some(ref account) = self.default_account {
+            cmd.args(["--account", account]);
+        }
         cmd.args(&cmd_args);
         cmd.env_clear();
         // gws needs PATH to find itself and HOME/APPDATA for credential storage
@@ -392,11 +396,6 @@ impl Tool for GoogleWorkspaceTool {
         // Apply credential path if configured
         if let Some(ref creds) = self.credentials_path {
             cmd.env("GOOGLE_APPLICATION_CREDENTIALS", creds);
-        }
-
-        // Apply default account if configured
-        if let Some(ref account) = self.default_account {
-            cmd.args(["--account", account]);
         }
 
         if self.audit_log {
