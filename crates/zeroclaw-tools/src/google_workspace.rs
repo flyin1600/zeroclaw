@@ -392,6 +392,20 @@ impl Tool for GoogleWorkspaceTool {
                 cmd.env(key, val);
             }
         }
+        // On Unix, XDG dirs are needed to resolve credential file locations
+        // (defaults: ~/.config, /run/user/UID).
+        #[cfg(unix)]
+        for key in &["XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+        // On Linux, D-Bus is required when gws uses the system keyring
+        // (secret-service) for OAuth token storage — common on headful desktops.
+        #[cfg(target_os = "linux")]
+        if let Ok(val) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            cmd.env("DBUS_SESSION_BUS_ADDRESS", val);
+        }
 
         // Apply credential path if configured
         if let Some(ref creds) = self.credentials_path {
