@@ -3,6 +3,7 @@ pub enum MemoryBackendKind {
     Sqlite,
     Lucid,
     Qdrant,
+    OpenBrain,
     Markdown,
     None,
     Unknown,
@@ -55,6 +56,15 @@ const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     optional_dependency: false,
 };
 
+const OPENBRAIN_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "openbrain",
+    label: "OpenBrain — Supabase pgvector memory via [memory.openbrain]",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: false,
+};
+
 const NONE_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "none",
     label: "None — disable persistent memory",
@@ -93,6 +103,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
         "qdrant" => MemoryBackendKind::Qdrant,
+        "openbrain" => MemoryBackendKind::OpenBrain,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
         _ => MemoryBackendKind::Unknown,
@@ -104,6 +115,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
+        MemoryBackendKind::OpenBrain => OPENBRAIN_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
         MemoryBackendKind::Unknown => CUSTOM_PROFILE,

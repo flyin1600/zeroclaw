@@ -30,6 +30,7 @@ pub mod lucid;
 pub mod markdown;
 pub mod namespaced;
 pub mod none;
+pub mod openbrain;
 pub mod policy;
 pub mod qdrant;
 pub mod response_cache;
@@ -52,6 +53,7 @@ pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
 pub use policy::PolicyEnforcer;
+pub use openbrain::OpenBrainMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
@@ -81,7 +83,7 @@ where
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
+        MemoryBackendKind::Qdrant | MemoryBackendKind::OpenBrain | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
@@ -374,6 +376,72 @@ pub fn create_memory_with_storage_and_routes(
             &url,
             &collection,
             qdrant_api_key,
+            embedder,
+        )));
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::OpenBrain) {
+        let url = config
+            .openbrain
+            .url
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::var("SUPABASE_URL").ok())
+            .filter(|s| !s.trim().is_empty())
+            .context(
+                "OpenBrain memory backend requires url in [memory.openbrain] or SUPABASE_URL env var",
+            )?;
+        let service_role_key = config
+            .openbrain
+            .service_role_key
+            .clone()
+            .or_else(|| std::env::var("SUPABASE_SERVICE_ROLE_KEY").ok())
+            .filter(|s| !s.trim().is_empty())
+            .context(
+                "OpenBrain memory backend requires service_role_key in [memory.openbrain] \
+                 or SUPABASE_SERVICE_ROLE_KEY env var",
+            )?;
+
+        // OpenBrain's `thoughts` table stores text-embedding-3-small (1536-dim) vectors.
+        // Using a different model would silently corrupt semantic search across all
+        // OpenBrain clients sharing this database.
+        const REQUIRED_MODEL: &str = "text-embedding-3-small";
+        const REQUIRED_DIMS: usize = 1536;
+        if resolved_embedding.provider.trim() == "none" || resolved_embedding.dimensions == 0 {
+            anyhow::bail!(
+                "OpenBrain memory backend requires an embedding provider. \
+                 Set `embedding_provider = \"openai\"` (or \"openrouter\") and \
+                 `embedding_model = \"{REQUIRED_MODEL}\"` in [memory]."
+            );
+        }
+        if resolved_embedding.model.trim() != REQUIRED_MODEL
+            || resolved_embedding.dimensions != REQUIRED_DIMS
+        {
+            anyhow::bail!(
+                "OpenBrain requires `embedding_model = \"{REQUIRED_MODEL}\"` and \
+                 `embedding_dimensions = {REQUIRED_DIMS}` in [memory]. \
+                 Using a different model would corrupt semantic search across OpenBrain clients. \
+                 Got: model=\"{}\", dimensions={}",
+                resolved_embedding.model,
+                resolved_embedding.dimensions
+            );
+        }
+
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+            Arc::from(embeddings::create_embedding_provider(
+                &resolved_embedding.provider,
+                resolved_embedding.api_key.as_deref(),
+                &resolved_embedding.model,
+                resolved_embedding.dimensions,
+            ));
+        tracing::info!(
+            "🧠 OpenBrain memory backend configured (url: {})",
+            url
+        );
+        return Ok(Box::new(OpenBrainMemory::new_lazy(
+            &url,
+            &service_role_key,
+            config.openbrain.match_threshold,
             embedder,
         )));
     }
@@ -697,6 +765,64 @@ mod tests {
             resolved.api_key.as_deref(),
             Some("gemini-key-must-not-be-used"),
             "default_provider key must not leak to the embedding provider"
+        );
+    }
+
+    #[test]
+    fn factory_openbrain_requires_url() {
+        let tmp = TempDir::new().unwrap();
+        // Configure the correct embedding settings but no URL.
+        let cfg = MemoryConfig {
+            backend: "openbrain".into(),
+            embedding_provider: "openai".into(),
+            embedding_model: "text-embedding-3-small".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+        // Ensure the env var is not set so we can test the error path.
+        let prev = std::env::var("SUPABASE_URL").ok();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("SUPABASE_URL") };
+
+        let result = create_memory(&cfg, tmp.path(), None);
+
+        // Restore env.
+        match prev {
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var("SUPABASE_URL", v) },
+            None => {}
+        }
+
+        assert!(result.is_err(), "should fail without SUPABASE_URL");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("SUPABASE_URL") || msg.contains("url"),
+            "error should mention SUPABASE_URL, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn factory_openbrain_rejects_wrong_embedding_model() {
+        let tmp = TempDir::new().unwrap();
+        // Provide URL + key in config directly so we reach the model validation
+        // without touching env vars (avoids races with other tests).
+        let mut cfg = MemoryConfig {
+            backend: "openbrain".into(),
+            embedding_provider: "openai".into(),
+            embedding_model: "text-embedding-ada-002".into(), // wrong model
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+        cfg.openbrain.url = Some("https://test.supabase.co".into());
+        cfg.openbrain.service_role_key = Some("test-key".into());
+
+        let result = create_memory(&cfg, tmp.path(), None);
+
+        assert!(result.is_err(), "should fail with wrong embedding model");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("text-embedding-3-small"),
+            "error should name the required model, got: {msg}"
         );
     }
 }

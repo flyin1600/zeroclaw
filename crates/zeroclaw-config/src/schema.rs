@@ -5106,6 +5106,40 @@ impl Default for QdrantConfig {
     }
 }
 
+/// Configuration for the OpenBrain (Supabase-hosted pgvector) memory backend
+/// (`[memory.openbrain]`). Used when `[memory].backend = "openbrain"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.openbrain"]
+pub struct OpenBrainConfig {
+    /// Supabase project URL (e.g. "https://xyz.supabase.co").
+    /// Falls back to `SUPABASE_URL` env var if not set.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Supabase service-role key (starts with "eyJ…").
+    /// Falls back to `SUPABASE_SERVICE_ROLE_KEY` env var if not set.
+    /// Used as both `Authorization: Bearer` and `apikey` headers.
+    #[serde(default)]
+    pub service_role_key: Option<String>,
+    /// Vector similarity threshold for `match_thoughts` RPC (0.0–1.0).
+    #[serde(default = "default_openbrain_match_threshold")]
+    pub match_threshold: f64,
+}
+
+fn default_openbrain_match_threshold() -> f64 {
+    0.5
+}
+
+impl Default for OpenBrainConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            service_role_key: None,
+            match_threshold: default_openbrain_match_threshold(),
+        }
+    }
+}
+
 /// Search strategy for memory recall.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5125,9 +5159,10 @@ pub enum SearchMode {
 #[prefix = "memory"]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "lucid" | "qdrant" | "openbrain" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
     /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
+    /// `openbrain` uses `[memory.openbrain]` config or `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` env vars.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
     pub auto_save: bool,
@@ -5248,6 +5283,13 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub qdrant: QdrantConfig,
+
+    // ── OpenBrain backend options ──────────────────────────────
+    /// Configuration for the OpenBrain (Supabase pgvector) backend.
+    /// Only used when `backend = "openbrain"`.
+    #[serde(default)]
+    #[nested]
+    pub openbrain: OpenBrainConfig,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -5371,6 +5413,7 @@ impl Default for MemoryConfig {
             policy: MemoryPolicyConfig::default(),
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            openbrain: OpenBrainConfig::default(),
         }
     }
 }
