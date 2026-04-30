@@ -180,6 +180,17 @@ pub trait Memory: Send + Sync {
         Ok(())
     }
 
+    /// Backend-specific async hygiene: delete remote records older than the
+    /// given retention windows. Called at agent startup, fire-and-forget.
+    /// Backends that store data remotely override this; the default is a no-op.
+    async fn backend_hygiene(
+        &self,
+        _purge_after_days: u32,
+        _conversation_retention_days: u32,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Recall memories scoped to a specific namespace.
     ///
     /// Default implementation delegates to `recall()` and filters by namespace.

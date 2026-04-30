@@ -2106,6 +2106,18 @@ pub async fn run(
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
+    // Backend hygiene — fire-and-forget, best-effort cleanup for remote backends.
+    {
+        let hygiene_mem = Arc::clone(&mem);
+        let purge_days = config.memory.purge_after_days;
+        let conv_days = config.memory.conversation_retention_days;
+        tokio::spawn(async move {
+            if let Err(e) = hygiene_mem.backend_hygiene(purge_days, conv_days).await {
+                tracing::debug!("backend hygiene skipped: {e}");
+            }
+        });
+    }
+
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
         tracing::info!(
