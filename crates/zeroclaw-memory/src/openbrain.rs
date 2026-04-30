@@ -2,8 +2,9 @@ use super::embeddings::EmbeddingProvider;
 use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
@@ -30,6 +31,8 @@ pub struct OpenBrainMemory {
     embedder: Arc<dyn EmbeddingProvider>,
     /// Lazy-init: verified on first operation.
     initialized: OnceCell<()>,
+    /// Throttle: timestamp of last backend_hygiene run.
+    last_hygiene: Mutex<Option<DateTime<Utc>>>,
 }
 
 // ── Internal wire types ──────────────────────────────────────────────────────
@@ -103,6 +106,7 @@ impl OpenBrainMemory {
             match_threshold,
             embedder,
             initialized: OnceCell::new(),
+            last_hygiene: Mutex::new(None),
         }
     }
 
@@ -580,6 +584,78 @@ impl Memory for OpenBrainMemory {
         _session_id: Option<&str>,
     ) -> Result<()> {
         // No-op: OpenBrain does not have a procedural memory concept.
+        Ok(())
+    }
+
+    async fn backend_hygiene(
+        &self,
+        purge_after_days: u32,
+        conversation_retention_days: u32,
+    ) -> Result<()> {
+        const INTERVAL_HOURS: i64 = 12;
+
+        {
+            let mut guard = self.last_hygiene.lock().unwrap();
+            let now = Utc::now();
+            if let Some(last) = *guard {
+                if now - last < Duration::hours(INTERVAL_HOURS) {
+                    return Ok(());
+                }
+            }
+            *guard = Some(now);
+        }
+
+        // Prune zeroclaw conversation records older than conversation_retention_days.
+        // source=zeroclaw scope ensures records from other OpenBrain clients are never touched.
+        let conv_cutoff = (Utc::now() - Duration::days(i64::from(conversation_retention_days)))
+            .to_rfc3339();
+        let conv_resp = self
+            .rest_request(reqwest::Method::DELETE, "/thoughts")
+            .query(&[
+                ("created_at", format!("lt.{conv_cutoff}")),
+                ("metadata->>source", "eq.zeroclaw".to_string()),
+                (
+                    "metadata->>zeroclaw_category",
+                    "eq.conversation".to_string(),
+                ),
+            ])
+            .header("Prefer", "return=minimal")
+            .send()
+            .await;
+        match conv_resp {
+            Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NO_CONTENT => {
+                tracing::info!(
+                    "OpenBrain hygiene: pruned zeroclaw conversations older than {conversation_retention_days}d"
+                );
+            }
+            Ok(r) => tracing::warn!("OpenBrain hygiene (conversations): HTTP {}", r.status()),
+            Err(e) => tracing::warn!("OpenBrain hygiene (conversations): {e}"),
+        }
+
+        // Prune zeroclaw daily records older than purge_after_days.
+        // Core memories (zeroclaw_category=core) are never pruned.
+        let purge_cutoff =
+            (Utc::now() - Duration::days(i64::from(purge_after_days))).to_rfc3339();
+        let daily_resp = self
+            .rest_request(reqwest::Method::DELETE, "/thoughts")
+            .query(&[
+                ("created_at", format!("lt.{purge_cutoff}")),
+                ("metadata->>source", "eq.zeroclaw".to_string()),
+                ("metadata->>zeroclaw_category", "eq.daily".to_string()),
+            ])
+            .header("Prefer", "return=minimal")
+            .send()
+            .await;
+        match daily_resp {
+            Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NO_CONTENT => {
+                tracing::info!(
+                    "OpenBrain hygiene: purged zeroclaw daily memories older than {purge_after_days}d"
+                );
+            }
+            Ok(r) => tracing::warn!("OpenBrain hygiene (daily): HTTP {}", r.status()),
+            Err(e) => tracing::warn!("OpenBrain hygiene (daily): {e}"),
+        }
+
         Ok(())
     }
 
