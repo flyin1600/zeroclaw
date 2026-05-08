@@ -2069,9 +2069,7 @@ pub async fn run_tool_call_loop(
             if text.is_empty() {
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
-            if !text.is_empty() {
-                last_display_text = text.clone();
-            }
+            last_display_text = text.clone();
             accumulated_display_text.push_str(&text);
             let last_message = if last_display_text.is_empty() {
                 accumulated_display_text.clone()
@@ -2989,7 +2987,10 @@ pub async fn run(
                     )
                     .await
                 {
-                    Ok(resp) => break resp.full_text,
+                    Ok(resp) => {
+                        last_message_from_loop = resp.last_message;
+                        break resp.full_text;
+                    }
                     Err(e) => {
                         if is_tool_loop_cancelled(&e) {
                             eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
