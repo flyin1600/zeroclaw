@@ -1487,4 +1487,131 @@ mod tests {
         process_due_jobs(&config, &security, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
     }
+
+    // Thread-local sink for capturing what text `deliver_announcement` sends.
+    // Each `#[tokio::test]` runs on its own thread (current_thread runtime),
+    // so tests are isolated from each other without additional locking.
+    thread_local! {
+        static CAPTURED_DELIVERY: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn install_capture_delivery_fn() {
+        register_delivery_fn(Box::new(|_config, _channel, _target, text| {
+            Box::pin(async move {
+                CAPTURED_DELIVERY.with(|c| *c.borrow_mut() = Some(text));
+                Ok(())
+            })
+        }));
+    }
+
+    fn take_captured_delivery() -> Option<String> {
+        CAPTURED_DELIVERY.with(|c| c.borrow_mut().take())
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivers_last_message_when_deliver_final_message_only_set() {
+        install_capture_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            Some("dfmo-delivers-last".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "summarize",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("chat-id".into()),
+                best_effort: false,
+                deliver_final_message_only: true,
+            }),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let full_output = "Let me check the logs.\nRunning tool X.\nFinal answer: all clear.";
+        let last_message = "Final answer: all clear.";
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(
+            &config,
+            &job,
+            true,
+            full_output,
+            last_message,
+            started,
+            finished,
+        )
+        .await;
+        assert!(success);
+
+        // Delivery should use last_message, not the full transcript.
+        assert_eq!(take_captured_delivery().as_deref(), Some(last_message));
+
+        // Storage always receives the full transcript.
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].output.as_deref(), Some(full_output));
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_delivers_full_output_when_deliver_final_message_only_not_set() {
+        install_capture_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &config,
+            Some("dfmo-delivers-full".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "summarize",
+            SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("chat-id".into()),
+                best_effort: false,
+                deliver_final_message_only: false,
+            }),
+            false,
+            None,
+        )
+        .unwrap();
+
+        let full_output = "Let me check.\nFinal answer: all clear.";
+        let last_message = "Final answer: all clear.";
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(
+            &config,
+            &job,
+            true,
+            full_output,
+            last_message,
+            started,
+            finished,
+        )
+        .await;
+        assert!(success);
+
+        // Without the flag, delivery receives the full transcript.
+        assert_eq!(take_captured_delivery().as_deref(), Some(full_output));
+
+        // Storage is always the full transcript regardless of the flag.
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].output.as_deref(), Some(full_output));
+    }
 }

@@ -539,6 +539,23 @@ pub struct AgentRunOutput {
     pub last_message: String,
 }
 
+impl AgentRunOutput {
+    /// Construct from `run_tool_call_loop` outputs, applying the fallback rule:
+    /// when `last_display_text` is empty (tool-only run), `last_message` falls
+    /// back to `full_text` so announce-mode delivery always has something to send.
+    pub(crate) fn build(full_text: String, last_display_text: String) -> Self {
+        let last_message = if last_display_text.is_empty() {
+            full_text.clone()
+        } else {
+            last_display_text
+        };
+        AgentRunOutput {
+            full_text,
+            last_message,
+        }
+    }
+}
+
 pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
@@ -1507,15 +1524,10 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
-            let last_message = if last_display_text.is_empty() {
-                accumulated_display_text.clone()
-            } else {
-                last_display_text.clone()
-            };
-            return Ok(AgentRunOutput {
-                full_text: accumulated_display_text,
-                last_message,
-            });
+            return Ok(AgentRunOutput::build(
+                accumulated_display_text,
+                last_display_text,
+            ));
         }
 
         // Accumulate text from this iteration (tool calls present, loop continues).
