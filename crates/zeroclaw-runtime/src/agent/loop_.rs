@@ -532,8 +532,10 @@ pub struct AgentRunOutput {
     /// Stored verbatim in `cron_runs.output` for operator debugging.
     pub full_text: String,
     /// Last non-empty display text produced during the run.
-    /// Used for `deliver_final_message_only` announce-mode delivery.
-    /// Falls back to `full_text` when no iteration produced non-empty text.
+    /// Populated only for single-message (cron/daemon) invocations; empty for
+    /// interactive REPL turns that don't go through the cron delivery path.
+    /// Used by `deliver_final_message_only` announce-mode delivery.
+    /// Empty when every iteration produced only tool calls with no prose.
     pub last_message: String,
 }
 
@@ -2071,14 +2073,10 @@ pub async fn run_tool_call_loop(
             }
             last_display_text = text.clone();
             accumulated_display_text.push_str(&text);
-            let last_message = if last_display_text.is_empty() {
-                accumulated_display_text.clone()
-            } else {
-                last_display_text
-            };
+            // text is non-empty (bailed above otherwise), so last_display_text is non-empty.
             Ok(AgentRunOutput {
                 full_text: accumulated_display_text,
-                last_message,
+                last_message: last_display_text,
             })
         }
         Err(e) => {

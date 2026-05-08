@@ -137,6 +137,8 @@ async fn catch_up_overdue_jobs(
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    // Delivery (including deliver_final_message_only) is not applied for one-shot runs;
+    // only the scheduled path through persist_job_result triggers delivery.
     let (success, full_output, _last_message) =
         Box::pin(execute_job_with_retry(config, &security, job)).await;
     (success, full_output)
@@ -483,11 +485,11 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 }
 
 fn select_delivery_text<'a>(
-    delivery: &DeliveryConfig,
+    deliver_final_message_only: bool,
     output: &'a str,
     last_message: &'a str,
 ) -> &'a str {
-    if delivery.deliver_final_message_only && !last_message.is_empty() {
+    if deliver_final_message_only && !last_message.is_empty() {
         last_message
     } else {
         output
@@ -513,7 +515,7 @@ async fn deliver_if_configured(
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
-    let text = select_delivery_text(delivery, output, last_message);
+    let text = select_delivery_text(delivery.deliver_final_message_only, output, last_message);
 
     deliver_announcement(config, channel, target, text).await
 }
@@ -1319,16 +1321,8 @@ mod tests {
 
     #[test]
     fn select_delivery_text_returns_last_message_when_flag_enabled() {
-        use crate::cron::DeliveryConfig;
-        let delivery = DeliveryConfig {
-            mode: "announce".into(),
-            channel: Some("telegram".into()),
-            to: Some("123".into()),
-            best_effort: true,
-            deliver_final_message_only: true,
-        };
         let result = select_delivery_text(
-            &delivery,
+            true,
             "Let me check disk usage.\n\nDisk at 73%.",
             "Morning Status: all clear.",
         );
@@ -1337,31 +1331,15 @@ mod tests {
 
     #[test]
     fn select_delivery_text_returns_full_output_when_flag_disabled() {
-        use crate::cron::DeliveryConfig;
-        let delivery = DeliveryConfig {
-            mode: "announce".into(),
-            channel: Some("telegram".into()),
-            to: Some("123".into()),
-            best_effort: true,
-            deliver_final_message_only: false,
-        };
         let full = "Let me check.\n\nFinal summary.";
-        let result = select_delivery_text(&delivery, full, "Final summary.");
+        let result = select_delivery_text(false, full, "Final summary.");
         assert_eq!(result, full);
     }
 
     #[test]
     fn select_delivery_text_falls_back_to_full_when_last_message_empty() {
-        use crate::cron::DeliveryConfig;
-        let delivery = DeliveryConfig {
-            mode: "announce".into(),
-            channel: Some("telegram".into()),
-            to: Some("123".into()),
-            best_effort: true,
-            deliver_final_message_only: true,
-        };
         let full = "Tool-only run produced this.";
-        let result = select_delivery_text(&delivery, full, "");
+        let result = select_delivery_text(true, full, "");
         assert_eq!(result, full);
     }
 
