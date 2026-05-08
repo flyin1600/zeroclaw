@@ -525,6 +525,18 @@ impl std::fmt::Display for ToolLoopCancelled {
 
 impl std::error::Error for ToolLoopCancelled {}
 
+/// Output produced by a completed agent run.
+#[derive(Debug, Default)]
+pub struct AgentRunOutput {
+    /// Full concatenated transcript across all iterations.
+    /// Stored verbatim in `cron_runs.output` for operator debugging.
+    pub full_text: String,
+    /// Last non-empty display text produced during the run.
+    /// Used for `deliver_final_message_only` announce-mode delivery.
+    /// Falls back to `full_text` when no iteration produced non-empty text.
+    pub last_message: String,
+}
+
 pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
     err.chain().any(|source| source.is::<ToolLoopCancelled>())
 }
@@ -7727,5 +7739,22 @@ Let me check the result."#;
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn agent_run_output_fields_are_independent() {
+        let output = super::AgentRunOutput {
+            full_text: "narration\nfinal summary".to_string(),
+            last_message: "final summary".to_string(),
+        };
+        assert_eq!(output.last_message, "final summary");
+        assert!(output.full_text.starts_with("narration"));
+    }
+
+    #[test]
+    fn agent_run_output_default_is_empty() {
+        let output = super::AgentRunOutput::default();
+        assert!(output.full_text.is_empty());
+        assert!(output.last_message.is_empty());
     }
 }
