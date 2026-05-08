@@ -482,7 +482,19 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str, _last_message: &str) -> Result<()> {
+fn select_delivery_text<'a>(
+    delivery: &DeliveryConfig,
+    output: &'a str,
+    last_message: &'a str,
+) -> &'a str {
+    if delivery.deliver_final_message_only && !last_message.is_empty() {
+        last_message
+    } else {
+        output
+    }
+}
+
+async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str, last_message: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
@@ -496,8 +508,9 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str, _la
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+    let text = select_delivery_text(delivery, output, last_message);
 
-    deliver_announcement(config, channel, target, output).await
+    deliver_announcement(config, channel, target, text).await
 }
 
 /// Delivery function type — takes owned values so the returned future is 'static.
@@ -1297,6 +1310,54 @@ mod tests {
 
         // Default delivery mode is not "announce", so should be a no-op.
         assert!(deliver_if_configured(&config, &job, "x", "").await.is_ok());
+    }
+
+    #[test]
+    fn select_delivery_text_returns_last_message_when_flag_enabled() {
+        use crate::cron::DeliveryConfig;
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("123".into()),
+            best_effort: true,
+            deliver_final_message_only: true,
+        };
+        let result = select_delivery_text(
+            &delivery,
+            "Let me check disk usage.\n\nDisk at 73%.",
+            "Morning Status: all clear.",
+        );
+        assert_eq!(result, "Morning Status: all clear.");
+    }
+
+    #[test]
+    fn select_delivery_text_returns_full_output_when_flag_disabled() {
+        use crate::cron::DeliveryConfig;
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("123".into()),
+            best_effort: true,
+            deliver_final_message_only: false,
+        };
+        let full = "Let me check.\n\nFinal summary.";
+        let result = select_delivery_text(&delivery, full, "Final summary.");
+        assert_eq!(result, full);
+    }
+
+    #[test]
+    fn select_delivery_text_falls_back_to_full_when_last_message_empty() {
+        use crate::cron::DeliveryConfig;
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("telegram".into()),
+            to: Some("123".into()),
+            best_effort: true,
+            deliver_final_message_only: true,
+        };
+        let full = "Tool-only run produced this.";
+        let result = select_delivery_text(&delivery, full, "");
+        assert_eq!(result, full);
     }
 
     #[tokio::test]

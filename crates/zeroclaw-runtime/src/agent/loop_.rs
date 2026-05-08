@@ -747,6 +747,7 @@ pub async fn agent_turn(
         None, // collected_receipts
     )
     .await
+    .map(|output| output.full_text)
 }
 
 fn maybe_inject_channel_delivery_defaults(
@@ -887,7 +888,7 @@ pub async fn run_tool_call_loop(
     channel: Option<&dyn Channel>,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
-) -> Result<String> {
+) -> Result<AgentRunOutput> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -914,6 +915,7 @@ pub async fn run_tool_call_loop(
 
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
+    let mut last_display_text = String::new();
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -1469,6 +1471,9 @@ pub async fn run_tool_call_loop(
                 }),
             );
             // No tool calls — this is the final response.
+            if !display_text.is_empty() {
+                last_display_text = display_text.clone();
+            }
             accumulated_display_text.push_str(&display_text);
 
             // If text wasn't streamed live, send it now via post-hoc chunking.
@@ -1500,10 +1505,21 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(accumulated_display_text);
+            let last_message = if last_display_text.is_empty() {
+                accumulated_display_text.clone()
+            } else {
+                last_display_text.clone()
+            };
+            return Ok(AgentRunOutput {
+                full_text: accumulated_display_text,
+                last_message,
+            });
         }
 
         // Accumulate text from this iteration (tool calls present, loop continues).
+        if !display_text.is_empty() {
+            last_display_text = display_text.clone();
+        }
         accumulated_display_text.push_str(&display_text);
 
         // Native tool-call providers can return assistant text separately from
@@ -2053,8 +2069,19 @@ pub async fn run_tool_call_loop(
             if text.is_empty() {
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
+            if !text.is_empty() {
+                last_display_text = text.clone();
+            }
             accumulated_display_text.push_str(&text);
-            Ok(accumulated_display_text)
+            let last_message = if last_display_text.is_empty() {
+                accumulated_display_text.clone()
+            } else {
+                last_display_text
+            };
+            Ok(AgentRunOutput {
+                full_text: accumulated_display_text,
+                last_message,
+            })
         }
         Err(e) => {
             tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
@@ -2516,6 +2543,7 @@ pub async fn run(
     let start = Instant::now();
 
     let mut final_output = String::new();
+    let mut last_message_from_loop = String::new();
 
     // Save the base system prompt before any thinking modifications so
     // the interactive loop can restore it between turns.
@@ -2646,7 +2674,8 @@ pub async fn run(
                 .await
             {
                 Ok(resp) => {
-                    response = resp;
+                    response = resp.full_text;
+                    last_message_from_loop = resp.last_message;
                     break;
                 }
                 Err(e) => {
@@ -2960,7 +2989,7 @@ pub async fn run(
                     )
                     .await
                 {
-                    Ok(resp) => break resp,
+                    Ok(resp) => break resp.full_text,
                     Err(e) => {
                         if is_tool_loop_cancelled(&e) {
                             eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
@@ -3118,7 +3147,7 @@ pub async fn run(
 
     Ok(AgentRunOutput {
         full_text: final_output,
-        last_message: String::new(), // set to last non-empty display text once run_tool_call_loop tracks it
+        last_message: last_message_from_loop,
     })
 }
 
@@ -4767,7 +4796,7 @@ mod tests {
         .await
         .expect("valid multimodal payload should pass");
 
-        assert_eq!(result, "vision-ok");
+        assert_eq!(result.full_text, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -4934,7 +4963,7 @@ mod tests {
         .await
         .expect("text-only messages should succeed with default provider");
 
-        assert_eq!(result, "hello world");
+        assert_eq!(result.full_text, "hello world");
     }
 
     /// When `vision_provider` is set but `vision_model` is not, the default
@@ -5050,7 +5079,7 @@ mod tests {
         .await
         .expect("empty image markers should not trigger vision routing");
 
-        assert_eq!(result, "handled");
+        assert_eq!(result.full_text, "handled");
     }
 
     /// Multiple image markers should still trigger vision routing when
@@ -5248,8 +5277,8 @@ mod tests {
         .expect("parallel execution should complete");
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
         assert!(
             max_active.load(Ordering::SeqCst) >= 1,
@@ -5328,8 +5357,8 @@ mod tests {
         .expect("cron_add delivery defaults should be injected");
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
 
         let recorded = recorded_args
@@ -5400,8 +5429,8 @@ mod tests {
         .expect("explicit delivery mode should be preserved");
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
 
         let recorded = recorded_args
@@ -5467,8 +5496,8 @@ mod tests {
         .expect("loop should finish after deduplicating repeated calls");
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
@@ -5547,8 +5576,8 @@ mod tests {
         .expect("non-interactive shell should succeed for low-risk command");
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
 
         let tool_results = history
@@ -5617,8 +5646,8 @@ mod tests {
         .expect("loop should finish with exempt tool executing twice");
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
@@ -5771,8 +5800,8 @@ mod tests {
         .expect("native fallback id flow should complete");
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
@@ -5880,8 +5909,8 @@ mod tests {
             "tool-call progress line should still be relayed"
         );
         assert!(
-            result.ends_with("Final answer"),
-            "accumulated result should end with final answer, got: {result}"
+            result.full_text.ends_with("Final answer"),
+            "accumulated result should end with final answer, got: {}", result.full_text
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
@@ -5940,7 +5969,7 @@ mod tests {
             }
         }
 
-        assert_eq!(result, "streamed final answer");
+        assert_eq!(result.full_text, "streamed final answer");
         assert_eq!(
             visible_deltas, "streamed final answer",
             "draft should receive upstream deltas once without post-hoc duplication"
@@ -6012,8 +6041,8 @@ mod tests {
         }
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
@@ -6091,8 +6120,8 @@ mod tests {
         }
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
@@ -6177,7 +6206,7 @@ mod tests {
             }
         }
 
-        assert_eq!(result, "routed streamed answer");
+        assert_eq!(result.full_text, "routed streamed answer");
         assert_eq!(
             visible_deltas, "routed streamed answer",
             "routed draft should receive upstream deltas once without post-hoc duplication"
@@ -7456,8 +7485,8 @@ Let me check the result."#;
         );
 
         assert!(
-            result.ends_with("I could not execute that command."),
-            "result should end with error message, got: {result}"
+            result.full_text.ends_with("I could not execute that command."),
+            "result should end with error message, got: {}", result.full_text
         );
     }
 
@@ -7594,8 +7623,8 @@ Let me check the result."#;
             .expect("tool loop should succeed");
 
         assert!(
-            result.ends_with("done"),
-            "result should end with 'done', got: {result}"
+            result.full_text.ends_with("done"),
+            "result should end with 'done', got: {}", result.full_text
         );
         let summary = tracker.get_summary().unwrap();
         assert_eq!(summary.request_count, 1);
@@ -7741,7 +7770,7 @@ Let me check the result."#;
         .await
         .expect("should succeed without cost scope");
 
-        assert_eq!(result, "ok");
+        assert_eq!(result.full_text, "ok");
     }
 
     #[test]

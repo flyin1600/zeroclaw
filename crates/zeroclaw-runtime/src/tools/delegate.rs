@@ -1218,10 +1218,10 @@ impl DelegateTool {
 
         match result {
             Ok(Ok(response)) => {
-                let rendered = if response.trim().is_empty() {
+                let rendered = if response.full_text.trim().is_empty() {
                     "[Empty response]".to_string()
                 } else {
-                    response
+                    response.full_text
                 };
 
                 Ok(ToolResult {
