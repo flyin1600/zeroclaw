@@ -150,7 +150,7 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     )
     .await;
     let (success, output) = match run_result {
-        Ok(out) => (true, out),
+        Ok(out) => (true, out.full_text),
         Err(err) => (false, format!("agent run errored: {err:#}")),
     };
 

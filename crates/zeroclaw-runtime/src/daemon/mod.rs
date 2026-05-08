@@ -501,7 +501,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 phase1_fut.await
             };
             match phase1_result {
-                Ok(response) => {
+                Ok(run_output) => {
+                    let response = run_output.full_text;
                     let indices = HeartbeatEngine::parse_decision_response(&response, tasks.len());
                     if indices.is_empty() {
                         tracing::info!("💓 Heartbeat Phase 1: skip (nothing to do)");
@@ -624,7 +625,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 phase2_fut.await
             };
             match phase2_result {
-                Ok(output) => {
+                Ok(run_output) => {
+                    let output = run_output.full_text;
                     crate::health::mark_component_ok("heartbeat");
                     #[allow(clippy::cast_possible_truncation)]
                     let duration_ms = task_start.elapsed().as_millis() as i64;

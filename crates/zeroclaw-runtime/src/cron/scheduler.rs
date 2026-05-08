@@ -137,32 +137,39 @@ async fn catch_up_overdue_jobs(
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    Box::pin(execute_job_with_retry(config, &security, job)).await
+    let (success, full_output, _last_message) =
+        Box::pin(execute_job_with_retry(config, &security, job)).await;
+    (success, full_output)
 }
 
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
-) -> (bool, String) {
+) -> (bool, String, String) {
     let mut last_output = String::new();
+    let mut last_msg = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
-        let (success, output) = match job.job_type {
-            JobType::Shell => run_job_command(config, security, job).await,
+        let (success, output, msg) = match job.job_type {
+            JobType::Shell => {
+                let (s, o) = run_job_command(config, security, job).await;
+                (s, o, String::new())
+            }
             JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
         };
         last_output = output;
+        last_msg = msg;
 
         if success {
-            return (true, last_output);
+            return (true, last_output, last_msg);
         }
 
         if last_output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
-            return (false, last_output);
+            return (false, last_output, last_msg);
         }
 
         if attempt < retries {
@@ -172,7 +179,7 @@ async fn execute_job_with_retry(
         }
     }
 
-    (false, last_output)
+    (false, last_output, last_msg)
 }
 
 async fn process_due_jobs(
@@ -229,30 +236,33 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
-    let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
+    let (success, full_output, last_message) =
+        Box::pin(execute_job_with_retry(config, security, job)).await;
     let finished_at = Utc::now();
     let success = Box::pin(persist_job_result(
         config,
         job,
         success,
-        &output,
+        &full_output,
+        &last_message,
         started_at,
         finished_at,
     ))
     .await;
 
-    (job.id.clone(), success, output)
+    (job.id.clone(), success, full_output)
 }
 
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
     job: &CronJob,
-) -> (bool, String) {
+) -> (bool, String, String) {
     if !security.can_act() {
         return (
             false,
             "blocked by security policy: autonomy is read-only".to_string(),
+            String::new(),
         );
     }
 
@@ -260,6 +270,7 @@ async fn run_agent_job(
         return (
             false,
             "blocked by security policy: rate limit exceeded".to_string(),
+            String::new(),
         );
     }
 
@@ -267,6 +278,7 @@ async fn run_agent_job(
         return (
             false,
             "blocked by security policy: action budget exhausted".to_string(),
+            String::new(),
         );
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
@@ -345,13 +357,14 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
+        Ok(output) => (
             true,
-            if response.trim().is_empty() {
+            if output.full_text.trim().is_empty() {
                 "agent job executed".to_string()
             } else {
-                response
+                output.full_text
             },
+            output.last_message,
         ),
         Err(e) => {
             // Purge memories written during this failed run so they don't
@@ -367,7 +380,7 @@ async fn run_agent_job(
             ) {
                 let _ = mem.purge_session(&mem_session_key).await;
             }
-            (false, format!("agent job failed: {e}"))
+            (false, format!("agent job failed: {e}"), String::new())
         }
     }
 }
@@ -377,12 +390,13 @@ async fn persist_job_result(
     job: &CronJob,
     mut success: bool,
     output: &str,
+    last_message: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
 
-    if let Err(e) = deliver_if_configured(config, job, output).await {
+    if let Err(e) = deliver_if_configured(config, job, output, last_message).await {
         if job.delivery.best_effort {
             tracing::warn!("Cron delivery failed (best_effort): {e}");
         } else {
@@ -468,7 +482,7 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str, _last_message: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
@@ -951,7 +965,7 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = Box::pin(execute_job_with_retry(&config, &security, &job)).await;
+        let (success, output, _) = Box::pin(execute_job_with_retry(&config, &security, &job)).await;
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -966,7 +980,7 @@ mod tests {
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = Box::pin(execute_job_with_retry(&config, &security, &job)).await;
+        let (success, output, _) = Box::pin(execute_job_with_retry(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }
@@ -980,7 +994,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+        let (success, output, _) = Box::pin(run_agent_job(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
@@ -995,7 +1009,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+        let (success, output, _) = Box::pin(run_agent_job(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -1011,7 +1025,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = Box::pin(run_agent_job(&config, &security, &job)).await;
+        let (success, output, _) = Box::pin(run_agent_job(&config, &security, &job)).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -1064,7 +1078,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", "", started, finished).await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -1093,7 +1107,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", "", started, finished).await;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -1119,7 +1133,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(&config, &job, false, "boom", "", started, finished).await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -1136,7 +1150,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", "", started, finished).await;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -1152,7 +1166,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(&config, &job, false, "boom", "", started, finished).await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -1189,7 +1203,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", "", started, finished).await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -1229,7 +1243,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", "", started, finished).await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -1262,7 +1276,7 @@ mod tests {
 
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(&config, &job, true, "ok", "", started, finished).await;
         assert!(success);
 
         // After reschedule_after_run, At schedule jobs should be disabled
@@ -1282,7 +1296,7 @@ mod tests {
         let job = test_job("echo ok");
 
         // Default delivery mode is not "announce", so should be a no-op.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert!(deliver_if_configured(&config, &job, "x", "").await.is_ok());
     }
 
     #[tokio::test]

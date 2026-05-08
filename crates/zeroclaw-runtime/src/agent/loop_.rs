@@ -2111,7 +2111,7 @@ pub async fn run(
     interactive: bool,
     session_state_file: Option<PathBuf>,
     allowed_tools: Option<Vec<String>>,
-) -> Result<String> {
+) -> Result<AgentRunOutput> {
     // ── Wire up agnostic subsystems ──────────────────────────────
     let base_observer = observability::create_observer(&config.observability);
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
@@ -3116,7 +3116,10 @@ pub async fn run(
         cost_usd: None,
     });
 
-    Ok(final_output)
+    Ok(AgentRunOutput {
+        full_text: final_output,
+        last_message: String::new(), // populated in Task 5
+    })
 }
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
