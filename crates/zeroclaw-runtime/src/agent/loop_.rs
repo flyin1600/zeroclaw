@@ -3118,7 +3118,7 @@ pub async fn run(
 
     Ok(AgentRunOutput {
         full_text: final_output,
-        last_message: String::new(), // populated in Task 5
+        last_message: String::new(), // set to last non-empty display text once run_tool_call_loop tracks it
     })
 }
 

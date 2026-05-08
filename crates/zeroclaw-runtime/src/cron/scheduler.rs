@@ -148,7 +148,7 @@ async fn execute_job_with_retry(
     job: &CronJob,
 ) -> (bool, String, String) {
     let mut last_output = String::new();
-    let mut last_msg = String::new();
+    let mut last_message = String::new();
     let retries = config.reliability.scheduler_retries;
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
@@ -161,15 +161,15 @@ async fn execute_job_with_retry(
             JobType::Agent => Box::pin(run_agent_job(config, security, job)).await,
         };
         last_output = output;
-        last_msg = msg;
+        last_message = msg;
 
         if success {
-            return (true, last_output, last_msg);
+            return (true, last_output, last_message);
         }
 
         if last_output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
-            return (false, last_output, last_msg);
+            return (false, last_output, last_message);
         }
 
         if attempt < retries {
@@ -179,7 +179,7 @@ async fn execute_job_with_retry(
         }
     }
 
-    (false, last_output, last_msg)
+    (false, last_output, last_message)
 }
 
 async fn process_due_jobs(
