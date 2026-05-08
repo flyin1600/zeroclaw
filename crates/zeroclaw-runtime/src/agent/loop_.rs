@@ -5279,7 +5279,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
         assert!(
             max_active.load(Ordering::SeqCst) >= 1,
@@ -5359,7 +5360,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
 
         let recorded = recorded_args
@@ -5431,7 +5433,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
 
         let recorded = recorded_args
@@ -5498,7 +5501,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
@@ -5578,7 +5582,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
 
         let tool_results = history
@@ -5648,7 +5653,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
@@ -5802,7 +5808,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert!(
@@ -5911,7 +5918,8 @@ mod tests {
         );
         assert!(
             result.full_text.ends_with("Final answer"),
-            "accumulated result should end with final answer, got: {}", result.full_text
+            "accumulated result should end with final answer, got: {}",
+            result.full_text
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
@@ -6043,7 +6051,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
@@ -6122,7 +6131,8 @@ mod tests {
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
@@ -7486,8 +7496,11 @@ Let me check the result."#;
         );
 
         assert!(
-            result.full_text.ends_with("I could not execute that command."),
-            "result should end with error message, got: {}", result.full_text
+            result
+                .full_text
+                .ends_with("I could not execute that command."),
+            "result should end with error message, got: {}",
+            result.full_text
         );
     }
 
@@ -7625,7 +7638,8 @@ Let me check the result."#;
 
         assert!(
             result.full_text.ends_with("done"),
-            "result should end with 'done', got: {}", result.full_text
+            "result should end with 'done', got: {}",
+            result.full_text
         );
         let summary = tracker.get_summary().unwrap();
         assert_eq!(summary.request_count, 1);

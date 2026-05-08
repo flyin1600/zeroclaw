@@ -93,7 +93,7 @@ use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
-    build_tool_instructions, clear_model_switch_request, get_model_switch_state,
+    AgentRunOutput, build_tool_instructions, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
@@ -3211,7 +3211,7 @@ async fn process_channel_message(
     };
 
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(Result<Result<AgentRunOutput, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
     }
 
@@ -3422,9 +3422,9 @@ async fn process_channel_message(
                 tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
             }
         }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+        LlmExecutionResult::Completed(Ok(Ok(run_output))) => {
             // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
+            let mut outbound_response = run_output.full_text;
             if let Some(hooks) = &ctx.hooks {
                 match hooks
                     .run_on_message_sending(

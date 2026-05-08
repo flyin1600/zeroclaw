@@ -494,7 +494,12 @@ fn select_delivery_text<'a>(
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str, last_message: &str) -> Result<()> {
+async fn deliver_if_configured(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+    last_message: &str,
+) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
