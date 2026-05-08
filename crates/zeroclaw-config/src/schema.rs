@@ -6494,6 +6494,10 @@ pub struct DeliveryConfigDecl {
     /// Best-effort delivery. Default: `true`.
     #[serde(default = "default_true")]
     pub best_effort: bool,
+    /// When `true` and `mode = "announce"`, deliver only the final assistant
+    /// message instead of the full accumulated transcript. Default: `false`.
+    #[serde(default)]
+    pub deliver_final_message_only: bool,
 }
 
 fn default_job_type_decl() -> String {

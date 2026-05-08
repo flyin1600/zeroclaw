@@ -849,7 +849,7 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
         channel: decl.channel.clone(),
         to: decl.to.clone(),
         best_effort: decl.best_effort,
-        deliver_final_message_only: false,
+        deliver_final_message_only: decl.deliver_final_message_only,
     }
 }
 
@@ -1708,5 +1708,33 @@ schedule = { kind = "every", every_ms = 300000 }
             parsed.jobs[1].schedule,
             zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 300_000 }
         ));
+    }
+
+    #[test]
+    fn convert_delivery_decl_maps_deliver_final_message_only() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            Some("dfmo-test".into()),
+            Schedule::Cron { expr: "*/5 * * * *".into(), tz: None },
+            "summarize",
+            SessionTarget::Isolated,
+            None,
+            Some(crate::cron::DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("telegram".into()),
+                to: Some("chat-id".into()),
+                best_effort: false,
+                deliver_final_message_only: true,
+            }),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(job.delivery.deliver_final_message_only);
+        // Verify it round-trips through SQLite serialization
+        let stored = crate::cron::get_job(&config, &job.id).unwrap();
+        assert!(stored.delivery.deliver_final_message_only);
     }
 }
