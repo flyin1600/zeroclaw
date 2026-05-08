@@ -110,6 +110,8 @@ pub struct DeliveryConfig {
     pub to: Option<String>,
     #[serde(default = "default_true")]
     pub best_effort: bool,
+    #[serde(default)]
+    pub deliver_final_message_only: bool,
 }
 
 impl Default for DeliveryConfig {
@@ -119,6 +121,7 @@ impl Default for DeliveryConfig {
             channel: None,
             to: None,
             best_effort: true,
+            deliver_final_message_only: false,
         }
     }
 }
@@ -246,5 +249,29 @@ mod tests {
     fn job_type_try_from_rejects_invalid_values() {
         assert!(JobType::try_from("").is_err());
         assert!(JobType::try_from("unknown").is_err());
+    }
+
+    #[test]
+    fn delivery_config_deserializes_deliver_final_message_only_true() {
+        let json = serde_json::json!({
+            "mode": "announce",
+            "channel": "telegram",
+            "to": "123456",
+            "best_effort": false,
+            "deliver_final_message_only": true
+        });
+        let config: DeliveryConfig = serde_json::from_value(json).unwrap();
+        assert!(config.deliver_final_message_only);
+    }
+
+    #[test]
+    fn delivery_config_deliver_final_message_only_defaults_false() {
+        let json = serde_json::json!({
+            "mode": "announce",
+            "channel": "telegram",
+            "to": "123456"
+        });
+        let config: DeliveryConfig = serde_json::from_value(json).unwrap();
+        assert!(!config.deliver_final_message_only);
     }
 }

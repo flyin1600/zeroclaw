@@ -849,6 +849,7 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
         channel: decl.channel.clone(),
         to: decl.to.clone(),
         best_effort: decl.best_effort,
+        deliver_final_message_only: false,
     }
 }
 
@@ -1022,6 +1023,7 @@ mod tests {
                 channel: Some("discord".into()),
                 to: Some("1234567890".into()),
                 best_effort: true,
+                deliver_final_message_only: false,
             }),
         )
         .unwrap();
@@ -1056,6 +1058,7 @@ mod tests {
                 channel: Some("discord".into()),
                 to: None,
                 best_effort: true,
+                deliver_final_message_only: false,
             }),
             false,
             None,
@@ -1083,6 +1086,7 @@ mod tests {
                 channel: Some("discord".into()),
                 to: Some("1234567890".into()),
                 best_effort: true,
+                deliver_final_message_only: false,
             }),
         )
         .unwrap_err();
