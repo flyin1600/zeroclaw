@@ -1,33 +1,26 @@
 //! End-to-end tests for memory–loop–heartbeat continuity.
-//!
-//! Validates that:
-//! - Memory persists across agent turns and sessions
-//! - The agent loop maintains context awareness through tool iterations
-//! - Memory recall enriches prompts so the agent "remembers" prior work
-//! - Context compression preserves facts to memory before discarding
-//! - Multi-step tasks complete without the agent stopping prematurely
 
 use std::sync::Arc;
 
+use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory::sqlite::SqliteMemory;
 use zeroclaw::memory::traits::{Memory, MemoryCategory};
 use zeroclaw::providers::ToolCall;
 
 use crate::support::helpers::{build_agent_with_sqlite_memory, text_response, tool_response};
-use crate::support::{CountingTool, EchoTool, MockProvider};
+use crate::support::{CountingTool, EchoTool, MockModelProvider};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 1. Memory Store + Recall Persistence
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Store a fact, then recall it in a fresh memory instance (same DB).
 #[tokio::test]
 async fn memory_persists_across_instances() {
     let tmp = tempfile::TempDir::new().unwrap();
 
     // Instance 1: store
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store(
             "project_deadline",
             "The deadline is March 30th 2026",
@@ -40,7 +33,7 @@ async fn memory_persists_across_instances() {
 
     // Instance 2: recall (simulates restart)
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let results = mem.recall("deadline", 5, None, None, None).await.unwrap();
         assert!(
             !results.is_empty(),
@@ -54,11 +47,10 @@ async fn memory_persists_across_instances() {
     }
 }
 
-/// Store multiple facts across categories and recall by relevance.
 #[tokio::test]
 async fn memory_recall_returns_relevant_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     mem.store(
         "user_name",
@@ -97,12 +89,11 @@ async fn memory_recall_returns_relevant_entries() {
 // 2. Agent Loop Multi-Step Completion
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent completes a 5-step tool chain without stopping.
 #[tokio::test]
 async fn agent_completes_five_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "counter".into(),
@@ -138,7 +129,7 @@ async fn agent_completes_five_step_tool_chain() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let response = agent.turn("Execute 5 sequential operations").await.unwrap();
     assert!(!response.is_empty());
@@ -149,17 +140,16 @@ async fn agent_completes_five_step_tool_chain() {
     );
 }
 
-/// Agent handles a multi-turn conversation, maintaining history.
 #[tokio::test]
 async fn agent_maintains_history_across_turns() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         text_response("I'll remember that your name is Argenis."),
         text_response("Your name is Argenis, as you told me earlier."),
         text_response("Yes, you are Argenis and you prefer Rust."),
     ]));
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let mut agent = build_agent_with_sqlite_memory(provider, vec![], tmp.path());
+    let mut agent = build_agent_with_sqlite_memory(model_provider, vec![], tmp.path());
 
     let r1 = agent.turn("My name is Argenis").await.unwrap();
     assert!(!r1.is_empty());
@@ -175,14 +165,13 @@ async fn agent_maintains_history_across_turns() {
 // 3. Memory-Enriched Agent Turns
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent with SqliteMemory stores and recalls across turns.
 #[tokio::test]
 async fn agent_auto_saves_and_recalls_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
 
     // Pre-seed memory with a fact
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store(
             "project_tech",
             "The project uses Rust and Tokio for async runtime",
@@ -194,11 +183,11 @@ async fn agent_auto_saves_and_recalls_memory() {
     }
 
     // Agent should have access to this via memory recall
-    let provider = Box::new(MockProvider::new(vec![text_response(
+    let model_provider = Box::new(MockModelProvider::new(vec![text_response(
         "Based on memory, the project uses Rust and Tokio.",
     )]));
 
-    let mut agent = build_agent_with_sqlite_memory(provider, vec![], tmp.path());
+    let mut agent = build_agent_with_sqlite_memory(model_provider, vec![], tmp.path());
     let response = agent
         .turn("What tech does this project use?")
         .await
@@ -207,83 +196,12 @@ async fn agent_auto_saves_and_recalls_memory() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 4. Context Compressor Memory Preservation
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// Verify ContextCompressor.with_memory saves summary to memory before splice.
-#[tokio::test]
-async fn compressor_with_memory_saves_summary() {
-    use zeroclaw::agent::context_compressor::{ContextCompressionConfig, ContextCompressor};
-    use zeroclaw::providers::traits::ChatMessage;
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-
-    let config = ContextCompressionConfig {
-        enabled: true,
-        threshold_ratio: 0.01, // Very low threshold to force compression
-        protect_first_n: 1,
-        protect_last_n: 1,
-        max_passes: 1,
-        summary_max_chars: 4000,
-        source_max_chars: 50000,
-        timeout_secs: 60,
-        identifier_policy: "strict".to_string(),
-        ..Default::default()
-    };
-
-    // Create compressor with memory handle
-    let compressor = ContextCompressor::new(config, 100) // Tiny context window
-        .with_memory(mem.clone());
-
-    // Build a long history that will trigger compression
-    let mut history: Vec<ChatMessage> = vec![ChatMessage::system(
-        "You are a helpful assistant.".to_string(),
-    )];
-    for i in 0..20 {
-        history.push(ChatMessage::user(format!("Question {i}: What is {i} * 2?")));
-        history.push(ChatMessage::assistant(format!(
-            "Answer: {} * 2 = {}",
-            i,
-            i * 2
-        )));
-    }
-    history.push(ChatMessage::user("Final question".to_string()));
-
-    // Create a mock provider for summarization
-    let mock_provider = MockProvider::new(vec![text_response(
-        "Summary: User asked 20 multiplication questions. All answered correctly.",
-    )]);
-
-    let result = compressor
-        .compress_if_needed(&mut history, &mock_provider, "test-model")
-        .await;
-
-    // Check if compression happened (it should with threshold_ratio=0.01)
-    if let Ok(compressed) = result {
-        if compressed.compressed {
-            // Verify the summary was saved to memory
-            let entries = mem
-                .recall("multiplication", 10, None, None, None)
-                .await
-                .unwrap();
-            assert!(
-                !entries.is_empty(),
-                "Compression summary should have been saved to memory"
-            );
-        }
-    }
-    // Even if compression didn't trigger, the test validates the wiring
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
 // 5. Battle-Tested Loop Scenarios
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Agent handles interleaved tool calls and text responses without stopping.
 #[tokio::test]
 async fn agent_handles_interleaved_tools_and_text() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         // Step 1: tool call
         tool_response(vec![ToolCall {
             id: "tc1".into(),
@@ -303,7 +221,8 @@ async fn agent_handles_interleaved_tools_and_text() {
     ]));
 
     let tmp = tempfile::TempDir::new().unwrap();
-    let mut agent = build_agent_with_sqlite_memory(provider, vec![Box::new(EchoTool)], tmp.path());
+    let mut agent =
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(EchoTool)], tmp.path());
 
     let response = agent.turn("Create a file then read it").await.unwrap();
     assert!(
@@ -312,13 +231,21 @@ async fn agent_handles_interleaved_tools_and_text() {
     );
 }
 
-/// Agent survives large tool output (truncation should kick in).
 #[tokio::test]
 async fn agent_survives_large_tool_output() {
     use zeroclaw::tools::{Tool, ToolResult};
 
     /// Tool that returns a very large output.
     struct LargeOutputTool;
+
+    impl ::zeroclaw_api::attribution::Attributable for LargeOutputTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            <Self as Tool>::name(self)
+        }
+    }
 
     #[async_trait::async_trait]
     impl Tool for LargeOutputTool {
@@ -336,13 +263,13 @@ async fn agent_survives_large_tool_output() {
             let output = "x".repeat(100_000);
             Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             })
         }
     }
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "large_output".into(),
@@ -354,7 +281,7 @@ async fn agent_survives_large_tool_output() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(LargeOutputTool)], tmp.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(LargeOutputTool)], tmp.path());
 
     let response = agent.turn("Generate a large output").await.unwrap();
     assert!(
@@ -363,12 +290,11 @@ async fn agent_survives_large_tool_output() {
     );
 }
 
-/// Agent handles parallel tool calls in a single iteration.
 #[tokio::test]
 async fn agent_handles_parallel_tool_calls() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![
             ToolCall {
                 id: "tc1".into(),
@@ -394,7 +320,7 @@ async fn agent_handles_parallel_tool_calls() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let response = agent.turn("Run 3 tools in parallel").await.unwrap();
     assert!(!response.is_empty());
@@ -405,12 +331,11 @@ async fn agent_handles_parallel_tool_calls() {
     );
 }
 
-/// Multi-turn with tools: each turn builds on the previous.
 #[tokio::test]
 async fn agent_multi_turn_with_tools_builds_context() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         // Turn 1: tool call + response
         tool_response(vec![ToolCall {
             id: "tc1".into(),
@@ -433,7 +358,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
 
     let tmp = tempfile::TempDir::new().unwrap();
     let mut agent =
-        build_agent_with_sqlite_memory(provider, vec![Box::new(counting_tool)], tmp.path());
+        build_agent_with_sqlite_memory(model_provider, vec![Box::new(counting_tool)], tmp.path());
 
     let r1 = agent.turn("Start task: increment counter").await.unwrap();
     assert!(!r1.is_empty());
@@ -455,20 +380,21 @@ async fn agent_multi_turn_with_tools_builds_context() {
 // 6. Memory Consolidation Integration
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Direct test of consolidate_turn saving to memory.
 #[tokio::test]
 async fn consolidation_extracts_facts_to_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
 
-    let provider = MockProvider::new(vec![text_response(
+    let model_provider = MockModelProvider::new(vec![text_response(
         r#"{"history_entry": "User shared project deadline info", "memory_update": "Project deadline is April 15th 2026"}"#,
     )]);
 
     let result = zeroclaw::memory::consolidation::consolidate_turn(
-        &provider,
+        &model_provider,
         "test-model",
+        None,
         mem.as_ref(),
+        &MemoryConfig::default(),
         "The project deadline is April 15th 2026",
         "Got it, I'll remember the deadline is April 15th.",
     )
@@ -484,22 +410,23 @@ async fn consolidation_extracts_facts_to_memory() {
     );
 }
 
-/// Memory survives multiple consolidation rounds without corruption.
 #[tokio::test]
 async fn memory_survives_rapid_consolidation() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
 
     // Simulate 10 rapid consolidation rounds
     for i in 0..10 {
-        let provider = MockProvider::new(vec![text_response(&format!(
+        let model_provider = MockModelProvider::new(vec![text_response(&format!(
             r#"{{"history_entry": "Turn {i} conversation", "memory_update": null}}"#,
         ))]);
 
         let _ = zeroclaw::memory::consolidation::consolidate_turn(
-            &provider,
+            &model_provider,
             "test-model",
+            None,
             mem.as_ref(),
+            &MemoryConfig::default(),
             &format!("User message {i}"),
             &format!("Assistant response {i}"),
         )
@@ -522,7 +449,6 @@ async fn memory_survives_rapid_consolidation() {
 // 7. Session Persistence End-to-End
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// SQLite session backend stores and loads messages correctly.
 #[tokio::test]
 async fn session_backend_persists_messages() {
     use zeroclaw::channels::session_backend::SessionBackend;
@@ -544,7 +470,6 @@ async fn session_backend_persists_messages() {
     assert_eq!(messages.len(), 2, "Both messages should persist");
 }
 
-/// Session state transitions work correctly.
 #[tokio::test]
 async fn session_state_transitions() {
     use zeroclaw::channels::session_backend::SessionBackend;

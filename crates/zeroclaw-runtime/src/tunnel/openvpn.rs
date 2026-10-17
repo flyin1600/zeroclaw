@@ -3,13 +3,6 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-/// OpenVPN Tunnel — uses the `openvpn` CLI to establish a VPN connection.
-///
-/// Requires the `openvpn` binary installed and accessible. On most systems,
-/// OpenVPN requires root/administrator privileges to create tun/tap devices.
-///
-/// The tunnel exposes the gateway via the VPN network using a configured
-/// `advertise_address` (e.g., `"10.8.0.2:42617"`).
 pub struct OpenVpnTunnel {
     config_file: String,
     auth_file: Option<String>,
@@ -20,13 +13,6 @@ pub struct OpenVpnTunnel {
 }
 
 impl OpenVpnTunnel {
-    /// Create a new OpenVPN tunnel instance.
-    ///
-    /// * `config_file` — path to the `.ovpn` configuration file.
-    /// * `auth_file` — optional path to a credentials file for `--auth-user-pass`.
-    /// * `advertise_address` — optional public address to advertise once connected.
-    /// * `connect_timeout_secs` — seconds to wait for the initialization sequence.
-    /// * `extra_args` — additional CLI arguments forwarded to the `openvpn` binary.
     pub fn new(
         config_file: String,
         auth_file: Option<String>,
@@ -82,10 +68,18 @@ impl Tunnel for OpenVpnTunnel {
             .spawn()?;
 
         // Wait for "Initialization Sequence Completed" in stderr
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture openvpn stderr"))?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"tunnel_provider": "openvpn", "stream": "stderr"})
+                    ),
+                "tunnel process: failed to capture child stream"
+            );
+            anyhow::Error::msg("Failed to capture openvpn stderr")
+        })?;
 
         let mut reader = tokio::io::BufReader::new(stderr).lines();
         let deadline = tokio::time::Instant::now()
@@ -98,7 +92,12 @@ impl Tunnel for OpenVpnTunnel {
 
             match line {
                 Ok(Ok(Some(l))) => {
-                    tracing::debug!("openvpn: {l}");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"l": l})),
+                        "openvpn: "
+                    );
                     if l.contains("Initialization Sequence Completed") {
                         connected = true;
                         break;
@@ -131,9 +130,14 @@ impl Tunnel for OpenVpnTunnel {
 
         // Drain stderr in background to prevent OS pipe buffer from filling and
         // blocking the openvpn process.
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             while let Ok(Some(line)) = reader.next_line().await {
-                tracing::trace!("openvpn: {line}");
+                ::zeroclaw_log::record!(
+                    TRACE,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"line": line})),
+                    "openvpn: "
+                );
             }
         });
 

@@ -1,6 +1,10 @@
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+
+const MAX_ROUND_DECIMALS: i64 = 15;
+
+const MAX_VALUES_LEN: usize = 10_000;
 
 pub struct CalculatorTool;
 
@@ -92,13 +96,25 @@ impl Tool for CalculatorTool {
         })
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "result": {
+                    "description": "Computed value: a number for numeric results, a string for multi-value results (e.g. mode ties)"
+                }
+            },
+            "required": ["result"]
+        }))
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let function = match args.get("function").and_then(|v| v.as_str()) {
             Some(f) => f,
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: function".to_string()),
                 });
             }
@@ -135,14 +151,23 @@ impl Tool for CalculatorTool {
         };
 
         match result {
-            Ok(output) => Ok(ToolResult {
-                success: true,
-                output,
-                error: None,
-            }),
+            Ok(output) => {
+                let value = output
+                    .parse::<f64>()
+                    .map(|n| serde_json::json!(n))
+                    .unwrap_or_else(|_| serde_json::Value::String(output.clone()));
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::json_with_text(
+                        serde_json::json!({ "result": value }),
+                        output,
+                    ),
+                    error: None,
+                })
+            }
             Err(err) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(err),
             }),
         }
@@ -169,6 +194,12 @@ fn extract_values(args: &serde_json::Value, min_len: usize) -> Result<Vec<f64>, 
     if values.len() < min_len {
         return Err(format!(
             "Expected at least {min_len} value(s), got {}",
+            values.len()
+        ));
+    }
+    if values.len() > MAX_VALUES_LEN {
+        return Err(format!(
+            "values array must be at most {MAX_VALUES_LEN} entries, got {}",
             values.len()
         ));
     }
@@ -200,7 +231,10 @@ fn calc_add(args: &serde_json::Value) -> Result<String, String> {
 fn calc_subtract(args: &serde_json::Value) -> Result<String, String> {
     let values = extract_values(args, 2)?;
     let mut iter = values.iter();
-    let mut result = *iter.next().unwrap();
+    let mut result = iter
+        .next()
+        .copied()
+        .ok_or_else(|| "Subtraction requires at least one value".to_string())?;
     for v in iter {
         result -= v;
     }
@@ -210,7 +244,10 @@ fn calc_subtract(args: &serde_json::Value) -> Result<String, String> {
 fn calc_divide(args: &serde_json::Value) -> Result<String, String> {
     let values = extract_values(args, 2)?;
     let mut iter = values.iter();
-    let mut result = *iter.next().unwrap();
+    let mut result = iter
+        .next()
+        .copied()
+        .ok_or_else(|| "Division requires at least one value".to_string())?;
     for v in iter {
         if *v == 0.0 {
             return Err("Division by zero".to_string());
@@ -263,7 +300,10 @@ fn calc_round(args: &serde_json::Value) -> Result<String, String> {
     if decimals < 0 {
         return Err("decimals must be non-negative".to_string());
     }
-    let multiplier = 10_f64.powi(i32::try_from(decimals).unwrap_or(i32::MAX));
+    if decimals > MAX_ROUND_DECIMALS {
+        return Err(format!("decimals must be at most {MAX_ROUND_DECIMALS}"));
+    }
+    let multiplier = 10_f64.powi(decimals as i32);
     Ok(format_num((x * multiplier).round() / multiplier))
 }
 
@@ -299,8 +339,8 @@ fn calc_factorial(args: &serde_json::Value) -> Result<String, String> {
     }
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let n = x.round() as u128;
-    if n > 170 {
-        return Err("Factorial result exceeds f64 range (max input: 170)".to_string());
+    if n > 34 {
+        return Err("Factorial input too large (max input: 34); 34! is the largest factorial that fits in a 128-bit integer".to_string());
     }
     let mut result: u128 = 1;
     for i in 2..=n {
@@ -327,7 +367,7 @@ fn calc_median(args: &serde_json::Value) -> Result<String, String> {
     if values.is_empty() {
         return Err("Cannot compute median of an empty array".to_string());
     }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values.sort_by(f64::total_cmp);
     let len = values.len();
     if len % 2 == 0 {
         Ok(format_num(f64::midpoint(
@@ -349,7 +389,11 @@ fn calc_mode(args: &serde_json::Value) -> Result<String, String> {
         let key = v.to_bits();
         *freq.entry(key).or_insert(0) += 1;
     }
-    let max_freq = *freq.values().max().unwrap();
+    let max_freq = freq
+        .values()
+        .copied()
+        .max()
+        .ok_or_else(|| "Cannot compute mode of an empty array".to_string())?;
     let mut seen = std::collections::HashSet::new();
     let mut modes = Vec::new();
     for &v in &values {
@@ -421,7 +465,7 @@ fn calc_percentile(args: &serde_json::Value) -> Result<String, String> {
     if !(0..=100).contains(&p) {
         return Err("Percentile rank must be between 0 and 100".to_string());
     }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values.sort_by(f64::total_cmp);
 
     let idx_f = p as f64 / 100.0 * (values.len() - 1) as f64;
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -578,6 +622,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_round_rejects_excessive_decimals() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"function": "round", "x": 2.715, "decimals": 1_000_000}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("at most"));
+    }
+
+    #[tokio::test]
+    async fn test_extract_values_rejects_oversized_array() {
+        let tool = CalculatorTool::new();
+        let oversized: Vec<f64> = (0..(MAX_VALUES_LEN + 1)).map(|n| n as f64).collect();
+        let result = tool
+            .execute(json!({"function": "sum", "values": oversized}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.as_ref().unwrap();
+        assert!(
+            err.contains("must be at most 10000 entries"),
+            "expected cap-rejection error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_values_accepts_exact_cap() {
+        // Boundary: an array of exactly `MAX_VALUES_LEN` entries must
+        // succeed. Off-by-one protection: the cap is inclusive, not
+        // exclusive. Matches the boundary-test pattern from
+        // (`read_capped_line_at_exact_cap_is_not_truncated`).
+        let tool = CalculatorTool::new();
+        let at_cap: Vec<f64> = (0..MAX_VALUES_LEN).map(|n| n as f64).collect();
+        let result = tool
+            .execute(json!({"function": "sum", "values": at_cap}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "exact-cap array should succeed: {:?}",
+            result.error
+        );
+        // 0 + 1 + ... + 9999 = 9999 * 10000 / 2 = 49_995_000
+        assert_eq!(result.output, "49995000");
+    }
+
+    #[tokio::test]
     async fn test_log_base10() {
         let tool = CalculatorTool::new();
         let result = tool
@@ -630,6 +722,30 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output, "120");
+    }
+
+    #[tokio::test]
+    async fn test_factorial_max_input() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"function": "factorial", "x": 34.0}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "295232799039604140847618609643520000000");
+    }
+
+    #[tokio::test]
+    async fn test_factorial_overflow_is_graceful() {
+        let tool = CalculatorTool::new();
+        // 35! overflows the u128 accumulator (~1.03e40 > u128::MAX ~3.40e38).
+        // This must return a graceful error rather than panicking on overflow.
+        let result = tool
+            .execute(json!({"function": "factorial", "x": 35.0}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("too large"));
     }
 
     #[tokio::test]

@@ -1,29 +1,42 @@
-//! Google Gemini provider with support for:
+//! Google Gemini model_provider with support for:
 //! - Direct API key (`GEMINI_API_KEY` env var or config)
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 //! - ZeroClaw auth-profiles OAuth tokens
-//! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::traits::{ChatMessage, Provider, TokenUsage};
+use crate::traits::{
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    ModelProvider, TokenUsage, ToolsPayload,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
-use reqwest::Client;
+use reqwest::{Client, header::HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Gemini provider supporting multiple authentication methods.
-pub struct GeminiProvider {
+const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
+
+/// Gemini model_provider supporting multiple authentication methods.
+pub struct GeminiModelProvider {
+    /// `[providers.models.gemini.<alias>]` config-key alias.
+    alias: String,
     auth: Option<GeminiAuth>,
     oauth_project: Arc<tokio::sync::Mutex<Option<String>>>,
+    oauth_project_seed: Option<String>,
     oauth_cred_paths: Vec<PathBuf>,
     oauth_index: Arc<tokio::sync::Mutex<usize>>,
     /// AuthService for managed profiles (auth-profiles.json).
     auth_service: Option<AuthService>,
     /// Override profile name for managed auth.
     auth_profile_override: Option<String>,
+    /// Per-alias OAuth app credentials carried at construction time so
+    /// runtime token refreshes via `AuthService::get_valid_gemini_access_token`
+    /// can mint new access tokens without dipping back into Config. Set
+    /// from `GeminiModelProviderConfig.oauth_client_id` / `oauth_client_secret`.
+    oauth_client_id: Option<String>,
+    oauth_client_secret: Option<String>,
 }
 
 /// Mutable OAuth token state — supports runtime refresh for long-lived processes.
@@ -39,12 +52,8 @@ struct OAuthTokenState {
 /// Resolved credential — the variant determines both the HTTP auth method
 /// and the diagnostic label returned by `auth_source()`.
 enum GeminiAuth {
-    /// Explicit API key from config: sent as `?key=` query parameter.
+    /// Explicit API key from config: sent as `x-goog-api-key`.
     ExplicitKey(String),
-    /// API key from `GEMINI_API_KEY` env var: sent as `?key=`.
-    EnvGeminiKey(String),
-    /// API key from `GOOGLE_API_KEY` env var: sent as `?key=`.
-    EnvGoogleKey(String),
     /// OAuth access token from Gemini CLI: sent as `Authorization: Bearer`.
     /// Wrapped in a Mutex to allow runtime token refresh.
     OAuthToken(Arc<tokio::sync::Mutex<OAuthTokenState>>),
@@ -54,27 +63,9 @@ enum GeminiAuth {
 }
 
 impl GeminiAuth {
-    /// Whether this credential is an API key (sent as `?key=` query param).
-    fn is_api_key(&self) -> bool {
-        matches!(
-            self,
-            GeminiAuth::ExplicitKey(_) | GeminiAuth::EnvGeminiKey(_) | GeminiAuth::EnvGoogleKey(_)
-        )
-    }
-
     /// Whether this credential is an OAuth token (CLI or managed).
     fn is_oauth(&self) -> bool {
         matches!(self, GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth)
-    }
-
-    /// The raw credential string (for API key variants only).
-    fn api_key_credential(&self) -> &str {
-        match self {
-            GeminiAuth::ExplicitKey(s)
-            | GeminiAuth::EnvGeminiKey(s)
-            | GeminiAuth::EnvGoogleKey(s) => s,
-            GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => "",
-        }
     }
 }
 
@@ -91,22 +82,6 @@ struct GenerateContentRequest {
     generation_config: GenerationConfig,
 }
 
-/// Request envelope for the internal cloudcode-pa API.
-/// OAuth tokens from Gemini CLI are scoped for this endpoint.
-///
-/// The internal API expects a nested structure:
-/// ```json
-/// {
-///   "model": "models/gemini-...",
-///   "project": "...",
-///   "request": {
-///     "contents": [...],
-///     "systemInstruction": {...},
-///     "generationConfig": {...}
-///   }
-/// }
-/// ```
-/// Ref: gemini-cli `packages/core/src/code_assist/converter.ts`
 #[derive(Debug, Serialize)]
 struct InternalGenerateContentEnvelope {
     model: String,
@@ -158,7 +133,7 @@ struct InlineData {
 /// multimodal pipeline), they are extracted as inline_data parts. The remaining
 /// text becomes a text part. Falls back to a single text part if no markers.
 fn build_parts(content: &str) -> Vec<Part> {
-    let (text, image_refs) = crate::multimodal::parse_image_markers(content);
+    let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
     let mut parts = Vec::new();
     let trimmed = text.trim();
     if !trimmed.is_empty() {
@@ -187,7 +162,8 @@ fn build_parts(content: &str) -> Vec<Part> {
 
 #[derive(Debug, Serialize, Clone)]
 struct GenerationConfig {
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
 }
@@ -208,14 +184,6 @@ struct GeminiUsageMetadata {
     prompt_token_count: Option<u64>,
     #[serde(default, rename = "candidatesTokenCount")]
     candidates_token_count: Option<u64>,
-}
-
-/// Response envelope for the internal cloudcode-pa API.
-/// The internal API nests the standard response under a `response` field.
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct InternalGenerateContentResponse {
-    response: GenerateContentResponse,
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,15 +207,6 @@ struct ResponsePart {
 }
 
 impl CandidateContent {
-    /// Extract effective text, skipping thinking/signature parts.
-    ///
-    /// Gemini thinking models (e.g. gemini-3-pro-preview) return parts like:
-    /// - `{"thought": true, "text": "reasoning..."}` — internal reasoning
-    /// - `{"text": "actual answer"}` — the real response
-    /// - `{"thoughtSignature": "..."}` — opaque signature (no text field)
-    ///
-    /// Returns the non-thinking text, falling back to thinking text only when
-    /// no non-thinking content is available.
     fn effective_text(self) -> Option<String> {
         let mut answer_parts: Vec<String> = Vec::new();
         let mut first_thinking: Option<String> = None;
@@ -283,9 +242,15 @@ impl GenerateContentResponse {
     fn into_effective_response(self) -> Self {
         match self {
             Self {
-                response: Some(inner),
+                response: Some(mut inner),
+                usage_metadata,
                 ..
-            } => *inner,
+            } => {
+                if inner.usage_metadata.is_none() {
+                    inner.usage_metadata = usage_metadata;
+                }
+                *inner
+            }
             other => other,
         }
     }
@@ -328,8 +293,50 @@ const CLOUDCODE_PA_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1inter
 const LOAD_CODE_ASSIST_ENDPOINT: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 
+/// A `loadCodeAssist` project reference: a bare id string, or an object
+/// carrying `id` / `projectId`. Google returns either shape depending on
+/// whether the account already has an onboarded project.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ProjectRef {
+    Id(String),
+    Object {
+        #[serde(alias = "projectId")]
+        id: Option<String>,
+    },
+}
+
+impl ProjectRef {
+    fn into_id(self) -> Option<String> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Object { id } => id,
+        }
+        .filter(|p| !p.trim().is_empty())
+    }
+}
+
+#[derive(Deserialize)]
+struct LoadCodeAssistResponse {
+    #[serde(rename = "cloudaicompanionProject")]
+    cloudaicompanion_project: Option<ProjectRef>,
+    #[serde(rename = "currentCloudaicompanionProject")]
+    current_cloudaicompanion_project: Option<ProjectRef>,
+}
+
+impl LoadCodeAssistResponse {
+    fn resolve_project_id(self) -> Option<String> {
+        self.cloudaicompanion_project
+            .and_then(ProjectRef::into_id)
+            .or_else(|| {
+                self.current_cloudaicompanion_project
+                    .and_then(ProjectRef::into_id)
+            })
+    }
+}
+
 /// Google AI Studio's Gemini endpoint.
-const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+pub(crate) const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TOKEN REFRESH
@@ -342,11 +349,6 @@ struct RefreshedToken {
     expiry_millis: Option<i64>,
 }
 
-/// Refresh an expired Gemini CLI OAuth token using the refresh_token grant.
-///
-/// Client credentials are optional and can be sourced from:
-/// - `oauth_creds.json` if present
-/// - `GEMINI_OAUTH_CLIENT_ID` / `GEMINI_OAUTH_CLIENT_SECRET` env vars
 fn refresh_gemini_cli_token(
     refresh_token: &str,
     client_id: Option<&str>,
@@ -366,7 +368,20 @@ fn refresh_gemini_cli_token(
         .header("Accept", "application/json")
         .form(&form)
         .send()
-        .map_err(|error| anyhow::anyhow!("Gemini CLI OAuth refresh request failed: {error}"))?;
+        .map_err(|error| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "oauth_provider": "gemini_cli",
+                        "phase": "refresh_request",
+                        "error": format!("{}", error),
+                    })),
+                "gemini: CLI OAuth refresh request failed"
+            );
+            anyhow::Error::msg(format!("Gemini CLI OAuth refresh request failed: {error}"))
+        })?;
 
     let status = response.status();
     let body = response
@@ -383,13 +398,33 @@ fn refresh_gemini_cli_token(
         expires_in: Option<i64>,
     }
 
-    let parsed: TokenResponse = serde_json::from_str(&body)
-        .map_err(|_| anyhow::anyhow!("Gemini CLI OAuth refresh response is not valid JSON"))?;
+    let parsed: TokenResponse = serde_json::from_str(&body).map_err(|_| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"oauth_provider": "gemini_cli"})),
+            "gemini: CLI OAuth refresh response is not valid JSON"
+        );
+        anyhow::Error::msg("Gemini CLI OAuth refresh response is not valid JSON")
+    })?;
 
     let access_token = parsed
         .access_token
         .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Gemini CLI OAuth refresh response missing access_token"))?;
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "oauth_provider": "gemini_cli",
+                        "missing": "access_token",
+                    })),
+                "gemini: CLI OAuth refresh missing access_token"
+            );
+            anyhow::Error::msg("Gemini CLI OAuth refresh response missing access_token")
+        })?;
 
     let expiry_millis = parsed.expires_in.and_then(|secs| {
         let now_millis = std::time::SystemTime::now()
@@ -414,10 +449,10 @@ fn build_oauth_refresh_form(
         ("grant_type", "refresh_token".to_string()),
         ("refresh_token", refresh_token.to_string()),
     ];
-    if let Some(id) = client_id.and_then(GeminiProvider::normalize_non_empty) {
+    if let Some(id) = client_id.and_then(GeminiModelProvider::normalize_non_empty) {
         form.push(("client_id", id));
     }
-    if let Some(secret) = client_secret.and_then(GeminiProvider::normalize_non_empty) {
+    if let Some(secret) = client_secret.and_then(GeminiModelProvider::normalize_non_empty) {
         form.push(("client_secret", secret));
     }
     form
@@ -440,12 +475,12 @@ fn extract_client_id_from_id_token(id_token: &str) -> Option<String> {
     claims
         .aud
         .as_deref()
-        .and_then(GeminiProvider::normalize_non_empty)
+        .and_then(GeminiModelProvider::normalize_non_empty)
         .or_else(|| {
             claims
                 .azp
                 .as_deref()
-                .and_then(GeminiProvider::normalize_non_empty)
+                .and_then(GeminiModelProvider::normalize_non_empty)
         })
 }
 
@@ -466,109 +501,172 @@ async fn refresh_gemini_cli_token_async(
         )
     })
     .await
-    .map_err(|e| anyhow::anyhow!("Token refresh task panicked: {e}"))?
+    .map_err(|e| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "oauth_provider": "gemini_cli",
+                    "phase": "task_join",
+                    "error": format!("{}", e),
+                })),
+            "gemini: token refresh task panicked"
+        );
+        anyhow::Error::msg(format!("Token refresh task panicked: {e}"))
+    })?
 }
 
-impl GeminiProvider {
-    /// Create a new Gemini provider.
-    ///
-    /// Authentication priority:
-    /// 1. Explicit API key passed in
-    /// 2. `GEMINI_API_KEY` environment variable
-    /// 3. `GOOGLE_API_KEY` environment variable
-    /// 4. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
-    pub fn new(api_key: Option<&str>) -> Self {
-        let oauth_cred_paths = Self::discover_oauth_cred_paths();
-        let resolved_auth = api_key
-            .and_then(Self::normalize_non_empty)
-            .map(GeminiAuth::ExplicitKey)
-            .or_else(|| Self::load_non_empty_env("GEMINI_API_KEY").map(GeminiAuth::EnvGeminiKey))
-            .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey))
-            .or_else(|| {
-                Self::try_load_gemini_cli_token(oauth_cred_paths.first())
-                    .map(|state| GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state))))
-            });
+/// Typed builder for [`GeminiModelProvider`].
+///
+/// Only `alias` is required; every credential input is optional and layered
+/// at [`Self::build`] time in this order:
+///   1. Explicit API key from [`Self::api_key`]
+///   2. Managed OAuth via [`Self::managed_auth`] (when wired and the
+///      profile exists)
+///   3. CLI OAuth tokens from `~/.gemini/oauth_creds.json`
+#[must_use]
+pub struct GeminiBuilder {
+    alias: String,
+    api_key: Option<String>,
+    auth_service: Option<AuthService>,
+    profile_override: Option<String>,
+    oauth_project_seed: Option<String>,
+    oauth_client_id: Option<String>,
+    oauth_client_secret: Option<String>,
+}
 
-        Self {
-            auth: resolved_auth,
-            oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
-            oauth_cred_paths,
-            oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
-            auth_service: None,
-            auth_profile_override: None,
-        }
+impl GeminiBuilder {
+    /// Explicit API key (from `[providers.models.gemini.<alias>] api_key`).
+    /// When set (and non-empty after trimming), takes precedence over every
+    /// OAuth path.
+    pub fn api_key(mut self, key: Option<&str>) -> Self {
+        self.api_key = key.map(str::to_string);
+        self
     }
 
-    /// Create a new Gemini provider with managed OAuth from auth-profiles.json.
-    ///
-    /// Authentication priority:
-    /// 1. Explicit API key passed in
-    /// 2. `GEMINI_API_KEY` environment variable
-    /// 3. `GOOGLE_API_KEY` environment variable
-    /// 4. Managed OAuth from auth-profiles.json (if auth_service provided)
-    /// 5. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
-    pub fn new_with_auth(
-        api_key: Option<&str>,
+    /// Wire up managed OAuth via the shared [`AuthService`], with an
+    /// optional profile override. When set and no explicit API key is
+    /// provided, the builder probes the service at build time; if a
+    /// managed profile exists, the resulting provider uses managed OAuth
+    /// instead of falling through to the CLI creds.
+    pub fn managed_auth(
+        mut self,
         auth_service: AuthService,
         profile_override: Option<String>,
     ) -> Self {
-        let oauth_cred_paths = Self::discover_oauth_cred_paths();
+        self.auth_service = Some(auth_service);
+        self.profile_override = profile_override;
+        self
+    }
 
-        // First check API keys
-        let resolved_auth = api_key
-            .and_then(Self::normalize_non_empty)
-            .map(GeminiAuth::ExplicitKey)
-            .or_else(|| Self::load_non_empty_env("GEMINI_API_KEY").map(GeminiAuth::EnvGeminiKey))
-            .or_else(|| Self::load_non_empty_env("GOOGLE_API_KEY").map(GeminiAuth::EnvGoogleKey));
+    /// Seed value for the OAuth project resolution cache.
+    pub fn oauth_project_seed(mut self, seed: Option<String>) -> Self {
+        self.oauth_project_seed = seed;
+        self
+    }
 
-        // If no API key, we'll use managed OAuth (checked at runtime)
-        // or fall back to CLI OAuth
-        let (auth, use_managed) = if resolved_auth.is_some() {
-            (resolved_auth, false)
-        } else {
-            // Check if we have a managed profile - this is a blocking check
-            // but we need to know at construction time
-            let has_managed = std::thread::scope(|s| {
-                s.spawn(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .ok()?;
-                    rt.block_on(async {
-                        auth_service
-                            .get_gemini_profile(profile_override.as_deref())
-                            .await
-                            .ok()
-                            .flatten()
-                    })
-                })
-                .join()
-                .ok()
-                .flatten()
-                .is_some()
-            });
+    /// Override the OAuth client credentials (defaults to the Gemini CLI
+    /// public client when unset).
+    pub fn oauth_client(
+        mut self,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+    ) -> Self {
+        self.oauth_client_id = client_id;
+        self.oauth_client_secret = client_secret;
+        self
+    }
 
-            if has_managed {
-                (Some(GeminiAuth::ManagedOAuth), true)
-            } else {
-                // Fall back to CLI OAuth
-                let cli_auth = Self::try_load_gemini_cli_token(oauth_cred_paths.first())
-                    .map(|state| GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state))));
-                (cli_auth, false)
-            }
+    /// Resolve the credential layers and finalize the provider.
+    pub fn build(self) -> GeminiModelProvider {
+        let oauth_cred_paths = GeminiModelProvider::discover_oauth_cred_paths();
+
+        // Layer 1 — explicit API key.
+        let explicit_key = self
+            .api_key
+            .as_deref()
+            .and_then(GeminiModelProvider::normalize_non_empty)
+            .map(GeminiAuth::ExplicitKey);
+
+        // Layer 3 — CLI OAuth fallback. Used both when no managed service is
+        // wired at all, and when a managed service was wired but no profile
+        // was found on disk.
+        let load_cli_oauth = || {
+            GeminiModelProvider::try_load_gemini_cli_token(oauth_cred_paths.first())
+                .map(|state| GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(state))))
         };
 
-        Self {
+        // Layer 2 — managed OAuth (only probed when an AuthService is wired
+        // and no explicit key beat it).
+        let (auth, use_managed) = match (explicit_key, self.auth_service.as_ref()) {
+            (Some(a), _) => (Some(a), false),
+            (None, Some(service)) => {
+                let profile = self.profile_override.clone();
+                let has_managed = std::thread::scope(|s| {
+                    let service = service.clone();
+                    s.spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .ok()?;
+                        rt.block_on(async {
+                            service
+                                .get_gemini_profile(profile.as_deref())
+                                .await
+                                .ok()
+                                .flatten()
+                        })
+                    })
+                    .join()
+                    .ok()
+                    .flatten()
+                    .is_some()
+                });
+                if has_managed {
+                    (Some(GeminiAuth::ManagedOAuth), true)
+                } else {
+                    (load_cli_oauth(), false)
+                }
+            }
+            (None, None) => (load_cli_oauth(), false),
+        };
+
+        GeminiModelProvider {
+            alias: self.alias,
             auth,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
+            oauth_project_seed: self.oauth_project_seed,
             oauth_cred_paths,
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
-            auth_service: if use_managed {
-                Some(auth_service)
-            } else {
-                None
-            },
-            auth_profile_override: profile_override,
+            auth_service: if use_managed { self.auth_service } else { None },
+            auth_profile_override: self.profile_override,
+            oauth_client_id: self.oauth_client_id,
+            oauth_client_secret: self.oauth_client_secret,
+        }
+    }
+}
+
+impl GeminiModelProvider {
+    /// Entry point for constructing a Gemini provider. Only `alias` is
+    /// required; layer optional credential inputs onto the returned
+    /// [`GeminiBuilder`].
+    ///
+    /// Authentication priority (evaluated at build time):
+    /// 1. Explicit API key ([`GeminiBuilder::api_key`], from
+    ///    `[providers.models.gemini.<alias>] api_key`)
+    /// 2. Managed OAuth via [`GeminiBuilder::managed_auth`], when wired
+    ///    and a profile exists
+    /// 3. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
+    pub fn builder(alias: &str) -> GeminiBuilder {
+        GeminiBuilder {
+            alias: alias.to_string(),
+            api_key: None,
+            auth_service: None,
+            profile_override: None,
+            oauth_project_seed: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
         }
     }
 
@@ -581,12 +679,6 @@ impl GeminiProvider {
         }
     }
 
-    fn load_non_empty_env(name: &str) -> Option<String> {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| Self::normalize_non_empty(&value))
-    }
-
     fn load_gemini_cli_creds(creds_path: &PathBuf) -> Option<GeminiCliOAuthCreds> {
         if !creds_path.exists() {
             return None;
@@ -595,10 +687,6 @@ impl GeminiProvider {
         serde_json::from_str(&content).ok()
     }
 
-    /// Discover all OAuth credential files from known Gemini CLI installations.
-    ///
-    /// Looks in `~/.gemini/oauth_creds.json` (default) plus any
-    /// `~/.gemini-*-home/.gemini/oauth_creds.json` siblings.
     fn discover_oauth_cred_paths() -> Vec<PathBuf> {
         let home = match UserDirs::new() {
             Some(u) => u.home_dir().to_path_buf(),
@@ -635,8 +723,7 @@ impl GeminiProvider {
 
     /// Try to load OAuth credentials from Gemini CLI's cached credentials.
     /// Location: `~/.gemini/oauth_creds.json`
-    ///
-    /// Returns the full `OAuthTokenState` so the provider can refresh at runtime.
+    /// Returns the full `OAuthTokenState` so the model_provider can refresh at runtime.
     fn try_load_gemini_cli_token(path: Option<&PathBuf>) -> Option<OAuthTokenState> {
         let creds = Self::load_gemini_cli_creds(path?)?;
 
@@ -658,20 +745,15 @@ impl GeminiProvider {
             .as_deref()
             .and_then(extract_client_id_from_id_token);
 
-        let client_id = Self::load_non_empty_env("GEMINI_OAUTH_CLIENT_ID")
-            .or_else(|| {
-                creds
-                    .client_id
-                    .as_deref()
-                    .and_then(Self::normalize_non_empty)
-            })
+        let client_id = creds
+            .client_id
+            .as_deref()
+            .and_then(Self::normalize_non_empty)
             .or(id_token_client_id);
-        let client_secret = Self::load_non_empty_env("GEMINI_OAUTH_CLIENT_SECRET").or_else(|| {
-            creds
-                .client_secret
-                .as_deref()
-                .and_then(Self::normalize_non_empty)
-        });
+        let client_secret = creds
+            .client_secret
+            .as_deref()
+            .and_then(Self::normalize_non_empty);
 
         Some(OAuthTokenState {
             access_token,
@@ -680,12 +762,6 @@ impl GeminiProvider {
             client_secret,
             expiry_millis,
         })
-    }
-
-    /// Get the Gemini CLI config directory (~/.gemini)
-    #[allow(dead_code)]
-    fn gemini_cli_dir() -> Option<PathBuf> {
-        UserDirs::new().map(|u| u.home_dir().join(".gemini"))
     }
 
     /// Check if Gemini CLI is configured and has valid credentials
@@ -702,11 +778,12 @@ impl GeminiProvider {
         })
     }
 
-    /// Check if any Gemini authentication is available
+    /// Check if any Gemini authentication is available via the Gemini CLI
+    /// OAuth credential cache. Per-alias config-supplied keys are tracked
+    /// separately on the constructed provider, so this helper no longer
+    /// reads process env.
     pub fn has_any_auth() -> bool {
-        Self::load_non_empty_env("GEMINI_API_KEY").is_some()
-            || Self::load_non_empty_env("GOOGLE_API_KEY").is_some()
-            || Self::has_cli_credentials()
+        Self::has_cli_credentials()
     }
 
     /// Get authentication source description for diagnostics.
@@ -714,8 +791,6 @@ impl GeminiProvider {
     pub fn auth_source(&self) -> &'static str {
         match self.auth.as_ref() {
             Some(GeminiAuth::ExplicitKey(_)) => "config",
-            Some(GeminiAuth::EnvGeminiKey(_)) => "GEMINI_API_KEY env var",
-            Some(GeminiAuth::EnvGoogleKey(_)) => "GOOGLE_API_KEY env var",
             Some(GeminiAuth::OAuthToken(_)) => "Gemini CLI OAuth",
             Some(GeminiAuth::ManagedOAuth) => "auth-profiles",
             None => "none",
@@ -748,7 +823,11 @@ impl GeminiProvider {
                     guard.client_secret.as_deref(),
                 )
                 .await?;
-                tracing::info!("Gemini CLI OAuth token refreshed successfully (runtime)");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Gemini CLI OAuth token refreshed successfully (runtime)"
+                );
                 guard.access_token = refreshed.access_token;
                 guard.expiry_millis = refreshed.expiry_millis;
             } else {
@@ -793,9 +872,14 @@ impl GeminiProvider {
                     let mut cached_project = self.oauth_project.lock().await;
                     *cached_project = None;
                 }
-                tracing::warn!(
-                    "Gemini OAuth: rotated credential to {}",
-                    self.oauth_cred_paths[next].display()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Gemini OAuth: rotated credential to {}",
+                        self.oauth_cred_paths[next].display().to_string()
+                    )
                 );
                 return true;
             }
@@ -814,15 +898,6 @@ impl GeminiProvider {
         model.strip_prefix("models/").unwrap_or(model).to_string()
     }
 
-    /// Build the API URL based on auth type.
-    ///
-    /// - API key users → public `generativelanguage.googleapis.com/v1beta`
-    /// - OAuth users → internal `cloudcode-pa.googleapis.com/v1internal`
-    ///
-    /// The Gemini CLI OAuth tokens are scoped for the internal Code Assist API,
-    /// not the public API. Sending them to the public endpoint results in
-    /// "400 Bad Request: API key not valid" errors.
-    /// See: <https://github.com/google-gemini/gemini-cli/issues/19200>
     fn build_generate_content_url(model: &str, auth: &GeminiAuth) -> String {
         match auth {
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
@@ -832,20 +907,14 @@ impl GeminiProvider {
             }
             _ => {
                 let model_name = Self::format_model_name(model);
-                let base_url = format!("{BASE_URL}/{model_name}:generateContent");
-
-                if auth.is_api_key() {
-                    format!("{base_url}?key={}", auth.api_key_credential())
-                } else {
-                    base_url
-                }
+                format!("{BASE_URL}/{model_name}:generateContent")
             }
         }
     }
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.gemini",
+            "model_provider.gemini",
             120,
             10,
         )
@@ -854,8 +923,7 @@ impl GeminiProvider {
     /// Resolve the GCP project ID for OAuth by calling the loadCodeAssist endpoint.
     /// Caches the result for subsequent calls.
     async fn resolve_oauth_project(&self, token: &str) -> anyhow::Result<String> {
-        let project_seed = Self::load_non_empty_env("GOOGLE_CLOUD_PROJECT")
-            .or_else(|| Self::load_non_empty_env("GOOGLE_CLOUD_PROJECT_ID"));
+        let project_seed = self.oauth_project_seed.clone();
         let project_seed_for_request = project_seed.clone();
         let duet_project_for_request = project_seed.clone();
 
@@ -888,26 +956,34 @@ impl GeminiProvider {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             if let Some(seed) = project_seed {
-                tracing::warn!(
-                    "loadCodeAssist failed (HTTP {status}); using GOOGLE_CLOUD_PROJECT fallback"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                    "loadCodeAssist failed (HTTP ); using oauth_project seed fallback"
                 );
                 return Ok(seed);
             }
             anyhow::bail!("loadCodeAssist failed (HTTP {status}): {body}");
         }
 
-        #[derive(Deserialize)]
-        struct LoadCodeAssistResponse {
-            #[serde(rename = "cloudaicompanionProject")]
-            cloudaicompanion_project: Option<String>,
-        }
-
         let result: LoadCodeAssistResponse = response.json().await?;
         let project = result
-            .cloudaicompanion_project
-            .filter(|p| !p.trim().is_empty())
+            .resolve_project_id()
             .or(project_seed)
-            .ok_or_else(|| anyhow::anyhow!("loadCodeAssist response missing project context"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "missing": "cloudaicompanionProject",
+                        })),
+                    "gemini: loadCodeAssist missing project context"
+                );
+                anyhow::Error::msg("loadCodeAssist response missing project context")
+            })?;
 
         // Cache for future calls
         {
@@ -919,7 +995,6 @@ impl GeminiProvider {
     }
 
     /// Build the HTTP request for generateContent.
-    ///
     /// For OAuth, pass the resolved `oauth_token` and `project`.
     /// For API key, both are `None`.
     fn build_generate_content_request(
@@ -931,9 +1006,12 @@ impl GeminiProvider {
         include_generation_config: bool,
         project: Option<&str>,
         oauth_token: Option<&str>,
-    ) -> reqwest::RequestBuilder {
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
         let req = self.http_client().post(url).json(request);
-        match auth {
+        Ok(match auth {
+            GeminiAuth::ExplicitKey(key) => {
+                req.header(GOOGLE_API_KEY_HEADER, Self::sensitive_api_key_header(key)?)
+            }
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
                 let token = oauth_token.unwrap_or_default();
                 // Internal Code Assist API uses a wrapped payload shape:
@@ -957,8 +1035,21 @@ impl GeminiProvider {
                     .json(&internal_request)
                     .bearer_auth(token)
             }
-            _ => req,
-        }
+        })
+    }
+
+    fn sensitive_api_key_header(key: &str) -> anyhow::Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(key)
+            .map_err(|_| anyhow::Error::msg("Gemini API key contains invalid header characters"))?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_api_key_probe_request(&self, key: &str) -> anyhow::Result<reqwest::RequestBuilder> {
+        Ok(self
+            .http_client()
+            .get(format!("{BASE_URL}/models"))
+            .header(GOOGLE_API_KEY_HEADER, Self::sensitive_api_key_header(key)?))
     }
 
     fn should_retry_oauth_without_generation_config(
@@ -982,22 +1073,125 @@ impl GeminiProvider {
     }
 }
 
-impl GeminiProvider {
+impl GeminiModelProvider {
+    fn build_chat_contents(
+        messages: &[ChatMessage],
+        tool_instructions: Option<&str>,
+    ) -> anyhow::Result<(Vec<Content>, Option<Content>)> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => system_parts.push(&msg.content),
+                "user" => contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: build_parts(&msg.content),
+                }),
+                "assistant" => contents.push(Content {
+                    role: Some("model".to_string()),
+                    parts: vec![Part::text(&msg.content)],
+                }),
+                _ => {}
+            }
+        }
+        if let Some(instructions) = tool_instructions {
+            system_parts.push(instructions);
+        }
+        // Gemini rejects a request whose last turn is a model turn. History
+        // trims, session restores, and steering continuations can all leave
+        // the history ending on the model's own output. Those model turns are
+        // the context a continuation must see, so they are kept and a final
+        // user continuation turn is appended; a request with no turns at all
+        // falls back to a lone user placeholder, and model-only history has
+        // nothing to anchor a request on and fails explicitly instead of
+        // being silently replaced with a context-free one.
+        match contents.last().map(|c| c.role.as_deref()) {
+            Some(Some("user")) => {}
+            Some(Some("model")) => {
+                if contents.iter().any(|c| c.role.as_deref() == Some("user")) {
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: vec![Part::text("[continue]")],
+                    });
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "turns": contents.len() })),
+                        "gemini: model-only history cannot anchor a generateContent request"
+                    );
+                    return Err(anyhow::Error::msg(
+                        "gemini: history ends on model turns but contains no user turn; \
+                         refusing to drop the model context or fabricate a context-free request",
+                    ));
+                }
+            }
+            // no turns at all (empty or system-only): a request still needs
+            // one user turn to anchor on
+            _ => {
+                contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part::text("[continue]")],
+                });
+            }
+        }
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part::text(system_parts.join("\n\n"))],
+            })
+        };
+        Ok((contents, system_instruction))
+    }
+
+    async fn chat_with_history_full(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        let (contents, system_instruction) = Self::build_chat_contents(messages, None)?;
+        self.send_generate_content(contents, system_instruction, model, temperature)
+            .await
+    }
+
+    fn token_usage_from_metadata(usage: GeminiUsageMetadata) -> Option<TokenUsage> {
+        if usage.prompt_token_count.is_none() && usage.candidates_token_count.is_none() {
+            return None;
+        }
+        Some(TokenUsage {
+            input_tokens: usage.prompt_token_count,
+            output_tokens: usage.candidates_token_count,
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        })
+    }
+
     async fn send_generate_content(
         &self,
         contents: Vec<Content>,
         system_instruction: Option<Content>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let auth = self.auth.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "auth"})),
+                "gemini: no auth configured"
+            );
+            anyhow::Error::msg(
                 "Gemini API key not found. Options:\n\
                  1. Set GEMINI_API_KEY env var\n\
                  2. Run `gemini` CLI to authenticate (tokens will be reused)\n\
-                 3. Run `zeroclaw auth login --provider gemini`\n\
+                 3. Run `zeroclaw auth login --model-provider gemini`\n\
                  4. Get an API key from https://aistudio.google.com/app/apikey\n\
-                 5. Run `zeroclaw onboard` to configure"
+                 5. Run `zeroclaw quickstart --model-provider gemini --api-key <key>` to configure",
             )
         })?;
 
@@ -1014,16 +1208,33 @@ impl GeminiProvider {
                 (Some(token), Some(proj))
             }
             GeminiAuth::ManagedOAuth => {
-                let auth_service = self
-                    .auth_service
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("ManagedOAuth requires auth_service"))?;
+                let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "auth_service"})),
+                        "gemini: ManagedOAuth requires auth_service"
+                    );
+                    anyhow::Error::msg("ManagedOAuth requires auth_service")
+                })?;
                 let token = auth_service
-                    .get_valid_gemini_access_token(self.auth_profile_override.as_deref())
+                    .get_valid_gemini_access_token(
+                        self.auth_profile_override.as_deref(),
+                        self.oauth_client_id.as_deref().unwrap_or(""),
+                        self.oauth_client_secret.as_deref().unwrap_or(""),
+                    )
                     .await?
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Gemini auth profile not found. Run `zeroclaw auth login --provider gemini`."
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"oauth_provider": "gemini"})),
+                            "gemini: auth profile not found"
+                        );
+                        anyhow::Error::msg(
+                            "Gemini auth profile not found. Run `zeroclaw auth login --model-provider gemini`.",
                         )
                     })?;
                 let proj = self.resolve_oauth_project(&token).await?;
@@ -1052,7 +1263,7 @@ impl GeminiProvider {
                 true,
                 project.as_deref(),
                 oauth_token.as_deref(),
-            )
+            )?
             .send()
             .await?;
 
@@ -1084,17 +1295,41 @@ impl GeminiProvider {
                             (token, proj)
                         }
                         GeminiAuth::ManagedOAuth => {
-                            let auth_service = self.auth_service.as_ref().unwrap();
+                            let Some(auth_service) = self.auth_service.as_ref() else {
+                                return Err(anyhow::Error::msg(
+                                    "Gemini managed OAuth requires an auth service",
+                                ));
+                            };
                             let token = auth_service
                                 .get_valid_gemini_access_token(
                                     self.auth_profile_override.as_deref(),
+                                    self.oauth_client_id.as_deref().unwrap_or(""),
+                                    self.oauth_client_secret.as_deref().unwrap_or(""),
                                 )
                                 .await?
-                                .ok_or_else(|| anyhow::anyhow!("Gemini auth profile not found"))?;
+                                .ok_or_else(|| {
+                                    ::zeroclaw_log::record!(
+                                        ERROR,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Reject
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({"oauth_provider": "gemini"})
+                                        ),
+                                        "gemini: auth profile not found"
+                                    );
+                                    anyhow::Error::msg("Gemini auth profile not found")
+                                })?;
                             let proj = self.resolve_oauth_project(&token).await?;
                             (token, proj)
                         }
-                        _ => unreachable!(),
+                        _ => {
+                            return Err(anyhow::Error::msg(
+                                "Gemini retry reached a non-refreshable authentication mode",
+                            ));
+                        }
                     };
                     oauth_token = Some(new_token);
                     project = Some(new_project);
@@ -1107,7 +1342,7 @@ impl GeminiProvider {
                             true,
                             project.as_deref(),
                             oauth_token.as_deref(),
-                        )
+                        )?
                         .send()
                         .await?;
                 } else {
@@ -1116,7 +1351,10 @@ impl GeminiProvider {
             } else if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
             {
-                tracing::warn!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
                 );
                 response = self
@@ -1128,7 +1366,7 @@ impl GeminiProvider {
                         false,
                         project.as_deref(),
                         oauth_token.as_deref(),
-                    )
+                    )?
                     .send()
                     .await?;
             } else {
@@ -1142,7 +1380,10 @@ impl GeminiProvider {
             if auth.is_oauth()
                 && Self::should_retry_oauth_without_generation_config(status, &error_text)
             {
-                tracing::warn!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "Gemini OAuth internal endpoint rejected generationConfig; retrying without generationConfig"
                 );
                 response = self
@@ -1154,7 +1395,7 @@ impl GeminiProvider {
                         false,
                         project.as_deref(),
                         oauth_token.as_deref(),
-                    )
+                    )?
                     .send()
                     .await?;
             } else {
@@ -1177,35 +1418,42 @@ impl GeminiProvider {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
-        let usage = result.usage_metadata.map(|u| TokenUsage {
-            input_tokens: u.prompt_token_count,
-            output_tokens: u.candidates_token_count,
-            cached_input_tokens: None,
-        });
+        let usage = result
+            .usage_metadata
+            .and_then(Self::token_usage_from_metadata);
 
         let text = result
             .candidates
             .and_then(|c| c.into_iter().next())
             .and_then(|c| c.content)
             .and_then(|c| c.effective_text())
-            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "gemini: empty response text"
+                );
+                anyhow::Error::msg("No response from Gemini")
+            })?;
 
         Ok((text, usage))
     }
 }
 
 #[async_trait]
-impl Provider for GeminiProvider {
-    // ── Provider-family defaults ──
+impl ModelProvider for GeminiModelProvider {
+    // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
         Some(BASE_URL)
     }
 
-    fn capabilities(&self) -> zeroclaw_api::provider::ProviderCapabilities {
-        zeroclaw_api::provider::ProviderCapabilities {
+    fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+        zeroclaw_api::model_provider::ProviderCapabilities {
             vision: true,
             native_tool_calling: false,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
@@ -1216,7 +1464,6 @@ impl Provider for GeminiProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
             parts: vec![Part::text(sys)],
@@ -1239,45 +1486,44 @@ impl Provider for GeminiProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
-        let mut system_parts: Vec<&str> = Vec::new();
-        let mut contents: Vec<Content> = Vec::new();
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => {
-                    system_parts.push(&msg.content);
-                }
-                "user" => {
-                    contents.push(Content {
-                        role: Some("user".to_string()),
-                        parts: build_parts(&msg.content),
-                    });
-                }
-                "assistant" => {
-                    // Gemini API uses "model" role instead of "assistant"
-                    contents.push(Content {
-                        role: Some("model".to_string()),
-                        parts: vec![Part::text(&msg.content)],
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        let system_instruction = if system_parts.is_empty() {
-            None
-        } else {
-            Some(Content {
-                role: None,
-                parts: vec![Part::text(system_parts.join("\n\n"))],
-            })
-        };
-
         let (text, _usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+            .chat_with_history_full(messages, model, temperature)
             .await?;
         Ok(text)
+    }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let tool_instructions = if let Some(tools) = request.tools
+            && !tools.is_empty()
+            && !self.supports_native_tools()
+        {
+            Some(match self.convert_tools(tools) {
+                ToolsPayload::PromptGuided { instructions } => instructions,
+                payload => {
+                    anyhow::bail!(
+                        "Provider returned non-prompt-guided tools payload ({payload:?}) while supports_native_tools() is false"
+                    )
+                }
+            })
+        } else {
+            None
+        };
+        let (contents, system_instruction) =
+            Self::build_chat_contents(request.messages, tool_instructions.as_deref())?;
+        let (text, usage) = self
+            .send_generate_content(contents, system_instruction, model, temperature)
+            .await?;
+        Ok(ProviderChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+            usage,
+            reasoning_content: None,
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -1286,17 +1532,37 @@ impl Provider for GeminiProvider {
                 GeminiAuth::ManagedOAuth => {
                     // For ManagedOAuth, verify and refresh the token if needed.
                     // This ensures fallback works even if tokens expired during daemon uptime.
-                    let auth_service = self
-                        .auth_service
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("ManagedOAuth requires auth_service"))?;
+                    let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "auth_service"})),
+                            "gemini: ManagedOAuth requires auth_service"
+                        );
+                        anyhow::Error::msg("ManagedOAuth requires auth_service")
+                    })?;
 
                     let _token = auth_service
-                        .get_valid_gemini_access_token(self.auth_profile_override.as_deref())
+                        .get_valid_gemini_access_token(
+                            self.auth_profile_override.as_deref(),
+                            self.oauth_client_id.as_deref().unwrap_or(""),
+                            self.oauth_client_secret.as_deref().unwrap_or(""),
+                        )
                         .await?
                         .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Gemini auth profile not found or expired. Run: zeroclaw auth login --provider gemini"
+                            ::zeroclaw_log::record!(
+                                ERROR,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"oauth_provider": "gemini"})),
+                                "gemini: auth profile not found or expired"
+                            );
+                            anyhow::Error::msg(
+                                "Gemini auth profile not found or expired. Run: zeroclaw auth login --model-provider gemini",
                             )
                         })?;
 
@@ -1308,19 +1574,9 @@ impl Provider for GeminiProvider {
                     // CLI OAuth — cloudcode-pa does not expose a lightweight model-list probe.
                     // Token will be validated on first real request.
                 }
-                _ => {
+                GeminiAuth::ExplicitKey(key) => {
                     // API key path — verify with public API models endpoint.
-                    let url = if auth.is_api_key() {
-                        format!(
-                            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-                            auth.api_key_credential()
-                        )
-                    } else {
-                        "https://generativelanguage.googleapis.com/v1beta/models".to_string()
-                    };
-
-                    self.http_client()
-                        .get(&url)
+                    self.build_api_key_probe_request(key)?
                         .send()
                         .await?
                         .error_for_status()?;
@@ -1331,9 +1587,22 @@ impl Provider for GeminiProvider {
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        // Gemini's /v1beta/models requires ?key=<api_key>. Onboard pulls the
+        // Gemini's /v1beta/models requires authentication. Onboard pulls the
         // catalog from models.dev before the user has entered a key.
         crate::models_dev::list_models_for("google").await
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for GeminiModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Gemini,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -1342,7 +1611,6 @@ mod tests {
     use super::*;
     use reqwest::{StatusCode, header::AUTHORIZATION};
 
-    /// Helper to create a test OAuth auth variant.
     fn test_oauth_auth(token: &str) -> GeminiAuth {
         GeminiAuth::OAuthToken(Arc::new(tokio::sync::Mutex::new(OAuthTokenState {
             access_token: token.to_string(),
@@ -1353,25 +1621,98 @@ mod tests {
         })))
     }
 
-    fn test_provider(auth: Option<GeminiAuth>) -> GeminiProvider {
-        GeminiProvider {
+    fn test_model_provider(auth: Option<GeminiAuth>) -> GeminiModelProvider {
+        GeminiModelProvider {
+            alias: "test".to_string(),
             auth,
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
+            oauth_project_seed: None,
             oauth_cred_paths: Vec::new(),
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None,
             auth_profile_override: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
         }
     }
 
     #[test]
     fn normalize_non_empty_trims_and_filters() {
         assert_eq!(
-            GeminiProvider::normalize_non_empty(" value "),
+            GeminiModelProvider::normalize_non_empty(" value "),
             Some("value".into())
         );
-        assert_eq!(GeminiProvider::normalize_non_empty(""), None);
-        assert_eq!(GeminiProvider::normalize_non_empty(" \t\n"), None);
+        assert_eq!(GeminiModelProvider::normalize_non_empty(""), None);
+        assert_eq!(GeminiModelProvider::normalize_non_empty(" \t\n"), None);
+    }
+
+    fn resolve(body: &str) -> Option<String> {
+        serde_json::from_str::<LoadCodeAssistResponse>(body)
+            .unwrap()
+            .resolve_project_id()
+    }
+
+    #[test]
+    fn load_code_assist_reads_bare_string_project() {
+        assert_eq!(
+            resolve(r#"{"cloudaicompanionProject":"my-proj"}"#),
+            Some("my-proj".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_reads_object_id_and_project_id() {
+        assert_eq!(
+            resolve(r#"{"cloudaicompanionProject":{"id":"obj-proj"}}"#),
+            Some("obj-proj".into())
+        );
+        assert_eq!(
+            resolve(r#"{"cloudaicompanionProject":{"projectId":"alias-proj"}}"#),
+            Some("alias-proj".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_falls_back_to_current_project() {
+        assert_eq!(
+            resolve(r#"{"currentCloudaicompanionProject":"current-proj"}"#),
+            Some("current-proj".into())
+        );
+        assert_eq!(
+            resolve(r#"{"currentCloudaicompanionProject":{"id":"current-obj"}}"#),
+            Some("current-obj".into())
+        );
+        assert_eq!(
+            resolve(r#"{"currentCloudaicompanionProject":{"projectId":"current-alias"}}"#),
+            Some("current-alias".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_prefers_primary_over_current() {
+        assert_eq!(
+            resolve(
+                r#"{"cloudaicompanionProject":"primary","currentCloudaicompanionProject":"current"}"#
+            ),
+            Some("primary".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_skips_blank_primary_for_current() {
+        assert_eq!(
+            resolve(
+                r#"{"cloudaicompanionProject":"  ","currentCloudaicompanionProject":"current"}"#
+            ),
+            Some("current".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_none_when_no_project_context() {
+        assert_eq!(resolve(r#"{}"#), None);
+        assert_eq!(resolve(r#"{"cloudaicompanionProject":{"id":null}}"#), None);
+        assert_eq!(resolve(r#"{"cloudaicompanionProject":""}"#), None);
     }
 
     #[test]
@@ -1447,92 +1788,91 @@ mod tests {
         std::fs::write(file.path(), json).unwrap();
 
         let path = file.path().to_path_buf();
-        let state = GeminiProvider::try_load_gemini_cli_token(Some(&path)).unwrap();
+        let state = GeminiModelProvider::try_load_gemini_cli_token(Some(&path)).unwrap();
         assert_eq!(state.client_id.as_deref(), Some("derived-client-id"));
         assert_eq!(state.client_secret, None);
     }
 
     #[test]
     fn provider_creates_without_key() {
-        let provider = GeminiProvider::new(None);
+        let model_provider = GeminiModelProvider::builder("test").build();
         // May pick up env vars; just verify it doesn't panic
-        let _ = provider.auth_source();
+        let _ = model_provider.auth_source();
     }
 
     #[test]
     fn provider_creates_with_key() {
-        let provider = GeminiProvider::new(Some("test-api-key"));
+        let model_provider = GeminiModelProvider::builder("test")
+            .api_key(Some("test-api-key"))
+            .build();
         assert!(matches!(
-            provider.auth,
+            model_provider.auth,
             Some(GeminiAuth::ExplicitKey(ref key)) if key == "test-api-key"
         ));
     }
 
     #[test]
     fn provider_rejects_empty_key() {
-        let provider = GeminiProvider::new(Some(""));
-        assert!(!matches!(provider.auth, Some(GeminiAuth::ExplicitKey(_))));
-    }
-
-    #[test]
-    fn gemini_cli_dir_returns_path() {
-        let dir = GeminiProvider::gemini_cli_dir();
-        // Should return Some on systems with home dir
-        if UserDirs::new().is_some() {
-            assert!(dir.is_some());
-            assert!(dir.unwrap().ends_with(".gemini"));
-        }
+        let model_provider = GeminiModelProvider::builder("test")
+            .api_key(Some(""))
+            .build();
+        assert!(!matches!(
+            model_provider.auth,
+            Some(GeminiAuth::ExplicitKey(_))
+        ));
     }
 
     #[test]
     fn auth_source_explicit_key() {
-        let provider = test_provider(Some(GeminiAuth::ExplicitKey("key".into())));
-        assert_eq!(provider.auth_source(), "config");
+        let model_provider = test_model_provider(Some(GeminiAuth::ExplicitKey("key".into())));
+        assert_eq!(model_provider.auth_source(), "config");
     }
 
     #[test]
     fn auth_source_none_without_credentials() {
-        let provider = test_provider(None);
-        assert_eq!(provider.auth_source(), "none");
+        let model_provider = test_model_provider(None);
+        assert_eq!(model_provider.auth_source(), "none");
     }
 
     #[test]
     fn auth_source_oauth() {
-        let provider = test_provider(Some(test_oauth_auth("ya29.mock")));
-        assert_eq!(provider.auth_source(), "Gemini CLI OAuth");
+        let model_provider = test_model_provider(Some(test_oauth_auth("ya29.mock")));
+        assert_eq!(model_provider.auth_source(), "Gemini CLI OAuth");
     }
 
     #[test]
     fn model_name_formatting() {
         assert_eq!(
-            GeminiProvider::format_model_name("gemini-2.0-flash"),
+            GeminiModelProvider::format_model_name("gemini-2.0-flash"),
             "models/gemini-2.0-flash"
         );
         assert_eq!(
-            GeminiProvider::format_model_name("models/gemini-1.5-pro"),
+            GeminiModelProvider::format_model_name("models/gemini-1.5-pro"),
             "models/gemini-1.5-pro"
         );
         assert_eq!(
-            GeminiProvider::format_internal_model_name("models/gemini-2.5-flash"),
+            GeminiModelProvider::format_internal_model_name("models/gemini-2.5-flash"),
             "gemini-2.5-flash"
         );
         assert_eq!(
-            GeminiProvider::format_internal_model_name("gemini-2.5-flash"),
+            GeminiModelProvider::format_internal_model_name("gemini-2.5-flash"),
             "gemini-2.5-flash"
         );
     }
 
     #[test]
-    fn api_key_url_includes_key_query_param() {
+    fn api_key_url_excludes_credential() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
-        assert!(url.contains(":generateContent?key=api-key-123"));
+        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        assert!(url.ends_with(":generateContent"));
+        assert!(!url.contains("api-key-123"));
+        assert!(!url.contains("?key="));
     }
 
     #[test]
     fn oauth_url_uses_internal_endpoint() {
         let auth = test_oauth_auth("ya29.test-token");
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.starts_with("https://cloudcode-pa.googleapis.com/v1internal"));
         assert!(url.ends_with(":generateContent"));
         assert!(!url.contains("generativelanguage.googleapis.com"));
@@ -1542,16 +1882,16 @@ mod tests {
     #[test]
     fn api_key_url_uses_public_endpoint() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         assert!(url.contains("generativelanguage.googleapis.com/v1beta"));
         assert!(url.contains("models/gemini-2.0-flash"));
     }
 
     #[test]
     fn oauth_request_uses_bearer_auth_header() {
-        let provider = test_provider(Some(test_oauth_auth("ya29.mock-token")));
+        let model_provider = test_model_provider(Some(test_oauth_auth("ya29.mock-token")));
         let auth = test_oauth_auth("ya29.mock-token");
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1559,12 +1899,12 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: 0.7,
+                temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
         };
 
-        let request = provider
+        let request = model_provider
             .build_generate_content_request(
                 &auth,
                 &url,
@@ -1574,6 +1914,7 @@ mod tests {
                 Some("test-project"),
                 Some("ya29.mock-token"),
             )
+            .unwrap()
             .build()
             .unwrap();
 
@@ -1588,9 +1929,9 @@ mod tests {
 
     #[test]
     fn oauth_request_wraps_payload_in_request_envelope() {
-        let provider = test_provider(Some(test_oauth_auth("ya29.mock-token")));
+        let model_provider = test_model_provider(Some(test_oauth_auth("ya29.mock-token")));
         let auth = test_oauth_auth("ya29.mock-token");
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1598,12 +1939,12 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: 0.7,
+                temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
         };
 
-        let request = provider
+        let request = model_provider
             .build_generate_content_request(
                 &auth,
                 &url,
@@ -1613,6 +1954,7 @@ mod tests {
                 Some("test-project"),
                 Some("ya29.mock-token"),
             )
+            .unwrap()
             .build()
             .unwrap();
 
@@ -1629,10 +1971,11 @@ mod tests {
     }
 
     #[test]
-    fn api_key_request_does_not_set_bearer_header() {
-        let provider = test_provider(Some(GeminiAuth::ExplicitKey("api-key-123".into())));
+    fn api_key_request_uses_header_without_url_credential() {
+        let model_provider =
+            test_model_provider(Some(GeminiAuth::ExplicitKey("api-key-123".into())));
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
-        let url = GeminiProvider::build_generate_content_url("gemini-2.0-flash", &auth);
+        let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
@@ -1640,12 +1983,12 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: 0.7,
+                temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
         };
 
-        let request = provider
+        let request = model_provider
             .build_generate_content_request(
                 &auth,
                 &url,
@@ -1655,10 +1998,69 @@ mod tests {
                 None,
                 None,
             )
+            .unwrap()
             .build()
             .unwrap();
 
         assert!(request.headers().get(AUTHORIZATION).is_none());
+        assert_eq!(
+            request
+                .headers()
+                .get(GOOGLE_API_KEY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("api-key-123")
+        );
+        assert!(
+            request
+                .headers()
+                .get(GOOGLE_API_KEY_HEADER)
+                .expect("API key header")
+                .is_sensitive()
+        );
+        assert!(!request.url().as_str().contains("api-key-123"));
+        assert!(!request.url().query_pairs().any(|(name, _)| name == "key"));
+    }
+
+    #[test]
+    fn api_key_probe_uses_header_without_url_credential() {
+        let model_provider = test_model_provider(None);
+        let request = model_provider
+            .build_api_key_probe_request("api-key-123")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(GOOGLE_API_KEY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("api-key-123")
+        );
+        assert!(
+            request
+                .headers()
+                .get(GOOGLE_API_KEY_HEADER)
+                .expect("API key header")
+                .is_sensitive()
+        );
+        assert_eq!(
+            request.url().as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+    }
+
+    #[test]
+    fn api_key_header_rejects_control_characters_without_echoing_credential() {
+        let credential = "api-key-123\r\ninjected: value";
+        let error = GeminiModelProvider::sensitive_api_key_header(credential)
+            .expect_err("control characters must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "Gemini API key contains invalid header characters"
+        );
+        assert!(!error.to_string().contains(credential));
     }
 
     #[test]
@@ -1673,7 +2075,7 @@ mod tests {
                 parts: vec![Part::text("You are helpful")],
             }),
             generation_config: GenerationConfig {
-                temperature: 0.7,
+                temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
         };
@@ -1700,7 +2102,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: Some(GenerationConfig {
-                    temperature: 0.7,
+                    temperature: Some(0.7),
                     max_output_tokens: 8192,
                 }),
             },
@@ -1759,36 +2161,6 @@ mod tests {
     }
 
     #[test]
-    fn internal_response_deserialize_nested() {
-        let json = r#"{
-            "response": {
-                "candidates": [{
-                    "content": {
-                        "parts": [{"text": "Hello from internal API!"}]
-                    }
-                }]
-            }
-        }"#;
-
-        let internal: InternalGenerateContentResponse = serde_json::from_str(json).unwrap();
-        let text = internal
-            .response
-            .candidates
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-            .content
-            .unwrap()
-            .parts
-            .into_iter()
-            .next()
-            .unwrap()
-            .text;
-        assert_eq!(text, Some("Hello from internal API!".to_string()));
-    }
-
-    #[test]
     fn creds_deserialize_with_expiry_date() {
         let json = r#"{
             "access_token": "ya29.test-token",
@@ -1827,7 +2199,7 @@ mod tests {
         let err =
             "Invalid JSON payload received. Unknown name \"generationConfig\": Cannot find field.";
         assert!(
-            GeminiProvider::should_retry_oauth_without_generation_config(
+            GeminiModelProvider::should_retry_oauth_without_generation_config(
                 StatusCode::BAD_REQUEST,
                 err
             )
@@ -1835,19 +2207,19 @@ mod tests {
         // JSON-escaped quotes (raw response body from Google API)
         let err_json = r#"Invalid JSON payload received. Unknown name \"generationConfig\": Cannot find field."#;
         assert!(
-            GeminiProvider::should_retry_oauth_without_generation_config(
+            GeminiModelProvider::should_retry_oauth_without_generation_config(
                 StatusCode::BAD_REQUEST,
                 err_json
             )
         );
         assert!(
-            !GeminiProvider::should_retry_oauth_without_generation_config(
+            !GeminiModelProvider::should_retry_oauth_without_generation_config(
                 StatusCode::UNAUTHORIZED,
                 err
             )
         );
         assert!(
-            !GeminiProvider::should_retry_oauth_without_generation_config(
+            !GeminiModelProvider::should_retry_oauth_without_generation_config(
                 StatusCode::BAD_REQUEST,
                 "something else"
             )
@@ -2059,21 +2431,21 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = test_provider(None);
-        let result = provider.warmup().await;
+        let model_provider = test_model_provider(None);
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn warmup_oauth_is_noop() {
-        let provider = test_provider(Some(test_oauth_auth("ya29.mock-token")));
-        let result = provider.warmup().await;
+        let model_provider = test_model_provider(Some(test_oauth_auth("ya29.mock-token")));
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[test]
     fn discover_oauth_cred_paths_does_not_panic() {
-        let _paths = GeminiProvider::discover_oauth_cred_paths();
+        let _paths = GeminiModelProvider::discover_oauth_cred_paths();
     }
 
     #[tokio::test]
@@ -2085,8 +2457,8 @@ mod tests {
             client_secret: None,
             expiry_millis: None,
         }));
-        let provider = test_provider(Some(GeminiAuth::OAuthToken(state.clone())));
-        assert!(!provider.rotate_oauth_credential(&state).await);
+        let model_provider = test_model_provider(Some(GeminiAuth::OAuthToken(state.clone())));
+        assert!(!model_provider.rotate_oauth_credential(&state).await);
     }
 
     #[test]
@@ -2102,25 +2474,88 @@ mod tests {
     }
 
     #[test]
+    fn response_usage_metadata_maps_to_token_usage() {
+        let usage = GeminiUsageMetadata {
+            prompt_token_count: Some(120),
+            candidates_token_count: Some(40),
+        };
+
+        let token_usage =
+            GeminiModelProvider::token_usage_from_metadata(usage).expect("usage counts should map");
+
+        assert_eq!(token_usage.input_tokens, Some(120));
+        assert_eq!(token_usage.output_tokens, Some(40));
+        assert_eq!(token_usage.cached_input_tokens, None);
+    }
+
+    #[test]
+    fn empty_usage_metadata_maps_to_none() {
+        let usage = GeminiUsageMetadata {
+            prompt_token_count: None,
+            candidates_token_count: None,
+        };
+
+        assert!(GeminiModelProvider::token_usage_from_metadata(usage).is_none());
+    }
+
+    #[test]
+    fn wrapped_response_preserves_outer_usage_metadata() {
+        let json = r#"{
+            "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 40},
+            "response": {
+                "candidates": [{"content": {"parts": [{"text": "Hello"}]}}]
+            }
+        }"#;
+
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let effective = resp.into_effective_response();
+        let usage = effective.usage_metadata.unwrap();
+
+        assert_eq!(usage.prompt_token_count, Some(120));
+        assert_eq!(usage.candidates_token_count, Some(40));
+    }
+
+    #[test]
+    fn wrapped_response_prefers_inner_usage_metadata() {
+        let json = r#"{
+            "usageMetadata": {"promptTokenCount": 120, "candidatesTokenCount": 40},
+            "response": {
+                "candidates": [{"content": {"parts": [{"text": "Hello"}]}}],
+                "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 2}
+            }
+        }"#;
+
+        let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let effective = resp.into_effective_response();
+        let usage = effective.usage_metadata.unwrap();
+
+        assert_eq!(usage.prompt_token_count, Some(5));
+        assert_eq!(usage.candidates_token_count, Some(2));
+    }
+
+    #[test]
     fn response_parses_without_usage_metadata() {
         let json = r#"{"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]}"#;
         let resp: GenerateContentResponse = serde_json::from_str(json).unwrap();
         assert!(resp.usage_metadata.is_none());
     }
 
-    /// Validates that warmup() for ManagedOAuth requires auth_service.
     #[tokio::test]
     async fn warmup_managed_oauth_requires_auth_service() {
-        let provider = GeminiProvider {
+        let model_provider = GeminiModelProvider {
+            alias: "test".to_string(),
             auth: Some(GeminiAuth::ManagedOAuth),
             oauth_project: Arc::new(tokio::sync::Mutex::new(None)),
+            oauth_project_seed: None,
             oauth_cred_paths: Vec::new(),
             oauth_index: Arc::new(tokio::sync::Mutex::new(0)),
             auth_service: None, // Missing auth_service
             auth_profile_override: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
         };
 
-        let result = provider.warmup().await;
+        let result = model_provider.warmup().await;
         assert!(result.is_err());
         assert!(
             result
@@ -2130,11 +2565,10 @@ mod tests {
         );
     }
 
-    /// Validates that warmup() for CLI OAuth skips validation (existing behavior).
     #[tokio::test]
     async fn warmup_cli_oauth_skips_validation() {
-        let provider = test_provider(Some(test_oauth_auth("fake_token")));
-        let result = provider.warmup().await;
+        let model_provider = test_model_provider(Some(test_oauth_auth("fake_token")));
+        let result = model_provider.warmup().await;
         // Should succeed without making HTTP requests
         assert!(result.is_ok());
     }
@@ -2220,7 +2654,7 @@ mod tests {
 
     #[test]
     fn build_parts_extracts_data_uri_as_inline_part() {
-        let content = "Check this [IMAGE:data:image/png;base64,iVBORw0KGgo=]";
+        let content = "Check this [IMAGE:data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC]";
         let parts = build_parts(content);
         assert_eq!(parts.len(), 2);
         // First part is text
@@ -2231,7 +2665,7 @@ mod tests {
         // Second part is inline image
         assert_eq!(
             serde_json::to_value(&parts[1]).unwrap(),
-            serde_json::json!({"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgo="}})
+            serde_json::json!({"inline_data": {"mime_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}})
         );
     }
 
@@ -2274,21 +2708,135 @@ mod tests {
 
     #[test]
     fn chat_with_history_maps_roles_correctly() {
-        // Verify the message→Content mapping logic directly by checking
-        // that the provider constructs the right Content structures.
-        // We can't call chat_with_history without a real API, but we can
-        // verify the Part construction used in each role branch.
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello [IMAGE:data:image/png;base64,AA==]"),
+        ];
 
-        // User messages should go through build_parts (supports images)
-        let user_parts = build_parts("Hello [IMAGE:data:image/png;base64,AA==]");
-        assert!(user_parts.iter().any(|p| matches!(p, Part::Inline { .. })));
+        let (contents, system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None)
+                .expect("user-anchored history must build");
 
-        // Assistant messages should use Part::text (no image parsing)
-        let assistant_part = Part::text("I see the image");
-        assert!(matches!(assistant_part, Part::Text { .. }));
+        let system_instruction = system_instruction.expect("system prompt should be separated");
+        assert_eq!(system_instruction.role, None);
+        assert!(
+            matches!(&system_instruction.parts[0], Part::Text { text } if text == "You are helpful")
+        );
 
-        // System messages should use Part::text
-        let system_part = Part::text("You are helpful");
-        assert!(matches!(system_part, Part::Text { .. }));
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+        assert!(
+            contents[0]
+                .parts
+                .iter()
+                .any(|p| matches!(p, Part::Inline { .. }))
+        );
+    }
+
+    #[test]
+    fn chat_contents_preserves_trailing_model_turn_and_appends_user_continuation() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("I see the image"),
+        ];
+
+        let (contents, _system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None)
+                .expect("history with a prior user turn must build");
+
+        // the model turn is the context a continuation needs, so it is kept
+        // and the request is anchored with a final user continuation turn
+        assert_eq!(contents.len(), 3, "model turn must be preserved");
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+        assert_eq!(contents[1].role.as_deref(), Some("model"));
+        assert!(
+            matches!(&contents[1].parts[0], Part::Text { text } if text == "I see the image"),
+            "the assistant context must survive the request build"
+        );
+        assert_eq!(contents[2].role.as_deref(), Some("user"));
+        assert!(matches!(&contents[2].parts[0], Part::Text { text } if text == "[continue]"));
+    }
+
+    #[test]
+    fn chat_contents_model_only_history_fails_explicitly() {
+        let messages = vec![ChatMessage::assistant("I see the image")];
+
+        let result = GeminiModelProvider::build_chat_contents(&messages, None);
+
+        let err = result.expect_err("model-only history must fail instead of losing context");
+        assert!(
+            err.to_string()
+                .contains("history ends on model turns but contains no user turn"),
+            "error should name the anchoring problem, got: {err}"
+        );
+    }
+
+    #[test]
+    fn chat_contents_empty_history_falls_back_to_bare_continue() {
+        let messages = vec![ChatMessage::system("You are helpful")];
+
+        let (contents, _system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None)
+                .expect("system-only history must build with a bare anchor turn");
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+        assert!(matches!(&contents[0].parts[0], Part::Text { text } if text == "[continue]"));
+    }
+
+    #[test]
+    fn chat_contents_ending_on_user_turn_is_untouched() {
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi"),
+            ChatMessage::user("Now continue"),
+        ];
+
+        let (contents, _system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None)
+                .expect("history already ending on a user turn must build");
+
+        assert_eq!(contents.len(), 3, "no synthetic turn may be appended");
+        assert!(
+            !contents.iter().any(|c| {
+                c.parts
+                    .iter()
+                    .any(|p| matches!(p, Part::Text { text } if text == "[continue]"))
+            }),
+            "no [continue] placeholder may appear"
+        );
+    }
+
+    #[test]
+    fn chat_contents_append_tool_instructions_to_system_prompt() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+        ];
+
+        let (_contents, system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, Some("Use tools carefully"))
+                .expect("user-anchored history must build");
+
+        let system_instruction = system_instruction.expect("system prompt should include tools");
+        assert!(
+            matches!(&system_instruction.parts[0], Part::Text { text } if text == "You are helpful\n\nUse tools carefully")
+        );
+    }
+
+    #[test]
+    fn chat_contents_create_system_prompt_from_tool_instructions() {
+        let messages = vec![ChatMessage::user("Hello")];
+
+        let (_contents, system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, Some("Use tools carefully"))
+                .expect("user-anchored history must build");
+
+        let system_instruction =
+            system_instruction.expect("tool instructions should be system prompt");
+        assert!(
+            matches!(&system_instruction.parts[0], Part::Text { text } if text == "Use tools carefully")
+        );
     }
 }

@@ -1,22 +1,21 @@
 //! Regression tests for Telegram attachment fallback behavior.
-//!
-//! When sending media by URL fails (e.g. Telegram can't fetch the URL or the
-//! content type is wrong), the channel should fall back to sending the URL as
-//! a text link instead of losing the entire reply.
-//!
-//! Bug: Previously, `send_attachment()` would propagate the error from
-//! `send_document_by_url()` immediately via `?`, causing the entire reply
-//! (including already-sent text) to fail with no fallback.
 
+use std::sync::Arc;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use zeroclaw::channels::telegram::TelegramChannel;
 use zeroclaw::channels::{Channel, SendMessage};
 
-/// Helper: create a TelegramChannel pointing at a mock server.
 fn test_channel(mock_url: &str) -> TelegramChannel {
-    TelegramChannel::new("TEST_TOKEN".into(), vec!["*".into()], false)
-        .with_api_base(mock_url.to_string())
+    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(|| vec!["*".into()]);
+    let mention_only = false;
+    TelegramChannel::new(
+        "TEST_TOKEN".into(),
+        "telegram_test_alias",
+        peer_resolver,
+        mention_only,
+    )
+    .with_api_base(mock_url.to_string())
 }
 
 /// Helper: mount a mock that accepts sendMessage requests (the fallback path).
@@ -36,8 +35,6 @@ async fn mock_send_message_ok(server: &MockServer) {
         .await;
 }
 
-/// When sendDocument by URL fails with "wrong type of the web page content",
-/// the channel should fall back to sending the URL as a text link.
 #[tokio::test]
 async fn document_url_failure_falls_back_to_text_link() {
     let server = MockServer::start().await;
@@ -71,7 +68,6 @@ async fn document_url_failure_falls_back_to_text_link() {
     );
 }
 
-/// When sendPhoto by URL fails, the channel should fall back to text link.
 #[tokio::test]
 async fn photo_url_failure_falls_back_to_text_link() {
     let server = MockServer::start().await;
@@ -102,8 +98,6 @@ async fn photo_url_failure_falls_back_to_text_link() {
     );
 }
 
-/// Text portion of a message with attachments is still delivered even when
-/// the attachment fails.
 #[tokio::test]
 async fn text_portion_delivered_before_attachment_failure() {
     let server = MockServer::start().await;
@@ -147,8 +141,6 @@ async fn text_portion_delivered_before_attachment_failure() {
     assert!(result.is_ok(), "send should succeed, got: {result:?}");
 }
 
-/// When multiple attachments are present and one fails, the others should
-/// still be attempted (each gets its own fallback).
 #[tokio::test]
 async fn multiple_attachments_independent_fallback() {
     let server = MockServer::start().await;
@@ -205,7 +197,6 @@ async fn multiple_attachments_independent_fallback() {
     );
 }
 
-/// When attachment succeeds, no fallback text is sent.
 #[tokio::test]
 async fn successful_attachment_no_fallback() {
     let server = MockServer::start().await;
@@ -254,8 +245,6 @@ async fn successful_attachment_no_fallback() {
     );
 }
 
-/// Document-only message (no text) with URL failure should still send
-/// a fallback text link.
 #[tokio::test]
 async fn document_only_message_falls_back_to_text() {
     let server = MockServer::start().await;

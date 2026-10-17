@@ -1,9 +1,4 @@
 //! Live Canvas gateway routes — REST + WebSocket for real-time canvas updates.
-//!
-//! - `GET  /api/canvas/:id` — get current canvas content (JSON)
-//! - `POST /api/canvas/:id` — push content programmatically
-//! - `GET  /api/canvas`     — list all active canvases
-//! - `WS   /ws/canvas/:id`  — real-time canvas updates via WebSocket
 
 use super::AppState;
 use super::api::require_auth;
@@ -247,7 +242,7 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
 
     // Spawn a task that forwards broadcast updates to the WebSocket
     let canvas_id_clone = canvas_id.clone();
-    let send_task = tokio::spawn(async move {
+    let send_task = zeroclaw_spawn::spawn!(async move {
         loop {
             match rx.recv().await {
                 Ok(frame) => {

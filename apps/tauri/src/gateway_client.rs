@@ -78,21 +78,6 @@ impl GatewayClient {
         Ok(body["require_pairing"].as_bool().unwrap_or(false))
     }
 
-    /// Request a new pairing code from the gateway (localhost-only admin endpoint).
-    pub async fn request_new_paircode(&self) -> Result<String> {
-        let resp = self
-            .client
-            .post(format!("{}/admin/paircode/new", self.base_url))
-            .send()
-            .await
-            .context("paircode request failed")?;
-        let body: serde_json::Value = resp.json().await?;
-        body["pairing_code"]
-            .as_str()
-            .map(String::from)
-            .context("no pairing_code in response")
-    }
-
     /// Exchange a pairing code for a bearer token.
     pub async fn pair_with_code(&self, code: &str) -> Result<String> {
         let resp = self
@@ -124,10 +109,25 @@ impl GatewayClient {
         }
     }
 
-    /// Auto-pair with the gateway: request a new code and exchange it for a token.
-    pub async fn auto_pair(&self) -> Result<String> {
-        let code = self.request_new_paircode().await?;
-        self.pair_with_code(&code).await
+    /// Push the device's currently-granted capabilities to the gateway so the agent
+    /// knows what this Mac can do without waiting for a /ws/nodes connection.
+    /// Requires a valid bearer token; the gateway uses its hash to identify the row.
+    pub async fn update_capabilities(&self, capabilities: &[String]) -> Result<()> {
+        let mut req = self
+            .client
+            .post(format!("{}/api/devices/me/capabilities", self.base_url))
+            .json(&serde_json::json!({ "capabilities": capabilities }));
+        if let Some(auth) = self.auth_header() {
+            req = req.header("Authorization", auth);
+        }
+        let resp = req
+            .send()
+            .await
+            .context("update_capabilities request failed")?;
+        if !resp.status().is_success() {
+            anyhow::bail!("update_capabilities returned {}", resp.status());
+        }
+        Ok(())
     }
 
     pub async fn send_webhook_message(&self, message: &str) -> Result<serde_json::Value> {

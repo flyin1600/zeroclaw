@@ -2,11 +2,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::GoogleWorkspaceAllowedOperation;
 
-/// Default `gws` command execution time before kill (overridden by config).
 #[cfg(test)]
 const DEFAULT_GWS_TIMEOUT_SECS: u64 = 30;
 /// Maximum output size in bytes (1MB).
@@ -14,11 +13,6 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
 use zeroclaw_config::schema::DEFAULT_GWS_SERVICES;
 
-/// Google Workspace CLI (`gws`) integration tool.
-///
-/// Wraps the `gws` CLI binary to give the agent structured access to
-/// Google Workspace services (Drive, Gmail, Calendar, Sheets, etc.).
-/// Requires `gws` to be installed and authenticated (`gws auth login`).
 pub struct GoogleWorkspaceTool {
     security: Arc<SecurityPolicy>,
     allowed_services: Vec<String>,
@@ -33,7 +27,6 @@ pub struct GoogleWorkspaceTool {
 
 impl GoogleWorkspaceTool {
     /// Create a new `GoogleWorkspaceTool`.
-    ///
     /// If `allowed_services` is empty, the default service set is used.
     pub fn new(
         security: Arc<SecurityPolicy>,
@@ -195,15 +188,39 @@ impl Tool for GoogleWorkspaceTool {
         let service = args
             .get("service")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'service' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "service"})),
+                    "google_workspace: missing service parameter"
+                );
+                anyhow::Error::msg("Missing 'service' parameter")
+            })?;
         let resource = args
             .get("resource")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'resource' parameter"))?;
-        let method = args
-            .get("method")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'method' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "resource"})),
+                    "google_workspace: missing resource parameter"
+                );
+                anyhow::Error::msg("Missing 'resource' parameter")
+            })?;
+        let method = args.get("method").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "method"})),
+                "google_workspace: missing method parameter"
+            );
+            anyhow::Error::msg("Missing 'method' parameter")
+        })?;
 
         // Extract and validate sub_resource early so the allowlist check can account for it.
         let sub_resource: Option<&str> = if let Some(sub_resource_value) = args.get("sub_resource")
@@ -213,20 +230,20 @@ impl Tool for GoogleWorkspaceTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'sub_resource' must be a string".into()),
                     });
                 }
             };
             if !s
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(
-                        "Invalid characters in 'sub_resource': only lowercase alphanumeric, underscore, and hyphen are allowed"
+                        "Invalid characters in 'sub_resource': only alphanumeric, underscore, and hyphen are allowed"
                             .into(),
                     ),
                 });
@@ -240,7 +257,7 @@ impl Tool for GoogleWorkspaceTool {
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
             });
         }
@@ -249,7 +266,7 @@ impl Tool for GoogleWorkspaceTool {
         if !self.allowed_services.iter().any(|s| s == service) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Service '{service}' is not in the allowed services list. \
                      Allowed: {}",
@@ -265,14 +282,15 @@ impl Tool for GoogleWorkspaceTool {
             };
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Operation '{op_path}' is not in the allowed operations list"
                 )),
             });
         }
 
-        // Validate inputs contain no shell metacharacters
+        // Validate inputs contain no shell metacharacters. Uppercase must pass:
+        // Google API identifiers are camelCase (calendarList, quickAdd).
         for (label, value) in [
             ("service", service),
             ("resource", resource),
@@ -280,13 +298,13 @@ impl Tool for GoogleWorkspaceTool {
         ] {
             if !value
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(format!(
-                        "Invalid characters in '{label}': only lowercase alphanumeric, underscore, and hyphen are allowed"
+                        "Invalid characters in '{label}': only alphanumeric, underscore, and hyphen are allowed"
                     )),
                 });
             }
@@ -299,7 +317,7 @@ impl Tool for GoogleWorkspaceTool {
             if !params.is_object() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("'params' must be an object".into()),
                 });
             }
@@ -311,7 +329,7 @@ impl Tool for GoogleWorkspaceTool {
             if !body.is_object() {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("'body' must be an object".into()),
                 });
             }
@@ -325,7 +343,7 @@ impl Tool for GoogleWorkspaceTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'format' must be a string".into()),
                     });
                 }
@@ -338,7 +356,7 @@ impl Tool for GoogleWorkspaceTool {
                 _ => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Invalid format '{format}': must be json, table, yaml, or csv"
                         )),
@@ -353,7 +371,7 @@ impl Tool for GoogleWorkspaceTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'page_all' must be a boolean".into()),
                     });
                 }
@@ -366,7 +384,7 @@ impl Tool for GoogleWorkspaceTool {
                 None => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some("'page_limit' must be a non-negative integer".into()),
                     });
                 }
@@ -379,12 +397,17 @@ impl Tool for GoogleWorkspaceTool {
         if !self.security.record_action() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
-        let mut cmd = tokio::process::Command::new("gws");
+        // Resolve `gws` via PATH so Windows `.cmd` shims (e.g. npm-installed
+        // `gws.cmd`) are picked up — `Command::new` on Windows does not append
+        // PATHEXT itself. Falls back to bare "gws" so the not-found error path
+        // below still fires when the binary is genuinely missing.
+        let gws_path: std::path::PathBuf = which::which("gws").unwrap_or_else(|_| "gws".into());
+        let mut cmd = tokio::process::Command::new(gws_path);
         cmd.args(&cmd_args);
         cmd.env_clear();
         // gws needs PATH to find itself and HOME/APPDATA for credential storage
@@ -405,14 +428,7 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         if self.audit_log {
-            tracing::info!(
-                tool = "google_workspace",
-                service = service,
-                resource = resource,
-                sub_resource = sub_resource.unwrap_or(""),
-                method = method,
-                "gws audit: executing API call"
-            );
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": "google_workspace", "service": service, "resource": resource, "sub_resource": sub_resource.unwrap_or(""), "method": method})), "gws audit: executing API call");
         }
 
         let result =
@@ -443,7 +459,7 @@ impl Tool for GoogleWorkspaceTool {
 
                 Ok(ToolResult {
                     success: output.status.success(),
-                    output: stdout,
+                    output: stdout.into(),
                     error: if stderr.is_empty() {
                         None
                     } else {
@@ -453,14 +469,14 @@ impl Tool for GoogleWorkspaceTool {
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to execute gws: {e}. Is gws installed? Run: npm install -g @googleworkspace/cli"
                 )),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "gws command timed out after {}s and was killed",
                     self.timeout_secs
@@ -482,6 +498,16 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    // PATH resolution must produce a usable PathBuf
+    // even when `gws` is not installed, so the executor can still emit the
+    // documented "Failed to execute gws" error rather than panicking.
+    #[test]
+    fn gws_path_resolution_falls_back_when_not_on_path() {
+        let resolved: std::path::PathBuf =
+            which::which("definitely-not-a-real-binary-zc6410").unwrap_or_else(|_| "gws".into());
+        assert_eq!(resolved.as_os_str(), "gws");
     }
 
     #[test]
@@ -621,6 +647,58 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Invalid characters")
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_camelcase_resource_and_method_past_charset_validation() {
+        // Google API identifiers are camelCase (calendarList, quickAdd). The
+        // invalid `format` stops execution deterministically after the charset
+        // check, so this test never spawns `gws`.
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let result = tool
+            .execute(json!({
+                "service": "calendar",
+                "resource": "calendarList",
+                "method": "quickAdd",
+                "format": "xml"
+            }))
+            .await
+            .expect("camelCase segments should return a result");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("Invalid format"),
+            "camelCase should pass charset validation and fail on format, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_camelcase_sub_resource_past_charset_validation() {
+        // The zero-action rate limit trips right after the sub_resource charset
+        // check, so this test never spawns `gws`.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            max_actions_per_hour: 0,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GoogleWorkspaceTool::new(security, vec![], vec![], None, None, 60, 30, false);
+        let result = tool
+            .execute(json!({
+                "service": "gmail",
+                "resource": "users",
+                "sub_resource": "sendAs",
+                "method": "list"
+            }))
+            .await
+            .expect("camelCase sub_resource should return a result");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("Rate limit"),
+            "camelCase sub_resource should pass charset validation and hit the rate limit, got: {err}"
         );
     }
 

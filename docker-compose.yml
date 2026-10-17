@@ -23,30 +23,41 @@ services:
     restart: unless-stopped
     
     environment:
-      # Required: Your LLM provider API key
-      - API_KEY=${API_KEY:-}
-      # Or use the prefixed version:
-      # - ZEROCLAW_API_KEY=${ZEROCLAW_API_KEY:-}
-      
-      # Optional: LLM provider (default: openrouter)
-      # Options: openrouter, openai, anthropic, ollama
-      - PROVIDER=${PROVIDER:-openrouter}
-      
-      # Allow public bind inside Docker (required for container networking)
-      - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+      # V0.8.0: single env-var override surface — the schema-mirror grammar
+      # `ZEROCLAW_<dotted_path_with_double_underscores>=<value>`. Each `__`
+      # is a path separator. Legacy `API_KEY`, `ANTHROPIC_API_KEY`,
+      # `OPENAI_API_KEY`, `PROVIDER`, `ZEROCLAW_MODEL` (etc.) fallbacks were
+      # eradicated.
+      #
+      # Pick a typed-family alias and set its api_key + model:
+      - ZEROCLAW_providers__models__openrouter__default__api_key=${OPENROUTER_API_KEY:-}
+      # - ZEROCLAW_providers__models__openrouter__default__model=anthropic/claude-sonnet-4-20250514
+      # - ZEROCLAW_providers__models__anthropic__default__api_key=${ANTHROPIC_API_KEY:-}
+      # - ZEROCLAW_providers__models__openai__default__api_key=${OPENAI_API_KEY:-}
+
+      # Listen on the container interface so Docker's published port can reach
+      # the gateway. Docker bridge traffic never arrives on container loopback,
+      # so a persisted `host = "127.0.0.1"` config stays unreachable without
+      # this. `allow_public_bind` only acknowledges the non-loopback listener
+      # and silences the startup warning; it does not refuse a public bind.
+      # Host-side exposure is bounded by the `ports:` mapping below.
+      - ZEROCLAW_gateway__host=0.0.0.0
+      - ZEROCLAW_gateway__allow_public_bind=true
       # Default gateway port inside container
-      - ZEROCLAW_GATEWAY_PORT=${ZEROCLAW_GATEWAY_PORT:-42617}
-      
-      # Optional: Model override
-      # - ZEROCLAW_MODEL=anthropic/claude-sonnet-4-20250514
+      - ZEROCLAW_gateway__port=${ZEROCLAW_GATEWAY_PORT:-42617}
       
     volumes:
       # Persist workspace and config (must match WORKDIR/HOME in Dockerfile)
       - zeroclaw-data:/zeroclaw-data
       
     ports:
-      # Gateway API port (override HOST_PORT if 42617 is taken)
-      - "${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
+      # Published on host loopback only. The in-container listener is
+      # `0.0.0.0`, so without this prefix the gateway would be reachable from
+      # the LAN, and `require_pairing = false` configs answer unauthenticated
+      # requests. To serve other hosts, drop the `127.0.0.1:` prefix (or set
+      # HOST_PORT to an explicit interface) and enable pairing or a tunnel.
+      # Override HOST_PORT if 42617 is taken.
+      - "${HOST_PORT:-127.0.0.1:42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
     
     # Resource limits
     deploy:

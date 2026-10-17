@@ -1,21 +1,18 @@
-//! AWS Bedrock provider using the Converse API.
-//!
-//! Authentication: supports two methods:
-//! - **Bearer token**: set `BEDROCK_API_KEY` env var (takes precedence).
-//! - **SigV4 signing**: AWS AKSK (Access Key ID + Secret Access Key)
-//!   via environment variables or EC2 IMDSv2. SigV4 signing is implemented
-//!   manually using hmac/sha2 crates — no AWS SDK dependency.
+//! AWS Bedrock model_provider using the Converse API.
 
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
+    ModelProvider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::{Arc, Mutex};
 use zeroclaw_api::tool::ToolSpec;
+#[cfg(windows)]
+use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
 
 /// Hostname prefix for the Bedrock Runtime endpoint.
 const ENDPOINT_PREFIX: &str = "bedrock-runtime";
@@ -34,11 +31,15 @@ enum BedrockAuth {
 // ── AWS Credentials ─────────────────────────────────────────────
 
 /// Resolved AWS credentials for SigV4 signing.
+#[derive(Clone)]
 struct AwsCredentials {
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
     region: String,
+    /// Credential expiry (from `credential_process` `Expiration` field).
+    /// `None` means no known expiry — treat as long-lived.
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl AwsCredentials {
@@ -58,6 +59,152 @@ impl AwsCredentials {
             secret_access_key,
             session_token,
             region,
+            expires_at: None,
+        })
+    }
+
+    /// Parse `~/.aws/config` (or `$AWS_CONFIG_FILE`) and return the
+    /// `credential_process` command and optional `region` for the active profile.
+    fn parse_aws_config(content: &str, profile: &str) -> Option<(String, Option<String>)> {
+        let target = if profile == "default" {
+            "[default]".to_string()
+        } else {
+            format!("[profile {profile}]")
+        };
+
+        let mut in_section = false;
+        let mut cred_process = None;
+        let mut region = None;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_section = trimmed == target;
+                continue;
+            }
+            if !in_section || trimmed.starts_with('#') || trimmed.starts_with(';') {
+                continue;
+            }
+            if let Some((key, value)) = trimmed.split_once('=') {
+                match key.trim() {
+                    "credential_process" => cred_process = Some(value.trim().to_string()),
+                    "region" => region = Some(value.trim().to_string()),
+                    _ => {}
+                }
+            }
+        }
+        cred_process.map(|cmd| (cmd, region))
+    }
+
+    /// Resolve credentials via `credential_process` in `~/.aws/config`.
+    fn from_credential_process() -> anyhow::Result<Self> {
+        let config_path = std::env::var("AWS_CONFIG_FILE").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+            format!("{home}/.aws/config")
+        });
+        let content = std::fs::read_to_string(&config_path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "config_path": &config_path,
+                        "error": format!("{}", e),
+                    })),
+                "bedrock: cannot read AWS config file"
+            );
+            anyhow::Error::msg(format!("Cannot read {config_path}: {e}"))
+        })?;
+        let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+        let (cmd, config_region) = Self::parse_aws_config(&content, &profile).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"profile": &profile})),
+                "bedrock: no credential_process in AWS profile"
+            );
+            anyhow::Error::msg(format!("No credential_process in [{profile}]"))
+        })?;
+
+        let output = run_credential_process_command(&cmd).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "bedrock: failed to spawn credential_process"
+            );
+            anyhow::Error::msg(format!("Failed to run credential_process: {e}"))
+        })?;
+        anyhow::ensure!(
+            output.status.success(),
+            "credential_process exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "bedrock: credential_process output is not valid JSON"
+            );
+            anyhow::Error::msg(format!("credential_process output is not valid JSON: {e}"))
+        })?;
+
+        let access_key_id = json["AccessKeyId"]
+            .as_str()
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "AccessKeyId"})),
+                    "bedrock: credential_process missing AccessKeyId"
+                );
+                anyhow::Error::msg("Missing AccessKeyId in credential_process output")
+            })?
+            .to_string();
+        let secret_access_key = json["SecretAccessKey"]
+            .as_str()
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "SecretAccessKey"})),
+                    "bedrock: credential_process missing SecretAccessKey"
+                );
+                anyhow::Error::msg("Missing SecretAccessKey in credential_process output")
+            })?
+            .to_string();
+        let session_token = json["SessionToken"].as_str().map(|s| s.to_string());
+
+        let expires_at = json["Expiration"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        let region = env_optional("AWS_REGION")
+            .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+            .or(config_region)
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Loaded AWS credentials via credential_process"
+        );
+
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region,
+            expires_at,
         })
     }
 
@@ -102,11 +249,35 @@ impl AwsCredentials {
 
         let access_key_id = creds_json["AccessKeyId"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing AccessKeyId in IMDS response"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "source": "imds",
+                            "missing": "AccessKeyId",
+                        })),
+                    "bedrock: IMDS response missing AccessKeyId"
+                );
+                anyhow::Error::msg("Missing AccessKeyId in IMDS response")
+            })?
             .to_string();
         let secret_access_key = creds_json["SecretAccessKey"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in IMDS response"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "source": "imds",
+                            "missing": "SecretAccessKey",
+                        })),
+                    "bedrock: IMDS response missing SecretAccessKey"
+                );
+                anyhow::Error::msg("Missing SecretAccessKey in IMDS response")
+            })?
             .to_string();
         let session_token = creds_json["Token"].as_str().map(|s| s.to_string());
 
@@ -128,9 +299,13 @@ impl AwsCredentials {
             region.trim().to_string()
         };
 
-        tracing::info!(
-            "Loaded AWS credentials from EC2 instance metadata (role: {})",
-            role
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Loaded AWS credentials from EC2 instance metadata (role: {})",
+                role
+            )
         );
 
         Ok(Self {
@@ -138,12 +313,16 @@ impl AwsCredentials {
             secret_access_key,
             session_token,
             region,
+            expires_at: None,
         })
     }
 
-    /// Resolve credentials: env vars first, then EC2 IMDS.
+    /// Resolve credentials: env vars first, then credential_process, then EC2 IMDS.
     async fn resolve() -> anyhow::Result<Self> {
         if let Ok(creds) = Self::from_env() {
+            return Ok(creds);
+        }
+        if let Ok(creds) = Self::from_credential_process() {
             return Ok(creds);
         }
         Self::from_imds().await
@@ -152,6 +331,25 @@ impl AwsCredentials {
     fn host(&self) -> String {
         format!("{ENDPOINT_PREFIX}.{}.amazonaws.com", self.region)
     }
+
+    /// Returns `true` if credentials have a known expiry that has passed
+    /// (with 60s skew to allow for clock drift and network latency).
+    fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(exp) => chrono::Utc::now() >= exp - chrono::Duration::seconds(60),
+            None => false,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
+    windows_std_cmd_shell_command(cmd).output()
+}
+
+#[cfg(not(windows))]
+fn run_credential_process_command(cmd: &str) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("sh").args(["-c", cmd]).output()
 }
 
 fn env_required(name: &str) -> anyhow::Result<String> {
@@ -159,7 +357,18 @@ fn env_required(name: &str) -> anyhow::Result<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Environment variable {name} is required for Bedrock"))
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"env_var": name})),
+                "bedrock: required environment variable is missing"
+            );
+            anyhow::Error::msg(format!(
+                "Environment variable {name} is required for Bedrock"
+            ))
+        })
 }
 
 fn env_optional(name: &str) -> Option<String> {
@@ -192,7 +401,6 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
 }
 
 /// Build the SigV4 `Authorization` header value.
-///
 /// `headers` must be sorted by lowercase header name.
 fn build_authorization_header(
     credentials: &AwsCredentials,
@@ -263,6 +471,8 @@ struct ConverseRequest {
     inference_config: Option<InferenceConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_config: Option<ToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_model_request_fields: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -271,12 +481,6 @@ struct ConverseMessage {
     content: Vec<ContentBlock>,
 }
 
-/// Content blocks use Bedrock's union style:
-/// `{"text": "..."}`, `{"toolUse": {...}}`, `{"toolResult": {...}}`, `{"cachePoint": {...}}`.
-///
-/// Note: `text` is a simple string value, not a nested object. `toolUse` and `toolResult`
-/// are nested objects. We use `#[serde(untagged)]` with manual struct wrappers to
-/// match this mixed format.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ContentBlock {
@@ -285,6 +489,34 @@ enum ContentBlock {
     ToolResult(ToolResultWrapper),
     CachePointBlock(CachePointWrapper),
     Image(ImageWrapper),
+    /// Thinking block for round-tripping extended thinking in conversation
+    /// history. Required when thinking is enabled and assistant messages
+    /// contain tool_use blocks.
+    #[serde(rename = "reasoningContent")]
+    ReasoningContent(ReasoningContentOutWrapper),
+}
+
+/// Outgoing reasoning content block for request messages.
+/// Serializes as `{"reasoningContent": {"reasoningText": {"text": "..."}}}`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentOutWrapper {
+    reasoning_content: ReasoningContentOutBlock,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentOutBlock {
+    reasoning_text: ReasoningTextOutField,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReasoningTextOutField {
+    text: String,
+    /// Signature for integrity verification — round-tripped from the
+    /// original thinking block returned by the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -378,12 +610,19 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-/// Some Bedrock models (the Claude opus-4-7 family) reject `temperature` in
-/// `inferenceConfig` with a 400 "temperature is deprecated for this model".
-/// Substring match covers region/profile prefixes (e.g. `us.anthropic.…`)
-/// and version suffixes (e.g. `-v1:0`).
-fn bedrock_model_omits_temperature(model: &str) -> bool {
-    model.contains("claude-opus-4-7")
+fn bedrock_model_supports_native_thinking(model: &str) -> bool {
+    !model.contains("claude-opus-4-7")
+}
+
+fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    if model.contains("claude") {
+        return true;
+    }
+    // The Nova 2 generation rejects `cachePoint` with a 400 despite matching the
+    // Nova family. Caching is an optimization, so unconfirmed generations skip
+    // it rather than risk the error; Nova 1 (Micro/Lite/Pro/Premier) keeps it.
+    model.contains("nova") && !model.contains("nova-2")
 }
 
 #[derive(Debug, Serialize)]
@@ -408,7 +647,9 @@ struct ToolSpecDef {
 
 #[derive(Debug, Serialize)]
 struct InputSchema {
-    json: serde_json::Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request
+    json: Arc<serde_json::Value>,
 }
 
 // ── Converse API Types (Response) ───────────────────────────────
@@ -418,9 +659,6 @@ struct InputSchema {
 struct ConverseResponse {
     #[serde(default)]
     output: Option<ConverseOutput>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    stop_reason: Option<String>,
     #[serde(default)]
     usage: Option<BedrockUsage>,
 }
@@ -442,23 +680,39 @@ struct ConverseOutput {
 
 #[derive(Debug, Deserialize)]
 struct ConverseOutputMessage {
-    #[allow(dead_code)]
-    role: String,
     content: Vec<ResponseContentBlock>,
 }
 
-/// Response content blocks from the Converse API.
-///
-/// Uses `#[serde(untagged)]` to match Bedrock's union format where `text` is a
-/// simple string value and `toolUse` is a nested object. Unknown block types
-/// (e.g. `reasoningContent`, `guardContent`) are captured as `Other` to prevent
-/// deserialization failures.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ResponseContentBlock {
     ToolUse(ResponseToolUseWrapper),
+    ReasoningContent(ReasoningContentWrapper),
     Text(TextBlock),
-    Other(#[allow(dead_code)] serde_json::Value),
+    Other(serde_json::Value),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentWrapper {
+    reasoning_content: ReasoningContentBlock,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentBlock {
+    #[serde(default)]
+    reasoning_text: Option<ReasoningTextField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReasoningTextField {
+    #[serde(default)]
+    text: Option<String>,
+    /// Signature for integrity verification — must be round-tripped
+    /// when sending thinking blocks back in conversation history.
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,66 +721,134 @@ struct ResponseToolUseWrapper {
     tool_use: ToolUseBlock,
 }
 
-// ── BedrockProvider ─────────────────────────────────────────────
+// ── BedrockModelProvider ─────────────────────────────────────────────
 
-pub struct BedrockProvider {
+pub struct BedrockModelProvider {
+    /// `[providers.models.<family>.<alias>]` config-key alias.
+    alias: String,
     auth: Option<BedrockAuth>,
     max_tokens: u32,
+    /// Cached SigV4 credentials from `credential_process` (with expiry).
+    cred_cache: Mutex<Option<AwsCredentials>>,
 }
 
-impl Default for BedrockProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Typed builder for [`BedrockModelProvider`].
+///
+/// `alias` is the only positional argument. Whether the built provider
+/// probes ambient AWS credentials (`BEDROCK_API_KEY` env, then
+/// `AwsCredentials::from_env`, then `AwsCredentials::from_credential_process`)
+/// depends on whether [`Self::bearer_token`] was called: setting an
+/// explicit token bypasses every probe, and specifically avoids
+/// spawning the `credential_process` command from `~/.aws/config`.
+/// Leaving it unset lets `build()` walk the standard AWS resolution
+/// chain — the shape long-standing callers rely on when they wire
+/// Bedrock through the AWS environment.
+#[must_use]
+pub struct BedrockBuilder {
+    alias: String,
+    bearer_token: Option<String>,
+    max_tokens: Option<u32>,
 }
 
-impl BedrockProvider {
-    pub fn new() -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
-        if let Some(token) = env_optional("BEDROCK_API_KEY") {
-            return Self {
-                auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
-            };
-        }
-        Self {
-            auth: AwsCredentials::from_env().ok().map(BedrockAuth::SigV4),
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
-        }
-    }
-
-    pub async fn new_async() -> Self {
-        // Bearer token takes precedence over SigV4 credentials.
-        if let Some(token) = env_optional("BEDROCK_API_KEY") {
-            return Self {
-                auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
-            };
-        }
-        let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
-        Self {
-            auth,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
-        }
-    }
-
-    /// Create a provider using a Bearer token for authentication.
-    pub fn with_bearer_token(token: &str) -> Self {
-        Self {
-            auth: Some(BedrockAuth::BearerToken(token.to_string())),
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
-        }
-    }
-
-    /// Override the maximum output tokens for API requests.
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
+impl BedrockBuilder {
+    /// Set an explicit Bearer token. When set, [`Self::build`] uses it
+    /// directly and skips every AWS credential probe (including the
+    /// `credential_process` command that would otherwise spawn a shell).
+    pub fn bearer_token(mut self, token: &str) -> Self {
+        self.bearer_token = Some(token.to_string());
         self
+    }
+
+    /// Override the maximum output tokens for API requests. Defaults to
+    /// [`zeroclaw_api::model_provider::BASELINE_MAX_TOKENS`] when unset.
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Finalize the provider synchronously.
+    ///
+    /// If `bearer_token` was set, uses it as-is with no ambient probe.
+    /// Otherwise walks the standard chain (`BEDROCK_API_KEY` env →
+    /// `AwsCredentials::from_env` → `AwsCredentials::from_credential_process`),
+    /// which can spawn the `credential_process` command from
+    /// `~/.aws/config`. Use [`Self::build_async`] if you need the
+    /// IMDS-aware resolver (which requires an async context).
+    pub fn build(self) -> BedrockModelProvider {
+        let auth = if let Some(token) = self.bearer_token {
+            Some(BedrockAuth::BearerToken(token))
+        } else {
+            resolve_ambient_auth_blocking()
+        };
+        BedrockModelProvider {
+            alias: self.alias,
+            auth,
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            cred_cache: Mutex::new(None),
+        }
+    }
+
+    /// Finalize the provider through the async credential resolver
+    /// (which additionally probes EC2 IMDSv2). Same bearer-token
+    /// short-circuit as [`Self::build`].
+    pub async fn build_async(self) -> BedrockModelProvider {
+        let auth = if let Some(token) = self.bearer_token {
+            Some(BedrockAuth::BearerToken(token))
+        } else {
+            resolve_ambient_auth_async().await
+        };
+        BedrockModelProvider {
+            alias: self.alias,
+            auth,
+            max_tokens: self
+                .max_tokens
+                .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
+            cred_cache: Mutex::new(None),
+        }
+    }
+}
+
+/// Walk the standard ambient AWS credential chain synchronously:
+/// `BEDROCK_API_KEY` env → `AwsCredentials::from_env` →
+/// `AwsCredentials::from_credential_process`. The last step can spawn
+/// the `credential_process` command from `~/.aws/config`.
+fn resolve_ambient_auth_blocking() -> Option<BedrockAuth> {
+    if let Some(token) = env_optional("BEDROCK_API_KEY") {
+        return Some(BedrockAuth::BearerToken(token));
+    }
+    AwsCredentials::from_env()
+        .or_else(|_| AwsCredentials::from_credential_process())
+        .ok()
+        .map(BedrockAuth::SigV4)
+}
+
+/// Async counterpart of [`resolve_ambient_auth_blocking`] that also
+/// probes EC2 IMDSv2 via [`AwsCredentials::resolve`].
+async fn resolve_ambient_auth_async() -> Option<BedrockAuth> {
+    if let Some(token) = env_optional("BEDROCK_API_KEY") {
+        return Some(BedrockAuth::BearerToken(token));
+    }
+    AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4)
+}
+
+impl BedrockModelProvider {
+    /// Entry point. Only `alias` is required; use
+    /// [`BedrockBuilder::bearer_token`] to pin an explicit token
+    /// (skipping every ambient probe) or call [`BedrockBuilder::build`]
+    /// with no token to walk the AWS credential chain.
+    pub fn builder(alias: &str) -> BedrockBuilder {
+        BedrockBuilder {
+            alias: alias.to_string(),
+            bearer_token: None,
+            max_tokens: None,
+        }
     }
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.bedrock",
+            "model_provider.bedrock",
             120,
             10,
         )
@@ -559,6 +881,23 @@ impl BedrockProvider {
         format!("/model/{encoded}/converse")
     }
 
+    /// Check the credential cache for unexpired credentials.
+    fn cached_credentials(&self) -> Option<AwsCredentials> {
+        let cache = self.cred_cache.lock().ok()?;
+        let creds = cache.as_ref()?;
+        if creds.is_expired() {
+            return None;
+        }
+        Some(creds.clone())
+    }
+
+    /// Store credentials in the cache.
+    fn cache_credentials(&self, creds: &AwsCredentials) {
+        if let Ok(mut cache) = self.cred_cache.lock() {
+            *cache = Some(creds.clone());
+        }
+    }
+
     /// Resolve auth: use cached if available, otherwise try env vars then IMDS.
     async fn resolve_auth(&self) -> anyhow::Result<BedrockAuth> {
         // If we already have auth cached, re-resolve from the same source.
@@ -568,7 +907,9 @@ impl BedrockProvider {
                     return Ok(BedrockAuth::BearerToken(token.clone()));
                 }
                 BedrockAuth::SigV4(_) => {
-                    // Re-resolve SigV4 credentials (they may have rotated).
+                    if let Some(creds) = self.cached_credentials() {
+                        return Ok(BedrockAuth::SigV4(creds));
+                    }
                 }
             }
         }
@@ -580,10 +921,14 @@ impl BedrockProvider {
         if let Ok(creds) = AwsCredentials::from_env() {
             return Ok(BedrockAuth::SigV4(creds));
         }
+        if let Ok(creds) = AwsCredentials::from_credential_process() {
+            self.cache_credentials(&creds);
+            return Ok(BedrockAuth::SigV4(creds));
+        }
         Ok(BedrockAuth::SigV4(AwsCredentials::from_imds().await?))
     }
 
-    // ── Cache heuristics (same thresholds as AnthropicProvider) ──
+    // ── Cache heuristics (same thresholds as AnthropicModelProvider) ──
 
     /// Cache system prompts larger than ~1024 tokens (3KB of text).
     fn should_cache_system(text: &str) -> bool {
@@ -644,10 +989,18 @@ impl BedrockProvider {
                                 .or_else(|| Self::last_pending_tool_use_id(&converse_messages))
                                 .unwrap_or_else(|| "unknown".to_string());
 
-                            tracing::warn!(
-                                "Failed to parse tool result message, creating error \
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!(
+                                    "Failed to parse tool result message, creating error \
                                  toolResult for tool_use_id={}",
-                                tool_use_id
+                                    tool_use_id
+                                )
                             );
 
                             ConverseMessage {
@@ -680,7 +1033,23 @@ impl BedrockProvider {
                     converse_messages.push(tool_result_msg);
                 }
                 _ => {
-                    let content_blocks = Self::parse_user_content_blocks(&msg.content);
+                    // A prompt-mode tool-result carrier reads through its
+                    // declaration, never its body: the declared image
+                    // attachments become image blocks and the carrier text
+                    // survives verbatim as one text block, through the same
+                    // `parse_user_message_image_refs` seam every other
+                    // adapter uses. Ordinary user messages keep the marker
+                    // behavior unchanged.
+                    let content_blocks = if zeroclaw_api::tool_carrier::classify(
+                        &msg.role,
+                        &msg.content,
+                    )
+                    .is_some()
+                    {
+                        Self::parse_prompt_carrier_content_blocks(&msg.content)
+                    } else {
+                        Self::parse_user_content_blocks(&msg.content)
+                    };
                     converse_messages.push(ConverseMessage {
                         role: "user".to_string(),
                         content: content_blocks,
@@ -697,13 +1066,6 @@ impl BedrockProvider {
         (system, converse_messages)
     }
 
-    /// Remove empty text ContentBlocks from converse messages.
-    ///
-    /// Bedrock rejects requests where a ContentBlock has a blank `text` field
-    /// with: "The text field in the ContentBlock object is blank". This can
-    /// occur when a daemon restart interrupts a streaming response, leaving a
-    /// partially-persisted message with empty content, or when bot/attachment-
-    /// only messages produce empty text blocks.
     fn sanitize_empty_content_blocks(messages: &mut [ConverseMessage]) {
         for msg in messages.iter_mut() {
             msg.content.retain(|block| match block {
@@ -714,6 +1076,46 @@ impl BedrockProvider {
                 msg.content.push(ContentBlock::Text(TextBlock {
                     text: "(empty)".to_string(),
                 }));
+            }
+        }
+    }
+
+    fn strip_orphaned_tool_uses(messages: &mut [ConverseMessage]) {
+        use std::collections::HashSet;
+
+        let answered_ids: HashSet<String> = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(w) => Some(w.tool_result.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+
+        for msg in messages.iter_mut() {
+            if msg.role != "assistant" {
+                continue;
+            }
+            let before = msg.content.len();
+            msg.content.retain(|block| match block {
+                ContentBlock::ToolUse(w) => answered_ids.contains(&w.tool_use.tool_use_id),
+                _ => true,
+            });
+            let removed = before - msg.content.len();
+            if removed > 0 {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "removed": removed })),
+                    "bedrock: converter stripped orphaned toolUse block(s) from an assistant \
+                     message — upstream history pruning likely missed a case"
+                );
+                if msg.content.is_empty() {
+                    msg.content.push(ContentBlock::Text(TextBlock {
+                        text: "(tool call omitted — no matching result)".to_string(),
+                    }));
+                }
             }
         }
     }
@@ -729,11 +1131,6 @@ impl BedrockProvider {
             .map(String::from)
     }
 
-    /// Find the first unmatched tool_use_id from the last assistant message.
-    ///
-    /// When a tool result can't be parsed at all (not even the ID), we fall
-    /// back to matching it against the preceding assistant turn's toolUse
-    /// blocks that don't yet have a corresponding toolResult.
     fn last_pending_tool_use_id(converse_messages: &[ConverseMessage]) -> Option<String> {
         let last_assistant = converse_messages
             .iter()
@@ -771,10 +1168,14 @@ impl BedrockProvider {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         let mut remaining = content;
         let has_image = content.contains("[IMAGE:");
-        tracing::info!(
-            "parse_user_content_blocks called, len={}, has_image={}",
-            content.len(),
-            has_image
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "parse_user_content_blocks called, len={}, has_image={}",
+                content.len(),
+                has_image
+            )
         );
 
         while let Some(start) = remaining.find("[IMAGE:") {
@@ -798,12 +1199,7 @@ impl BedrockProvider {
                     let mime = &rest[..semi];
                     let after_semi = &rest[semi + 1..];
                     if let Some(b64) = after_semi.strip_prefix("base64,") {
-                        let format = match mime {
-                            "image/png" => "png",
-                            "image/gif" => "gif",
-                            "image/webp" => "webp",
-                            _ => "jpeg",
-                        };
+                        let format = Self::image_format_for_mime(mime);
                         blocks.push(ContentBlock::Image(ImageWrapper {
                             image: ImageBlock {
                                 format: format.to_string(),
@@ -847,6 +1243,94 @@ impl BedrockProvider {
         blocks
     }
 
+    /// Build user-role blocks for a prompt-mode tool-result carrier: the
+    /// declared image attachments become image blocks, and the carrier text
+    /// `parse_user_message_image_refs` returns (the rebuilt carrier without
+    /// its image attachment lines) becomes one verbatim text block that is
+    /// never scanned for markers. The Bedrock counterpart of the seam every
+    /// other adapter routes user-role carriers through, so a carrier body
+    /// quoting marker syntax stays text instead of smuggling an image into
+    /// the request.
+    fn parse_prompt_carrier_content_blocks(content: &str) -> Vec<ContentBlock> {
+        let (text, image_refs) = crate::multimodal::parse_user_message_image_refs(content);
+        let mut blocks = Vec::new();
+
+        for image_ref in &image_refs {
+            let (mime, payload) = if image_ref.starts_with("data:") {
+                // Routed through the same shared structural check the
+                // anthropic adapter's user arm uses, so both adapters agree
+                // on what a deliverable image is: a header without `;base64`,
+                // a media type off the allowlist, a non-canonical payload, or
+                // one over the per-image ceiling is dropped here instead of
+                // drawing a 400 from the API.
+                match crate::multimodal::split_base64_image_data_uri(
+                    image_ref,
+                    crate::multimodal::MAX_ENCODED_IMAGE_PAYLOAD_BYTES,
+                ) {
+                    Ok((mime, payload)) => (mime.to_ascii_lowercase(), payload.to_string()),
+                    Err(reason) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{reason}"),
+                                "error_key": "bedrock_image_marker_malformed_data_uri",
+                            })),
+                            "dropping image marker: data URI failed the structural check"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "bedrock_image_source_missing",
+                        })),
+                    "dropping image marker: source is neither a data URI nor an existing file"
+                );
+                // The multimodal normalizer is the only component allowed to
+                // turn a file reference into inline image content, so a
+                // non-inline reference is dropped rather than read: reading
+                // the path (extension-inferred MIME, no size or content
+                // validation) would reopen the hole the normalizer exists to
+                // close. Mirrors the anthropic adapter's user arm.
+                continue;
+            };
+
+            let format = Self::image_format_for_mime(&mime);
+            blocks.push(ContentBlock::Image(ImageWrapper {
+                image: ImageBlock {
+                    format: format.to_string(),
+                    source: ImageSource {
+                        bytes: payload.to_string(),
+                    },
+                },
+            }));
+        }
+
+        blocks.push(ContentBlock::Text(TextBlock { text }));
+        blocks
+    }
+
+    /// Map an image MIME media type to the Bedrock image `format` field
+    /// value. JPEG is the catch-all, exactly as the inline user-marker parse
+    /// has always mapped it.
+    fn image_format_for_mime(mime: &str) -> &'static str {
+        match mime {
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "jpeg",
+        }
+    }
+
     /// Parse assistant message containing structured tool calls.
     fn parse_assistant_tool_call_message(content: &str) -> Option<Vec<ContentBlock>> {
         let value = serde_json::from_str::<serde_json::Value>(content).ok()?;
@@ -855,6 +1339,38 @@ impl BedrockProvider {
             .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
 
         let mut blocks = Vec::new();
+
+        // When extended thinking is enabled, assistant messages must start
+        // with reasoning content blocks (including signatures) before any
+        // tool_use blocks. The reasoning_content field stores JSON-encoded
+        // thinking blocks from the original response.
+        if let Some(reasoning) = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            // reasoning_content may contain multiple JSON blocks joined by \n
+            for part in reasoning.split('\n') {
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
+                    let text = block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let signature = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    blocks.push(ContentBlock::ReasoningContent(ReasoningContentOutWrapper {
+                        reasoning_content: ReasoningContentOutBlock {
+                            reasoning_text: ReasoningTextOutField { text, signature },
+                        },
+                    }));
+                }
+            }
+        }
+
         if let Some(text) = value
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -890,9 +1406,8 @@ impl BedrockProvider {
             .to_string();
         let result = value
             .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
+            .map(Self::tool_result_content_text)
+            .unwrap_or_default();
         Some(ConverseMessage {
             role: "user".to_string(),
             content: vec![ContentBlock::ToolResult(ToolResultWrapper {
@@ -903,6 +1418,15 @@ impl BedrockProvider {
                 },
             })],
         })
+    }
+
+    // Bedrock toolResult content is text-only. Preserve string tool output as-is;
+    // encode structured output compactly so object/array results are not dropped.
+    fn tool_result_content_text(value: &serde_json::Value) -> String {
+        value
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string())
     }
 
     // ── Tool conversion ─────────────────────────────────────────
@@ -919,7 +1443,7 @@ impl BedrockProvider {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
                     input_schema: InputSchema {
-                        json: tool.parameters.clone(),
+                        json: Arc::clone(&tool.parameters),
                     },
                 },
             })
@@ -931,12 +1455,14 @@ impl BedrockProvider {
 
     fn parse_converse_response(response: ConverseResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
             cached_input_tokens: None,
+            cache_creation_input_tokens: None,
         });
 
         if let Some(output) = response.output
@@ -950,6 +1476,16 @@ impl BedrockProvider {
                             text_parts.push(trimmed);
                         }
                     }
+                    ResponseContentBlock::ReasoningContent(wrapper) => {
+                        if let Some(reasoning_text) = wrapper.reasoning_content.reasoning_text {
+                            // Store as JSON with signature for round-tripping.
+                            let block = serde_json::json!({
+                                "text": reasoning_text.text.as_deref().unwrap_or(""),
+                                "signature": reasoning_text.signature.as_deref().unwrap_or(""),
+                            });
+                            thinking_parts.push(block.to_string());
+                        }
+                    }
                     ResponseContentBlock::ToolUse(wrapper) => {
                         if !wrapper.tool_use.name.is_empty() {
                             tool_calls.push(ProviderToolCall {
@@ -960,10 +1496,16 @@ impl BedrockProvider {
                             });
                         }
                     }
-                    ResponseContentBlock::Other(_) => {}
+                    ResponseContentBlock::Other(value) => drop(value),
                 }
             }
         }
+
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("\n"))
+        };
 
         ProviderChatResponse {
             text: if text_parts.is_empty() {
@@ -973,7 +1515,7 @@ impl BedrockProvider {
             },
             tool_calls,
             usage,
-            reasoning_content: None,
+            reasoning_content,
         }
     }
 
@@ -1003,9 +1545,16 @@ impl BedrockProvider {
                             {
                                 *bytes = serde_json::json!(format!("<base64 {} chars>", s.len()));
                             }
-                            tracing::info!(
-                                "Bedrock image block: {}",
-                                serde_json::to_string(&b).unwrap_or_default()
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                &format!(
+                                    "Bedrock image block: {}",
+                                    serde_json::to_string(&b).unwrap_or_default()
+                                )
                             );
                         }
                     }
@@ -1078,15 +1627,16 @@ impl BedrockProvider {
     }
 }
 
-// ── Provider trait implementation ───────────────────────────────
+// ── ModelProvider trait implementation ───────────────────────────────
 
 #[async_trait]
-impl Provider for BedrockProvider {
+impl ModelProvider for BedrockModelProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            extended_thinking: true,
         }
     }
 
@@ -1117,14 +1667,14 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
+        let supports_caching = bedrock_model_supports_prompt_caching(model);
         let system = system_prompt.map(|text| {
             let mut blocks = vec![SystemBlock::Text(TextBlock {
                 text: text.to_string(),
             })];
-            if Self::should_cache_system(text) {
+            if supports_caching && Self::should_cache_system(text) {
                 blocks.push(SystemBlock::CachePoint(CachePointWrapper {
                     cache_point: CachePoint::default_cache(),
                 }));
@@ -1143,20 +1693,23 @@ impl Provider for BedrockProvider {
             messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
-                temperature: if bedrock_model_omits_temperature(model) {
-                    None
-                } else {
-                    Some(temperature)
-                },
+                temperature,
             }),
             tool_config: None,
+            additional_model_request_fields: None,
         };
 
         let response = self.send_converse_request(&auth, model, &request).await?;
 
-        Self::parse_converse_response(response)
-            .text
-            .ok_or_else(|| anyhow::anyhow!("No response from Bedrock"))
+        Self::parse_converse_response(response).text.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "bedrock: empty text in response"
+            );
+            anyhow::Error::msg("No response from Bedrock")
+        })
     }
 
     async fn chat(
@@ -1165,7 +1718,6 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
@@ -1173,12 +1725,23 @@ impl Provider for BedrockProvider {
         // Strip empty text ContentBlocks that would cause Bedrock 400 errors.
         Self::sanitize_empty_content_blocks(&mut converse_messages);
 
+        // Strip orphaned toolUse blocks (no matching toolResult) that would
+        // otherwise trigger "Expected toolResult blocks at messages.N.content
+        // for the following Ids: tooluse_*". The runtime history pruner is the
+        // primary defence; this is the converter-side backstop.
+        Self::strip_orphaned_tool_uses(&mut converse_messages);
+
+        // Prompt caching (cachePoint) is only accepted by Claude/Nova models;
+        // sending it to e.g. Qwen or Llama returns a 400. Gate all cachePoint
+        // insertion on model support.
+        let supports_caching = bedrock_model_supports_prompt_caching(model);
+
         // Apply cachePoint to system if large.
         let system = system_blocks.map(|mut blocks| {
             let has_large_system = blocks
                 .iter()
                 .any(|b| matches!(b, SystemBlock::Text(tb) if Self::should_cache_system(&tb.text)));
-            if has_large_system {
+            if supports_caching && has_large_system {
                 blocks.push(SystemBlock::CachePoint(CachePointWrapper {
                     cache_point: CachePoint::default_cache(),
                 }));
@@ -1187,7 +1750,8 @@ impl Provider for BedrockProvider {
         });
 
         // Apply cachePoint to last message if conversation is long.
-        if Self::should_cache_conversation(request.messages)
+        if supports_caching
+            && Self::should_cache_conversation(request.messages)
             && let Some(last_msg) = converse_messages.last_mut()
         {
             last_msg
@@ -1199,18 +1763,50 @@ impl Provider for BedrockProvider {
 
         let tool_config = Self::convert_tools_to_converse(request.tools);
 
+        // Native thinking forces temperature=1.0 (Anthropic API requirement).
+        // Otherwise the caller's Option<f64> flows through verbatim; None
+        // omits the field via skip_serializing_if.
+        let (effective_temperature, additional_fields, effective_max_tokens) = match request
+            .thinking
+        {
+            Some(params) if bedrock_model_supports_native_thinking(model) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                    "Bedrock native extended thinking enabled; forcing temperature=1.0"
+                );
+                let fields = serde_json::json!({
+                    "thinking": {
+                        "type": "enabled",
+                        "budget_tokens": params.budget_tokens
+                    }
+                });
+                let min_required = params.budget_tokens + 1;
+                let max_tokens = self.max_tokens.max(min_required);
+                (Some(1.0), Some(fields), max_tokens)
+            }
+            Some(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"model": model})),
+                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
+                );
+                (temperature, None, self.max_tokens)
+            }
+            None => (temperature, None, self.max_tokens),
+        };
+
         let converse_request = ConverseRequest {
             system,
             messages: converse_messages,
             inference_config: Some(InferenceConfig {
-                max_tokens: self.max_tokens,
-                temperature: if bedrock_model_omits_temperature(model) {
-                    None
-                } else {
-                    Some(temperature)
-                },
+                max_tokens: effective_max_tokens,
+                temperature: effective_temperature,
             }),
             tool_config,
+            additional_model_request_fields: additional_fields,
         };
 
         let response = self
@@ -1233,6 +1829,19 @@ impl Provider for BedrockProvider {
 }
 
 // ── Tests ───────────────────────────────────────────────────────
+
+impl ::zeroclaw_api::attribution::Attributable for BedrockModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Bedrock,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1297,6 +1906,7 @@ mod tests {
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
             session_token: None,
             region: "us-east-1".to_string(),
+            expires_at: None,
         };
 
         let timestamp = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
@@ -1336,6 +1946,7 @@ mod tests {
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
             session_token: Some("session-token-value".to_string()),
             region: "us-east-1".to_string(),
+            expires_at: None,
         };
 
         let timestamp = chrono::DateTime::parse_from_rfc3339("2024-01-15T12:00:00Z")
@@ -1377,28 +1988,34 @@ mod tests {
             secret_access_key: "secret".to_string(),
             session_token: None,
             region: "us-west-2".to_string(),
+            expires_at: None,
         };
         assert_eq!(creds.host(), "bedrock-runtime.us-west-2.amazonaws.com");
     }
 
-    // ── Provider construction tests ─────────────────────────────
+    // ── ModelProvider construction tests ─────────────────────────────
 
     #[test]
     fn creates_without_credentials() {
-        // Provider should construct even without env vars.
-        let _provider = BedrockProvider::new();
+        // ModelProvider should construct even without env vars.
+        let _provider = BedrockModelProvider::builder("test").build();
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn chat_fails_without_credentials() {
-        let provider = {
-            let _env_lock = env_lock();
-            BedrockProvider {
-                auth: None,
-                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
-            }
+        let _env_lock = env_lock();
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
+        let _bearer = EnvGuard::set("BEDROCK_API_KEY", None);
+        let _config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
+            auth: None,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         };
-        let result = provider
+        let result = model_provider
             .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", Some(0.7))
             .await;
         assert!(result.is_err());
@@ -1416,10 +2033,58 @@ mod tests {
 
     #[test]
     fn creates_with_bearer_token() {
-        let provider = BedrockProvider::with_bearer_token("test-api-key");
-        assert!(provider.auth.is_some());
+        let model_provider = BedrockModelProvider::builder("test")
+            .bearer_token("test-api-key")
+            .build();
+        assert!(model_provider.auth.is_some());
         assert!(
-            matches!(provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
+            matches!(model_provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
+        );
+    }
+
+    /// Regression for the factory-side explicit-API-key path.
+    ///
+    /// The pre-refactor code used `BedrockModelProvider::with_bearer_token(alias, api_key)`,
+    /// which directly constructed a bearer-token provider and skipped
+    /// every ambient AWS credential probe. An earlier iteration of this
+    /// refactor routed the same path through `new(alias).with_bearer_token(...)`,
+    /// which meant `new(alias)` would still walk `BEDROCK_API_KEY` env → SigV4
+    /// env → `credential_process` (spawning a shell command from
+    /// `~/.aws/config`) before the bearer-token override took effect —
+    /// an observable security-boundary regression.
+    ///
+    /// This test proves the current builder-based explicit-key path
+    /// bypasses every ambient probe: with the AWS config file pointed at
+    /// `/dev/null` (so any `credential_process` walk would either err out
+    /// or, if the parser were ever changed, spawn `/dev/null` as a
+    /// command) and with `BEDROCK_API_KEY` deliberately set to a
+    /// distractor value, the resulting `auth` must be exactly the
+    /// caller-supplied bearer token.
+    #[test]
+    fn bearer_token_builder_skips_ambient_credential_probe() {
+        let _env_lock = env_lock();
+        // A stale ambient bearer would beat the explicit one if the
+        // builder probed env before applying the caller's token.
+        let _bedrock_env = EnvGuard::set("BEDROCK_API_KEY", Some("distractor-ambient-token"));
+        // Point the AWS config file at /dev/null so any accidental
+        // credential_process walk fails loudly instead of silently
+        // reading from the developer's real ~/.aws/config.
+        let _aws_config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
+        // Also clear the SigV4 env vars so from_env cannot silently
+        // succeed and mask an unintended probe.
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
+
+        let model_provider = BedrockModelProvider::builder("test")
+            .bearer_token("explicit-caller-token")
+            .build();
+
+        assert!(
+            matches!(
+                model_provider.auth,
+                Some(BedrockAuth::BearerToken(ref t)) if t == "explicit-caller-token"
+            ),
+            "explicit bearer_token() must skip BEDROCK_API_KEY probe and win over any ambient value"
         );
     }
 
@@ -1431,9 +2096,9 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
 
-        let provider = BedrockProvider::new();
+        let model_provider = BedrockModelProvider::builder("test").build();
         assert!(matches!(
-            provider.auth,
+            model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "env-bearer-token"
         ));
     }
@@ -1445,10 +2110,10 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
 
-        let provider = BedrockProvider::new();
+        let model_provider = BedrockModelProvider::builder("test").build();
         // Bearer token should take priority over SigV4 credentials.
         assert!(matches!(
-            provider.auth,
+            model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "bearer-key"
         ));
     }
@@ -1457,7 +2122,7 @@ mod tests {
 
     #[test]
     fn endpoint_url_formats_correctly() {
-        let url = BedrockProvider::endpoint_url("us-east-1", "anthropic.claude-sonnet-4-6");
+        let url = BedrockModelProvider::endpoint_url("us-east-1", "anthropic.claude-sonnet-4-6");
         assert_eq!(
             url,
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-sonnet-4-6/converse"
@@ -1467,15 +2132,17 @@ mod tests {
     #[test]
     fn endpoint_url_keeps_raw_colon() {
         // Endpoint URL uses raw colon so reqwest sends `:` on the wire.
-        let url =
-            BedrockProvider::endpoint_url("us-west-2", "anthropic.claude-3-5-haiku-20241022-v1:0");
+        let url = BedrockModelProvider::endpoint_url(
+            "us-west-2",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+        );
         assert!(url.contains("/model/anthropic.claude-3-5-haiku-20241022-v1:0/converse"));
     }
 
     #[test]
     fn canonical_uri_encodes_colon() {
         // Canonical URI must encode `:` as `%3A` for SigV4 signing.
-        let uri = BedrockProvider::canonical_uri("anthropic.claude-3-5-haiku-20241022-v1:0");
+        let uri = BedrockModelProvider::canonical_uri("anthropic.claude-3-5-haiku-20241022-v1:0");
         assert_eq!(
             uri,
             "/model/anthropic.claude-3-5-haiku-20241022-v1%3A0/converse"
@@ -1484,7 +2151,7 @@ mod tests {
 
     #[test]
     fn canonical_uri_no_colon_unchanged() {
-        let uri = BedrockProvider::canonical_uri("anthropic.claude-sonnet-4-6");
+        let uri = BedrockModelProvider::canonical_uri("anthropic.claude-sonnet-4-6");
         assert_eq!(uri, "/model/anthropic.claude-sonnet-4-6/converse");
     }
 
@@ -1496,7 +2163,7 @@ mod tests {
             ChatMessage::system("You are helpful"),
             ChatMessage::user("Hello"),
         ];
-        let (system, msgs) = BedrockProvider::convert_messages(&messages);
+        let (system, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert!(system.is_some());
         let system_blocks = system.unwrap();
         assert_eq!(system_blocks.len(), 1);
@@ -1510,18 +2177,140 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there"),
         ];
-        let (system, msgs) = BedrockProvider::convert_messages(&messages);
+        let (system, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert!(system.is_none());
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
     }
 
+    fn image_marker(target: &str) -> String {
+        zeroclaw_api::tool_carrier::marker_line(&zeroclaw_api::media::RenderedMarker {
+            target: target.to_string(),
+            kind: zeroclaw_api::media::MarkerKind::Image,
+        })
+    }
+
+    /// A count-zero carrier whose body quotes a data-URI marker and a path
+    /// marker, the ordinary shape of a tool reading source text that
+    /// contains them. The carrier reads through its declaration, so the
+    /// quotes stay body text: zero image blocks, and the delivered text is
+    /// the carrier byte-for-byte, no marker rewrite.
+    #[test]
+    fn convert_messages_prompt_carrier_quoting_data_uri_marker_stays_text() {
+        let body = format!(
+            "source example: {} and {} in prose",
+            image_marker("data:image/png;base64,QUJD"),
+            image_marker("/tmp/quoted.png")
+        );
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        let messages = vec![ChatMessage::user(carrier.clone())];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "user");
+        assert!(
+            !msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image(_))),
+            "no image block may be built from carrier body text"
+        );
+        let text: String = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(tb) => Some(tb.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, carrier, "the carrier content is delivered verbatim");
+    }
+
+    /// A declared carrier with one data-URI image attachment whose body
+    /// quotes a second data-URI marker: exactly one image block, built from
+    /// the declared attachment and never the quoted one, with the body text
+    /// verbatim around it.
+    #[test]
+    fn convert_messages_prompt_carrier_declared_image_builds_exactly_one_block() {
+        let declared = "data:image/png;base64,iVBORw0KGgo=";
+        let body = format!(
+            "source example: {} in prose",
+            image_marker("data:image/png;base64,QUJD")
+        );
+        let carrier = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(
+            &body,
+            &[zeroclaw_api::media::RenderedMarker {
+                target: declared.to_string(),
+                kind: zeroclaw_api::media::MarkerKind::Image,
+            }],
+        );
+        let messages = vec![ChatMessage::user(carrier)];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        let images: Vec<&ImageBlock> = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image(w) => Some(&w.image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            images.len(),
+            1,
+            "exactly the declared attachment builds an image block"
+        );
+        assert_eq!(images[0].source.bytes, "iVBORw0KGgo=");
+        assert_eq!(images[0].format, "png");
+        let text: String = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(tb) => Some(tb.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected = zeroclaw_api::tool_carrier::render_prompt_tool_carrier(&body, &[]);
+        assert_eq!(
+            text, expected,
+            "the body text is verbatim in the rebuilt count-zero carrier"
+        );
+        assert!(
+            text.contains(&body),
+            "the quoted marker stays in the body verbatim"
+        );
+    }
+
+    /// Control for the carrier branch: a plain user message whose text carries
+    /// one data-URI marker still lifts it into exactly one image block, the
+    /// pre-carrier behavior of `parse_user_content_blocks` unchanged.
+    #[test]
+    fn convert_messages_user_text_marker_still_builds_image_block() {
+        let content = format!(
+            "look {}",
+            image_marker("data:image/png;base64,iVBORw0KGgo=")
+        );
+        let messages = vec![ChatMessage::user(content)];
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 1);
+        let images: Vec<&ImageBlock> = msgs[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image(w) => Some(&w.image),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(images.len(), 1, "the user-text marker still lifts");
+        assert_eq!(images[0].source.bytes, "iVBORw0KGgo=");
+        assert_eq!(images[0].format, "png");
+    }
+
     #[test]
     fn convert_messages_tool_role_to_tool_result() {
         let tool_json = r#"{"tool_call_id": "call_123", "content": "Result data"}"#;
         let messages = vec![ChatMessage::tool(tool_json)];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert!(matches!(msgs[0].content[0], ContentBlock::ToolResult(_)));
@@ -1531,7 +2320,7 @@ mod tests {
     fn convert_messages_assistant_tool_calls_parsed() {
         let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
         let messages = vec![ChatMessage::assistant(tool_call_json)];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
         assert_eq!(msgs[0].content.len(), 2);
@@ -1540,9 +2329,58 @@ mod tests {
     }
 
     #[test]
+    fn strip_orphaned_tool_uses_removes_unanswered_tool_use() {
+        // Belt-and-suspenders: if an orphaned tool_use slips past the runtime
+        // history pruner, the Bedrock converter must strip it so AWS doesn't
+        // reject with "Expected toolResult blocks at messages.N.content".
+        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_ORPHAN", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
+        let messages = vec![ChatMessage::assistant(tool_call_json)];
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        // Pre-condition: the converter produced an (orphaned) ToolUse block.
+        assert!(
+            msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_)))
+        );
+
+        BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
+
+        assert_eq!(msgs[0].role, "assistant");
+        assert!(
+            !msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_))),
+            "orphaned ToolUse must be stripped"
+        );
+        // Content must not be empty (Bedrock rejects blank content).
+        assert!(!msgs[0].content.is_empty());
+    }
+
+    #[test]
+    fn strip_orphaned_tool_uses_retains_answered_tool_use() {
+        let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_OK", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
+        let tool_result_json = r#"{"content":"ls output","tool_call_id":"call_OK"}"#;
+        let messages = vec![
+            ChatMessage::assistant(tool_call_json),
+            ChatMessage::tool(tool_result_json),
+        ];
+        let (_, mut msgs) = BedrockModelProvider::convert_messages(&messages);
+        BedrockModelProvider::strip_orphaned_tool_uses(&mut msgs);
+        assert!(
+            msgs[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse(_))),
+            "a tool_use with a matching tool_result must be retained"
+        );
+    }
+
+    #[test]
     fn convert_messages_plain_assistant_text() {
         let messages = vec![ChatMessage::assistant("Just text")];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].content[0], ContentBlock::Text(_)));
     }
@@ -1551,19 +2389,21 @@ mod tests {
 
     #[test]
     fn should_cache_system_small_prompt() {
-        assert!(!BedrockProvider::should_cache_system("Short prompt"));
+        assert!(!BedrockModelProvider::should_cache_system("Short prompt"));
     }
 
     #[test]
     fn should_cache_system_large_prompt() {
         let large = "a".repeat(3073);
-        assert!(BedrockProvider::should_cache_system(&large));
+        assert!(BedrockModelProvider::should_cache_system(&large));
     }
 
     #[test]
     fn should_cache_system_boundary() {
-        assert!(!BedrockProvider::should_cache_system(&"a".repeat(3072)));
-        assert!(BedrockProvider::should_cache_system(&"a".repeat(3073)));
+        assert!(!BedrockModelProvider::should_cache_system(
+            &"a".repeat(3072)
+        ));
+        assert!(BedrockModelProvider::should_cache_system(&"a".repeat(3073)));
     }
 
     #[test]
@@ -1573,7 +2413,7 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi"),
         ];
-        assert!(!BedrockProvider::should_cache_conversation(&messages));
+        assert!(!BedrockModelProvider::should_cache_conversation(&messages));
     }
 
     #[test]
@@ -1585,19 +2425,19 @@ mod tests {
                 content: format!("Message {i}"),
             });
         }
-        assert!(BedrockProvider::should_cache_conversation(&messages));
+        assert!(BedrockModelProvider::should_cache_conversation(&messages));
     }
 
     // ── Tool conversion tests ───────────────────────────────────
 
     #[test]
     fn convert_tools_to_converse_formats_correctly() {
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "Run commands".to_string(),
-            parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
-        }];
-        let config = BedrockProvider::convert_tools_to_converse(Some(&tools));
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "Run commands",
+            serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        )];
+        let config = BedrockModelProvider::convert_tools_to_converse(Some(&tools));
         assert!(config.is_some());
         let config = config.unwrap();
         assert_eq!(config.tools.len(), 1);
@@ -1606,8 +2446,8 @@ mod tests {
 
     #[test]
     fn convert_tools_to_converse_empty_returns_none() {
-        assert!(BedrockProvider::convert_tools_to_converse(Some(&[])).is_none());
-        assert!(BedrockProvider::convert_tools_to_converse(None).is_none());
+        assert!(BedrockModelProvider::convert_tools_to_converse(Some(&[])).is_none());
+        assert!(BedrockModelProvider::convert_tools_to_converse(None).is_none());
     }
 
     // ── Serde tests ─────────────────────────────────────────────
@@ -1627,6 +2467,7 @@ mod tests {
                 temperature: Some(0.7),
             }),
             tool_config: None,
+            additional_model_request_fields: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
@@ -1634,29 +2475,98 @@ mod tests {
         assert!(json.contains("maxTokens"));
     }
 
-    // ── Opus 4.7 temperature-omission tests (issue #6095) ────────
-
     #[test]
-    fn bedrock_model_omits_temperature_matches_opus_4_7() {
-        assert!(bedrock_model_omits_temperature(
+    fn bedrock_model_supports_native_thinking_excludes_opus_4_7() {
+        // Per AWS Bedrock model card, Opus 4.7 only supports adaptive thinking;
+        // fixed-budget native thinking returns a 400.
+        assert!(!bedrock_model_supports_native_thinking(
             "us.anthropic.claude-opus-4-7"
         ));
-        assert!(bedrock_model_omits_temperature(
+        assert!(!bedrock_model_supports_native_thinking(
             "anthropic.claude-opus-4-7-v1:0"
         ));
     }
 
     #[test]
-    fn bedrock_model_omits_temperature_skips_other_models() {
-        assert!(!bedrock_model_omits_temperature(
+    fn bedrock_model_supports_native_thinking_allows_other_models() {
+        assert!(bedrock_model_supports_native_thinking(
             "us.anthropic.claude-opus-4-6-v1"
         ));
-        assert!(!bedrock_model_omits_temperature(
+        assert!(bedrock_model_supports_native_thinking(
             "us.anthropic.claude-sonnet-4-6-v1"
         ));
-        assert!(!bedrock_model_omits_temperature(
+        assert!(bedrock_model_supports_native_thinking(
             "us.anthropic.claude-haiku-4-5-v1"
         ));
+    }
+
+    #[test]
+    fn prompt_caching_supported_for_claude_and_nova() {
+        for model in [
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "us.anthropic.claude-sonnet-4-6-v1",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "amazon.nova-pro-v1:0",
+            "us.amazon.nova-lite-v1:0",
+        ] {
+            assert!(
+                bedrock_model_supports_prompt_caching(model),
+                "expected prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_unsupported_for_other_families() {
+        // Qwen (and other non-Claude/Nova families) reject
+        // cachePoint blocks, so caching must be disabled for them.
+        for model in [
+            "qwen.qwen3-coder-next",
+            "meta.llama3-1-70b-instruct-v1:0",
+            "mistral.mistral-large-2407-v1:0",
+            "deepseek.r1-v1:0",
+        ] {
+            assert!(
+                !bedrock_model_supports_prompt_caching(model),
+                "expected NO prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_unsupported_for_nova2() {
+        // Nova 2 models match the "nova" family but reject cachePoint with a
+        // 400 "extraneous key [cachePoint] is not permitted".
+        for model in [
+            "us.amazon.nova-2-lite-v1:0",
+            "amazon.nova-2-lite-v1:0",
+            "US.AMAZON.NOVA-2-LITE-V1:0",
+        ] {
+            assert!(
+                !bedrock_model_supports_prompt_caching(model),
+                "expected NO prompt caching support for {model}"
+            );
+        }
+        // First-generation Nova models keep caching (whose IDs must not be
+        // caught by the Nova 2 exclusion).
+        for model in [
+            "us.amazon.nova-lite-v1:0",
+            "amazon.nova-micro-v1:0",
+            "amazon.nova-pro-v1:0",
+            "amazon.nova-premier-v1:0",
+        ] {
+            assert!(
+                bedrock_model_supports_prompt_caching(model),
+                "expected prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_match_is_case_insensitive() {
+        assert!(bedrock_model_supports_prompt_caching("ANTHROPIC.CLAUDE-X"));
+        assert!(bedrock_model_supports_prompt_caching("Amazon.Nova-Pro"));
+        assert!(!bedrock_model_supports_prompt_caching("QWEN.qwen3"));
     }
 
     #[test]
@@ -1699,7 +2609,7 @@ mod tests {
             "stopReason": "end_turn"
         }"#;
         let resp: ConverseResponse = serde_json::from_str(json).unwrap();
-        let parsed = BedrockProvider::parse_converse_response(resp);
+        let parsed = BedrockModelProvider::parse_converse_response(resp);
         assert_eq!(parsed.text.as_deref(), Some("Hello from Bedrock"));
         assert!(parsed.tool_calls.is_empty());
     }
@@ -1718,7 +2628,7 @@ mod tests {
             "stopReason": "tool_use"
         }"#;
         let resp: ConverseResponse = serde_json::from_str(json).unwrap();
-        let parsed = BedrockProvider::parse_converse_response(resp);
+        let parsed = BedrockModelProvider::parse_converse_response(resp);
         assert!(parsed.text.is_none());
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "shell");
@@ -1729,7 +2639,7 @@ mod tests {
     fn converse_response_empty_output() {
         let json = r#"{"output": null, "stopReason": null}"#;
         let resp: ConverseResponse = serde_json::from_str(json).unwrap();
-        let parsed = BedrockProvider::parse_converse_response(resp);
+        let parsed = BedrockModelProvider::parse_converse_response(resp);
         assert!(parsed.text.is_none());
         assert!(parsed.tool_calls.is_empty());
     }
@@ -1786,21 +2696,25 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_credentials_is_noop() {
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         };
-        let result = provider.warmup().await;
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[test]
     fn capabilities_reports_native_tool_calling() {
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
         };
-        let caps = provider.capabilities();
+        let caps = model_provider.capabilities();
         assert!(caps.native_tool_calling);
     }
 
@@ -1839,7 +2753,7 @@ mod tests {
                 content: "not valid json".to_string(),
             },
         ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         let tool_msg = &msgs[2];
         assert_eq!(tool_msg.role, "user");
         assert!(
@@ -1861,7 +2775,7 @@ mod tests {
                 content: "raw output with no json".to_string(),
             },
         ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         if let ContentBlock::ToolResult(ref wrapper) = msgs[2].content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "tool_abc");
             assert_eq!(wrapper.tool_result.status, "error");
@@ -1880,7 +2794,7 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
             ChatMessage::tool(r#"{"tool_call_id":"t2","content":"result 2"}"#),
         ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         // Should be: user, assistant, user (merged tool results)
         assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
         assert_eq!(msgs[2].role, "user");
@@ -1896,30 +2810,63 @@ mod tests {
     #[test]
     fn extract_tool_call_id_tries_multiple_field_names() {
         assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"tool_call_id":"a"}"#),
+            BedrockModelProvider::extract_tool_call_id(r#"{"tool_call_id":"a"}"#),
             Some("a".to_string())
         );
         assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"tool_use_id":"b"}"#),
+            BedrockModelProvider::extract_tool_call_id(r#"{"tool_use_id":"b"}"#),
             Some("b".to_string())
         );
         assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"toolUseId":"c"}"#),
+            BedrockModelProvider::extract_tool_call_id(r#"{"toolUseId":"c"}"#),
             Some("c".to_string())
         );
         assert_eq!(
-            BedrockProvider::extract_tool_call_id("not json at all"),
+            BedrockModelProvider::extract_tool_call_id("not json at all"),
             None
         );
     }
 
     #[test]
     fn parse_tool_result_accepts_alternate_id_fields() {
-        let msg =
-            BedrockProvider::parse_tool_result_message(r#"{"tool_use_id":"x","content":"ok"}"#);
+        let msg = BedrockModelProvider::parse_tool_result_message(
+            r#"{"tool_use_id":"x","content":"ok"}"#,
+        );
         assert!(msg.is_some());
         if let ContentBlock::ToolResult(ref wrapper) = msg.unwrap().content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "x");
+            assert_eq!(wrapper.tool_result.content[0].text, "ok");
+        } else {
+            panic!("Expected ToolResult");
+        }
+    }
+
+    #[test]
+    fn parse_tool_result_preserves_structured_content_as_json_text() {
+        let object_msg = BedrockModelProvider::parse_tool_result_message(
+            r#"{"tool_call_id":"obj","content":{"ok":true,"count":2}}"#,
+        )
+        .expect("object content should parse");
+        if let ContentBlock::ToolResult(ref wrapper) = object_msg.content[0] {
+            assert_eq!(wrapper.tool_result.tool_use_id, "obj");
+            assert_eq!(
+                wrapper.tool_result.content[0].text,
+                r#"{"count":2,"ok":true}"#
+            );
+        } else {
+            panic!("Expected ToolResult");
+        }
+
+        let array_msg = BedrockModelProvider::parse_tool_result_message(
+            r#"{"tool_call_id":"arr","content":["alpha",{"beta":1}]}"#,
+        )
+        .expect("array content should parse");
+        if let ContentBlock::ToolResult(ref wrapper) = array_msg.content[0] {
+            assert_eq!(wrapper.tool_result.tool_use_id, "arr");
+            assert_eq!(
+                wrapper.tool_result.content[0].text,
+                r#"["alpha",{"beta":1}]"#
+            );
         } else {
             panic!("Expected ToolResult");
         }
@@ -1933,7 +2880,7 @@ mod tests {
                 text: String::new(),
             })],
         }];
-        BedrockProvider::sanitize_empty_content_blocks(&mut messages);
+        BedrockModelProvider::sanitize_empty_content_blocks(&mut messages);
         assert_eq!(messages.len(), 1);
         if let ContentBlock::Text(ref tb) = messages[0].content[0] {
             assert_eq!(tb.text, "(empty)");
@@ -1950,7 +2897,7 @@ mod tests {
                 text: "Hello".to_string(),
             })],
         }];
-        BedrockProvider::sanitize_empty_content_blocks(&mut messages);
+        BedrockModelProvider::sanitize_empty_content_blocks(&mut messages);
         if let ContentBlock::Text(ref tb) = messages[0].content[0] {
             assert_eq!(tb.text, "Hello");
         } else {
@@ -1968,7 +2915,7 @@ mod tests {
             },
             ChatMessage::user("Continue"),
         ];
-        let (_, converse) = BedrockProvider::convert_messages(&messages);
+        let (_, converse) = BedrockModelProvider::convert_messages(&messages);
         let assistant_msg = &converse[1];
         assert_eq!(assistant_msg.role, "assistant");
         if let ContentBlock::Text(ref tb) = assistant_msg.content[0] {
@@ -1976,5 +2923,198 @@ mod tests {
         } else {
             panic!("Expected Text block for assistant message");
         }
+    }
+
+    // ── credential_process tests ────────────────────────────────
+
+    #[test]
+    fn parse_aws_config_default_profile() {
+        let config = "\
+[default]
+region=us-west-2
+credential_process=ada credentials print --account=123 --provider=conduit --role=MyRole
+";
+        let result = AwsCredentials::parse_aws_config(config, "default");
+        assert!(result.is_some());
+        let (cmd, region) = result.unwrap();
+        assert_eq!(
+            cmd,
+            "ada credentials print --account=123 --provider=conduit --role=MyRole"
+        );
+        assert_eq!(region.as_deref(), Some("us-west-2"));
+    }
+
+    #[test]
+    fn parse_aws_config_named_profile() {
+        let config = "\
+[default]
+region=us-east-1
+
+[profile myprofile]
+region=eu-west-1
+credential_process=aws sso get-role-credentials --profile myprofile
+";
+        let result = AwsCredentials::parse_aws_config(config, "myprofile");
+        assert!(result.is_some());
+        let (cmd, region) = result.unwrap();
+        assert!(cmd.contains("myprofile"));
+        assert_eq!(region.as_deref(), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn parse_aws_config_missing_credential_process() {
+        let config = "\
+[default]
+region=us-west-2
+";
+        let result = AwsCredentials::parse_aws_config(config, "default");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_aws_config_ignores_comments() {
+        let config = "\
+[default]
+# credential_process=should-be-ignored
+; credential_process=also-ignored
+credential_process=real-command
+";
+        let result = AwsCredentials::parse_aws_config(config, "default");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "real-command");
+    }
+
+    #[test]
+    fn parse_aws_config_nonexistent_profile() {
+        let config = "\
+[default]
+credential_process=some-command
+";
+        let result = AwsCredentials::parse_aws_config(config, "nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn from_credential_process_parses_json_output() {
+        let credential_json =
+            r#"{"Version":1,"AccessKeyId":"AKIA","SecretAccessKey":"secret","SessionToken":"tok"}"#;
+        #[cfg(windows)]
+        let credential_command = format!("echo {credential_json}");
+        #[cfg(not(windows))]
+        let credential_command = format!("printf '%s\\n' '{credential_json}'");
+        let config =
+            format!("[default]\ncredential_process={credential_command}\nregion=ap-southeast-1\n");
+
+        let (cmd, region) = AwsCredentials::parse_aws_config(&config, "default").unwrap();
+        assert_eq!(cmd, credential_command);
+        assert_eq!(region.as_deref(), Some("ap-southeast-1"));
+
+        let output = run_credential_process_command(&cmd).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["AccessKeyId"].as_str(), Some("AKIA"));
+        assert_eq!(json["SecretAccessKey"].as_str(), Some("secret"));
+        assert_eq!(json["SessionToken"].as_str(), Some("tok"));
+    }
+
+    #[test]
+    fn env_vars_take_precedence_over_credential_process() {
+        let _env_lock = env_lock();
+        let _ak = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("FROM_ENV"));
+        let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret_from_env"));
+
+        let creds = AwsCredentials::from_env();
+        assert!(creds.is_ok());
+        assert_eq!(creds.unwrap().access_key_id, "FROM_ENV");
+    }
+
+    // ── credential cache tests ──────────────────────────────────
+
+    fn make_creds(expires_at: Option<chrono::DateTime<chrono::Utc>>) -> AwsCredentials {
+        AwsCredentials {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: Some("tok".to_string()),
+            region: "us-west-2".to_string(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn is_expired_returns_false_when_no_expiry() {
+        let creds = make_creds(None);
+        assert!(!creds.is_expired());
+    }
+
+    #[test]
+    fn is_expired_returns_false_when_future() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let creds = make_creds(Some(future));
+        assert!(!creds.is_expired());
+    }
+
+    #[test]
+    fn is_expired_returns_true_when_past() {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let creds = make_creds(Some(past));
+        assert!(creds.is_expired());
+    }
+
+    #[test]
+    fn is_expired_returns_true_within_skew_window() {
+        // 30 seconds from now is within the 60s skew — should be treated as expired.
+        let soon = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let creds = make_creds(Some(soon));
+        assert!(creds.is_expired());
+    }
+
+    #[test]
+    fn cached_credentials_returns_none_when_empty() {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
+            auth: None,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
+        };
+        assert!(model_provider.cached_credentials().is_none());
+    }
+
+    #[test]
+    fn cached_credentials_returns_some_when_valid() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
+            auth: None,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(Some(make_creds(Some(future)))),
+        };
+        let cached = model_provider.cached_credentials();
+        assert!(cached.is_some());
+        assert_eq!(cached.unwrap().access_key_id, "AKIA");
+    }
+
+    #[test]
+    fn cached_credentials_returns_none_when_expired() {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
+            auth: None,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(Some(make_creds(Some(past)))),
+        };
+        assert!(model_provider.cached_credentials().is_none());
+    }
+
+    #[test]
+    fn cache_credentials_stores_and_retrieves() {
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
+            auth: None,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            cred_cache: Mutex::new(None),
+        };
+        assert!(model_provider.cached_credentials().is_none());
+        model_provider.cache_credentials(&make_creds(Some(future)));
+        assert!(model_provider.cached_credentials().is_some());
     }
 }

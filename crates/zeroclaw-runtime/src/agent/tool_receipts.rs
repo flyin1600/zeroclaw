@@ -1,11 +1,4 @@
 //! HMAC-SHA256 tool execution receipts for hallucination detection.
-//!
-//! When enabled, every tool execution produces a cryptographic receipt that
-//! proves the tool actually ran. The LLM cannot forge valid receipts because
-//! it doesn't know the ephemeral session key.
-//!
-//! Based on: Basu, A. (2026). "Tool Receipts, Not Zero-Knowledge Proofs:
-//! Practical Hallucination Detection for AI Agents." arXiv:2603.10060
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -40,14 +33,12 @@ impl ReceiptGenerator {
         Self { key }
     }
 
-    /// Create a generator with a known key (for testing).
     #[cfg(test)]
     pub fn with_key(key: Vec<u8>) -> Self {
         Self { key }
     }
 
     /// Generate a receipt for a tool execution.
-    ///
     /// The receipt encodes: tool_name | args_hash | result_hash | timestamp
     /// into an HMAC-SHA256 digest, formatted as `zc-receipt-{timestamp}-{hash}`.
     pub fn generate(
@@ -74,7 +65,6 @@ impl ReceiptGenerator {
     }
 
     /// Verify a receipt against the expected tool execution parameters.
-    ///
     /// Parses the timestamp from the receipt string, recomputes the HMAC,
     /// and compares. Returns `false` for malformed, tampered, or fabricated receipts.
     pub fn verify(
@@ -118,6 +108,98 @@ impl ReceiptGenerator {
         mac.update(timestamp.to_string().as_bytes());
         mac.finalize().into_bytes().to_vec()
     }
+}
+
+/// Per-turn receipt forwarding scope, used to thread the generator and
+/// the per-turn collector through delegate sub-loops without changing the
+/// `Tool` trait signature. Mirrors the pattern used by
+/// `TOOL_LOOP_COST_TRACKING_CONTEXT`.
+#[derive(Clone)]
+pub struct ReceiptScope {
+    pub generator: ReceiptGenerator,
+    pub collector: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ReceiptScope {
+    /// Single source of truth for turning resolved receipt config into a live
+    /// scope. Returns `None` when receipts are disabled so each turn entrypoint
+    /// gates identically without duplicating the generator/collector glue.
+    pub fn from_config(config: &zeroclaw_config::schema::ToolReceiptsConfig) -> Option<Self> {
+        config
+            .enabled
+            .then(|| Self::with_generator(ReceiptGenerator::new()))
+    }
+
+    /// Wrap an existing generator with a fresh per-turn collector.
+    pub fn with_generator(generator: ReceiptGenerator) -> Self {
+        Self {
+            generator,
+            collector: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The generator reference for the explicit `ToolLoop.receipt_generator`
+    /// parameter. Threaded so the top-level loop signs each tool result.
+    pub fn generator(&self) -> &ReceiptGenerator {
+        &self.generator
+    }
+
+    /// The collector reference for the explicit `ToolLoop.collected_receipts`
+    /// parameter. Receives signed receipts for the duration of the turn.
+    pub fn collector(&self) -> &std::sync::Mutex<Vec<String>> {
+        &self.collector
+    }
+}
+
+/// Scope `TOOL_LOOP_RECEIPT_CONTEXT` around `fut` for the lifetime of one turn
+/// so delegate sub-loops forward receipts into the same per-turn collector.
+/// One seam shared by every entrypoint; a `None` scope is inert.
+pub async fn scope_receipts<F>(scope: Option<ReceiptScope>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_RECEIPT_CONTEXT.scope(scope, fut).await
+}
+
+/// Scope for detached work (background delegation): the parent's generator so
+/// the child's tool results verify against the same key, and a FRESH collector,
+/// because the parent's per-turn collector belongs to a turn that ends before the
+/// detached task does. `None` stays `None` so receipts-off installs are unchanged.
+pub fn detached_scope(parent_generator: Option<ReceiptGenerator>) -> Option<ReceiptScope> {
+    parent_generator.map(ReceiptScope::with_generator)
+}
+
+/// Canonical system-prompt addendum that instructs the model to carry the
+/// `[receipt: ...]` field verbatim. Shared by every turn entrypoint so the
+/// instruction text never drifts between the channel orchestrator and the
+/// ACP/WS/CLI agent paths.
+pub const SYSTEM_PROMPT_ADDENDUM: &str = "\n## Tool Execution Receipts\n\n\
+     Every tool result includes a `[receipt: ...]` field. This is a cryptographic \
+     signature proving the tool actually executed. You must include the receipt \
+     verbatim when referencing tool results. Do not modify, omit, or fabricate receipts. \
+     A missing or invalid receipt indicates a fabricated tool call.\n\n";
+
+/// Render the trailing `Tool receipts:` block from a per-turn collector, or
+/// `None` when the collector is empty. Shared seam so the channel orchestrator
+/// and the agent turn paths emit byte-identical blocks.
+#[must_use]
+pub fn render_receipts_block(receipts: &[String]) -> Option<String> {
+    if receipts.is_empty() {
+        return None;
+    }
+    use std::fmt::Write as _;
+    let mut block = String::from("---\nTool receipts:");
+    for r in receipts {
+        let _ = write!(block, "\n  {r}");
+    }
+    Some(block)
+}
+
+tokio::task_local! {
+    /// Set by the orchestrator when `[agent.tool_receipts] enabled = true`.
+    /// `DelegateTool` reads this to forward receipts into sub-agent tool loops
+    /// so subagent tool calls land in the same per-turn collector.
+    pub static TOOL_LOOP_RECEIPT_CONTEXT: Option<ReceiptScope>;
 }
 
 /// Parse a receipt string into (timestamp, hash).
@@ -250,5 +332,33 @@ mod tests {
         let r2 = receipt_gen2.generate("shell", &args, "out", 100);
         // Different keys → different receipts (probabilistically)
         assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn detached_scope_clones_the_generator_and_starts_a_fresh_collector() {
+        // Receipts-off installs stay off: no parent generator, no scope.
+        assert!(detached_scope(None).is_none());
+
+        let parent = ReceiptScope::with_generator(ReceiptGenerator::with_key(test_key()));
+        let detached = detached_scope(Some(parent.generator.clone()))
+            .expect("a parent generator yields a scope");
+        assert!(
+            !std::sync::Arc::ptr_eq(&detached.collector, &parent.collector),
+            "detached work gets a fresh collector, never the parent's per-turn collector"
+        );
+        assert!(
+            detached.collector.lock().unwrap().is_empty(),
+            "the fresh collector starts empty"
+        );
+        let args = test_args();
+        let receipt = detached.generator.generate_now("shell", &args, "output");
+        assert!(
+            receipt.starts_with("zc-receipt-"),
+            "the detached scope produces receipt-shaped output, got {receipt}"
+        );
+        assert!(
+            parent.generator.verify(&receipt, "shell", &args, "output"),
+            "the detached scope signs with the parent's key, so the parent verifies it"
+        );
     }
 }

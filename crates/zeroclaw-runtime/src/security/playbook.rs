@@ -1,8 +1,4 @@
 //! Incident response playbook definitions and execution engine.
-//!
-//! Playbooks define structured response procedures for security incidents.
-//! Each playbook has named steps, some of which require human approval before
-//! execution. Playbooks are loaded from JSON files in the configured directory.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -96,11 +92,29 @@ pub fn load_playbooks(dir: &Path) -> Vec<Playbook> {
                     Ok(contents) => match serde_json::from_str::<Playbook>(&contents) {
                         Ok(pb) => playbooks.push(pb),
                         Err(e) => {
-                            tracing::warn!("Failed to parse playbook {}: {e}", path.display());
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                &format!("Failed to parse playbook {}", path.display().to_string())
+                            );
                         }
                     },
                     Err(e) => {
-                        tracing::warn!("Failed to read playbook {}: {e}", path.display());
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            &format!("Failed to read playbook {}", path.display().to_string())
+                        );
                     }
                 }
             }
@@ -147,7 +161,6 @@ pub fn can_auto_approve(
 }
 
 /// Evaluate a playbook step. Returns the result with approval gating.
-///
 /// Steps that require approval and cannot be auto-approved will return
 /// `StepStatus::PendingApproval` without executing.
 pub fn evaluate_step(

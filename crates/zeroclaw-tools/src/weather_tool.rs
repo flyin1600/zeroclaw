@@ -1,15 +1,10 @@
 //! Weather tool — fetches current conditions and forecast via wttr.in.
-//!
-//! Uses the free, no-API-key wttr.in service (`?format=j1` JSON endpoint).
-//! Supports any location wttr.in accepts: city names (in any language/script),
-//! airport IATA codes, GPS coordinates, zip/postal codes, and domain-based
-//! geolocation. Units default to metric but can be overridden per-call.
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 const WTTR_BASE_URL: &str = "https://wttr.in";
 const WTTR_TIMEOUT_SECS: u64 = 15;
@@ -140,8 +135,9 @@ impl WeatherTool {
 
     /// Build the wttr.in request URL for the given location.
     fn build_url(location: &str) -> String {
-        // Percent-encode spaces; wttr.in also accepts `+` but %20 is safer.
-        let encoded = location.trim().replace(' ', "+");
+        let encoded = urlencoding::encode(location.trim())
+            .replace("%20", "+")
+            .replace("%2C", ",");
         format!("{WTTR_BASE_URL}/{encoded}?format=j1")
     }
 
@@ -178,8 +174,16 @@ impl WeatherTool {
             );
         }
 
-        let parsed: WttrResponse = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("Failed to parse wttr.in response: {e}"))?;
+        let parsed: WttrResponse = serde_json::from_str(&body).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "weather_tool: failed to parse wttr.in response"
+            );
+            anyhow::Error::msg(format!("Failed to parse wttr.in response: {e}"))
+        })?;
 
         Ok(parsed)
     }
@@ -402,7 +406,7 @@ impl Tool for WeatherTool {
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter 'location'".into()),
                 });
             }
@@ -425,13 +429,13 @@ impl Tool for WeatherTool {
                 let output = Self::format_output(&data, metric, days);
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -535,6 +539,24 @@ mod tests {
     fn build_url_zip_code() {
         let url = WeatherTool::build_url("74015");
         assert_eq!(url, "https://wttr.in/74015?format=j1");
+    }
+
+    #[test]
+    fn build_url_encodes_ampersand_in_location() {
+        let url = WeatherTool::build_url("A&B");
+        assert_eq!(url, "https://wttr.in/A%26B?format=j1");
+    }
+
+    #[test]
+    fn build_url_encodes_query_chars_in_location() {
+        let url = WeatherTool::build_url("Paris?format=3");
+        assert_eq!(url, "https://wttr.in/Paris%3Fformat%3D3?format=j1");
+    }
+
+    #[test]
+    fn build_url_encodes_non_ascii_location() {
+        let url = WeatherTool::build_url("北京");
+        assert_eq!(url, "https://wttr.in/%E5%8C%97%E4%BA%AC?format=j1");
     }
 
     // ── execute: parameter validation ─────────────────────────────────────────

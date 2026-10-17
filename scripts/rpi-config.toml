@@ -126,11 +126,10 @@ max_cpu_time_seconds = 60
 max_subprocesses = 10
 memory_monitoring = true
 
-[security.audit]
-enabled = true
-log_path = "audit.log"
-max_size_mb = 100
-sign_events = false
+# [security.audit] is left at its defaults (enabled), which keeps the
+# certificate issuance and renewal trail. It does not record tool commands:
+# command execution has no audit writer, so this section is not a record of
+# what the agent ran.
 
 [security.otp]
 enabled = true
@@ -146,8 +145,6 @@ gated_actions = [
 ]
 gated_domains = []
 gated_domain_categories = []
-challenge_delivery = "dm"
-challenge_timeout_secs = 120
 challenge_max_attempts = 3
 
 [security.estop]
@@ -301,14 +298,11 @@ system_prompt_prefix = ""
 [reliability]
 provider_retries = 2
 provider_backoff_ms = 500
-fallback_providers = []
 api_keys = []
 channel_initial_backoff_secs = 2
 channel_max_backoff_secs = 60
 scheduler_poll_secs = 15
 scheduler_retries = 2
-
-[reliability.model_fallbacks]
 
 [scheduler]
 enabled = true
@@ -494,17 +488,8 @@ user_agent = "ZeroClaw/1.0"
 [web_search]
 enabled = false
 provider = "duckduckgo"
-fallback_providers = []
-retries_per_provider = 0
-retry_backoff_ms = 250
-domain_filter = []
-language_filter = []
-exa_search_type = "auto"
-exa_include_text = false
-jina_site_filters = []
 max_results = 5
 timeout_secs = 15
-user_agent = "ZeroClaw/1.0"
 
 [proxy]
 enabled = false

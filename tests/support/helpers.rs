@@ -5,12 +5,11 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw::agent::agent::Agent;
 use zeroclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
-use zeroclaw::agent::memory_loader::MemoryLoader;
 use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::Memory;
 use zeroclaw::observability::{NoopObserver, Observer};
-use zeroclaw::providers::{ChatResponse, Provider, ToolCall};
+use zeroclaw::providers::{ChatResponse, ModelProvider, ToolCall};
 use zeroclaw::tools::Tool;
 
 /// Create an in-memory "none" backend for tests.
@@ -48,10 +47,10 @@ pub fn tool_response(calls: Vec<ToolCall>) -> ChatResponse {
 }
 
 /// Build an agent with `NativeToolDispatcher`.
-pub fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
+pub fn build_agent(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
-        .provider(provider)
-        .tools(tools)
+        .model_provider(model_provider)
+        .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -61,10 +60,10 @@ pub fn build_agent(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Ag
 }
 
 /// Build an agent with `XmlToolDispatcher`.
-pub fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -> Agent {
+pub fn build_agent_xml(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dyn Tool>>) -> Agent {
     Agent::builder()
-        .provider(provider)
-        .tools(tools)
+        .model_provider(model_provider)
+        .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(XmlToolDispatcher))
@@ -73,30 +72,26 @@ pub fn build_agent_xml(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>>) -
         .unwrap()
 }
 
-/// Build an agent with optional custom `MemoryLoader`.
+/// Build an agent with an optional custom `Memory` backend.
 pub fn build_recording_agent(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
-    memory_loader: Option<Box<dyn MemoryLoader>>,
+    memory: Option<Arc<dyn zeroclaw::memory::Memory>>,
 ) -> Agent {
-    let mut builder = Agent::builder()
-        .provider(provider)
-        .tools(tools)
-        .memory(make_memory())
+    Agent::builder()
+        .model_provider(model_provider)
+        .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))
+        .memory(memory.unwrap_or_else(make_memory))
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
-        .workspace_dir(std::env::temp_dir());
-
-    if let Some(loader) = memory_loader {
-        builder = builder.memory_loader(loader);
-    }
-
-    builder.build().unwrap()
+        .workspace_dir(std::env::temp_dir())
+        .build()
+        .unwrap()
 }
 
 /// Build an agent with real `SqliteMemory` in a temporary directory.
 pub fn build_agent_with_sqlite_memory(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     temp_dir: &std::path::Path,
 ) -> Agent {
@@ -106,8 +101,8 @@ pub fn build_agent_with_sqlite_memory(
     };
     let mem = Arc::from(memory::create_memory(&cfg, temp_dir, None).unwrap());
     Agent::builder()
-        .provider(provider)
-        .tools(tools)
+        .model_provider(model_provider)
+        .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))
         .memory(mem)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -116,27 +111,121 @@ pub fn build_agent_with_sqlite_memory(
         .unwrap()
 }
 
-/// Mock memory loader that returns a static context string.
-pub struct StaticMemoryLoader {
-    context: String,
+/// Mock memory whose `recall` returns the given (key, content) pairs as
+/// Core entries. With the unified engine injection, wiring this as the
+/// agent's memory reproduces the old "static context string" strategy shim.
+pub struct StaticRecallMemory {
+    entries: Vec<(String, String)>,
 }
 
-impl StaticMemoryLoader {
-    pub fn new(context: &str) -> Self {
+impl StaticRecallMemory {
+    pub fn new(entries: &[(&str, &str)]) -> Self {
         Self {
-            context: context.to_string(),
+            entries: entries
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
         }
     }
 }
 
 #[async_trait]
-impl MemoryLoader for StaticMemoryLoader {
-    async fn load_context(
+impl zeroclaw::memory::Memory for StaticRecallMemory {
+    fn name(&self) -> &str {
+        "static-recall"
+    }
+    async fn store(
         &self,
-        _memory: &dyn Memory,
-        _user_message: &str,
+        _key: &str,
+        _content: &str,
+        _category: zeroclaw::memory::MemoryCategory,
         _session_id: Option<&str>,
-    ) -> Result<String> {
-        Ok(self.context.clone())
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn recall(
+        &self,
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw::memory::MemoryEntry>> {
+        Ok(self
+            .entries
+            .iter()
+            .map(|(k, v)| zeroclaw::memory::MemoryEntry {
+                principal_id: None,
+                id: k.clone(),
+                key: k.clone(),
+                content: v.clone(),
+                category: zeroclaw::memory::MemoryCategory::Core,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                session_id: None,
+                score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
+                agent_alias: None,
+                agent_id: None,
+            })
+            .collect())
+    }
+    async fn get(&self, _key: &str) -> anyhow::Result<Option<zeroclaw::memory::MemoryEntry>> {
+        Ok(None)
+    }
+    async fn list(
+        &self,
+        _category: Option<&zeroclaw::memory::MemoryCategory>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw::memory::MemoryEntry>> {
+        Ok(vec![])
+    }
+    async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+    async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+    async fn count(&self) -> anyhow::Result<usize> {
+        Ok(self.entries.len())
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+    async fn store_with_agent(
+        &self,
+        _key: &str,
+        _content: &str,
+        _category: zeroclaw::memory::MemoryCategory,
+        _session_id: Option<&str>,
+        _namespace: Option<&str>,
+        _importance: Option<f64>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn recall_for_agents(
+        &self,
+        _allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<zeroclaw::memory::MemoryEntry>> {
+        self.recall(query, limit, session_id, since, until).await
+    }
+}
+
+impl zeroclaw_api::attribution::Attributable for StaticRecallMemory {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::InMemory)
+    }
+    fn alias(&self) -> &str {
+        "StaticRecallMemory"
     }
 }

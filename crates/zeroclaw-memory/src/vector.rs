@@ -46,11 +46,10 @@ pub fn vec_to_bytes(v: &[f32]) -> Vec<u8> {
 /// Deserialize bytes to f32 vector (little-endian)
 pub fn bytes_to_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| {
-            let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-            f32::from_le_bytes(arr)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -65,8 +64,10 @@ pub struct ScoredResult {
 
 /// Hybrid merge: combine vector and keyword results with weighted fusion.
 ///
-/// Normalizes each score set to [0, 1], then computes:
-///   `final_score` = `vector_weight` * `vector_score` + `keyword_weight` * `keyword_score`
+/// Normalizes each score set to [0, 1], then fuses each candidate using only
+/// the modalities it actually has. The contributing weights are normalized so
+/// a keyword-only candidate is not penalized merely because another candidate
+/// has a vector score (and vice versa).
 ///
 /// Deduplicates by id, keeping the best score from each source.
 pub fn hybrid_merge(
@@ -115,9 +116,21 @@ pub fn hybrid_merge(
     let mut results: Vec<ScoredResult> = map
         .into_values()
         .map(|mut r| {
-            let vs = r.vector_score.unwrap_or(0.0);
-            let ks = r.keyword_score.unwrap_or(0.0);
-            r.final_score = vector_weight * vs + keyword_weight * ks;
+            let mut weighted_score = 0.0;
+            let mut present_weight = 0.0;
+            if let Some(score) = r.vector_score {
+                weighted_score += vector_weight * score;
+                present_weight += vector_weight;
+            }
+            if let Some(score) = r.keyword_score {
+                weighted_score += keyword_weight * score;
+                present_weight += keyword_weight;
+            }
+            r.final_score = if present_weight > f32::EPSILON {
+                weighted_score / present_weight
+            } else {
+                0.0
+            };
             r
         })
         .collect();

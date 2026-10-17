@@ -1,11 +1,3 @@
-// Composio Tool Provider — optional managed tool surface with 1000+ OAuth integrations.
-//
-// When enabled, ZeroClaw can execute actions on Gmail, Notion, GitHub, Slack, etc.
-// through Composio's API without storing raw OAuth tokens locally.
-//
-// This is opt-in. Users who prefer sovereign/local-only mode skip this entirely.
-// The Composio API key is stored in the encrypted secret store.
-
 use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -15,13 +7,11 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
 const COMPOSIO_API_BASE_V3: &str = "https://backend.composio.dev/api/v3";
-#[allow(dead_code)] // Used by WIP get_connection_url_v2
-const COMPOSIO_API_BASE_V2: &str = "https://backend.composio.dev/api";
 const COMPOSIO_TOOL_VERSION_LATEST: &str = "latest";
 
 fn ensure_https(url: &str) -> anyhow::Result<()> {
@@ -62,7 +52,6 @@ impl ComposioTool {
     }
 
     /// List available Composio apps/actions for the authenticated user.
-    ///
     /// Uses the v3 endpoint.
     pub async fn list_actions(
         &self,
@@ -179,11 +168,6 @@ impl ComposioTool {
         let accounts = self
             .list_connected_accounts(Some(&app), Some(&entity))
             .await?;
-        // The API returns accounts ordered by updated_at DESC, so the first
-        // usable account is the most recently active one.  We always pick it
-        // rather than giving up when multiple accounts exist — giving up was
-        // the root cause of the "cannot find connected account" loop reported
-        // in issue #959.
         let Some(first) = accounts.into_iter().find(|acct| acct.is_usable()) else {
             return Ok(None);
         };
@@ -193,7 +177,6 @@ impl ComposioTool {
     }
 
     /// Execute a Composio action/tool with given parameters.
-    ///
     /// Uses the v3 endpoint.
     pub async fn execute_action(
         &self,
@@ -368,11 +351,6 @@ impl ComposioTool {
             "version": COMPOSIO_TOOL_VERSION_LATEST,
         });
 
-        // The v3 execute endpoint accepts either structured `arguments` or a
-        // natural-language `text` description (mutually exclusive).  Prefer
-        // `text` when the caller provides it so Composio's NLP resolves the
-        // correct parameters — this is the primary fix for the "keeps guessing
-        // and failing" issue reported by the community.
         if let Some(nl_text) = text {
             body["text"] = json!(nl_text);
         } else {
@@ -428,7 +406,6 @@ impl ComposioTool {
     }
 
     /// Get the OAuth connection URL for a specific app/toolkit or auth config.
-    ///
     /// Uses the v3 endpoint.
     pub async fn get_connection_url(
         &self,
@@ -450,7 +427,14 @@ impl ComposioTool {
             Some(id) => id.to_string(),
             None => {
                 let app = app_name.ok_or_else(|| {
-                    anyhow::anyhow!("Missing 'app' or 'auth_config_id' for v3 connect")
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "app_or_auth_config_id"})),
+                        "composio: v3 connect missing app or auth_config_id"
+                    );
+                    anyhow::Error::msg("Missing 'app' or 'auth_config_id' for v3 connect")
                 })?;
                 self.resolve_auth_config_id(app).await?
             }
@@ -479,46 +463,15 @@ impl ComposioTool {
             .json()
             .await
             .context("Failed to decode Composio v3 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v3 response"))?;
-        Ok(ComposioConnectionLink {
-            redirect_url,
-            connected_account_id: extract_connected_account_id(&result),
-        })
-    }
-
-    #[allow(dead_code)] // WIP: V2 connection API
-    async fn get_connection_url_v2(
-        &self,
-        app_name: &str,
-        entity_id: &str,
-    ) -> anyhow::Result<ComposioConnectionLink> {
-        let url = format!("{COMPOSIO_API_BASE_V2}/connectedAccounts");
-
-        let body = json!({
-            "integrationId": app_name,
-            "entityId": entity_id,
-        });
-
-        let resp = self
-            .client()
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let err = response_error(resp).await;
-            anyhow::bail!("Composio v2 connect failed: {err}");
-        }
-
-        let result: serde_json::Value = resp
-            .json()
-            .await
-            .context("Failed to decode Composio v2 connect response")?;
-        let redirect_url = extract_redirect_url(&result)
-            .ok_or_else(|| anyhow::anyhow!("No redirect URL in Composio v2 response"))?;
+        let redirect_url = extract_redirect_url(&result).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "composio: v3 response missing redirect URL"
+            );
+            anyhow::Error::msg("No redirect URL in Composio v3 response")
+        })?;
         Ok(ComposioConnectionLink {
             redirect_url,
             connected_account_id: extract_connected_account_id(&result),
@@ -526,7 +479,6 @@ impl ComposioTool {
     }
 
     /// Fetch full metadata for a single tool by slug, including input/output parameter schemas.
-    ///
     /// Calls `GET /api/v3/tools/{tool_slug}` which returns the detailed schema
     /// the LLM needs to construct correct `params` for `execute`.
     async fn get_tool_schema(&self, tool_slug: &str) -> anyhow::Result<serde_json::Value> {
@@ -660,10 +612,16 @@ impl Tool for ComposioTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+        let action = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "action"})),
+                "composio: missing action parameter"
+            );
+            anyhow::Error::msg("Missing 'action' parameter")
+        })?;
 
         let entity_id = args
             .get("entity_id")
@@ -702,13 +660,13 @@ impl Tool for ComposioTool {
                         );
                         Ok(ToolResult {
                             success: true,
-                            output,
+                            output: output.into(),
                             error: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to list actions: {e}")),
                     }),
                 }
@@ -727,7 +685,7 @@ impl Tool for ComposioTool {
                                 success: true,
                                 output: format!(
                                     "No connected accounts found{app_hint} for entity '{entity_id}'. Run action='connect' first."
-                                ),
+                                ).into(),
                                 error: None,
                             });
                         }
@@ -752,13 +710,13 @@ impl Tool for ComposioTool {
                         );
                         Ok(ToolResult {
                             success: true,
-                            output,
+                            output: output.into(),
                             error: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to list connected accounts: {e}")),
                     }),
                 }
@@ -771,7 +729,7 @@ impl Tool for ComposioTool {
                 {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error),
                     });
                 }
@@ -781,7 +739,19 @@ impl Tool for ComposioTool {
                     .or_else(|| args.get("action_name"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
-                        anyhow::anyhow!("Missing 'action_name' (or 'tool_slug') for execute")
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                ::serde_json::json!({"missing": "action_name_or_tool_slug"})
+                            ),
+                            "composio: execute missing action_name/tool_slug"
+                        );
+                        anyhow::Error::msg("Missing 'action_name' (or 'tool_slug') for execute")
                     })?;
 
                 let app = args.get("app").and_then(|v| v.as_str());
@@ -798,7 +768,7 @@ impl Tool for ComposioTool {
                             .unwrap_or_else(|_| format!("{result:?}"));
                         Ok(ToolResult {
                             success: true,
-                            output,
+                            output: output.into(),
                             error: None,
                         })
                     }
@@ -813,7 +783,7 @@ impl Tool for ComposioTool {
                             .unwrap_or_default();
                         Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(format!("Action execution failed: {e}{schema_hint}")),
                         })
                     }
@@ -827,7 +797,7 @@ impl Tool for ComposioTool {
                 {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(error),
                     });
                 }
@@ -861,13 +831,13 @@ impl Tool for ComposioTool {
                         }
                         Ok(ToolResult {
                             success: true,
-                            output,
+                            output: output.into(),
                             error: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to get connection URL: {e}")),
                     }),
                 }
@@ -875,7 +845,7 @@ impl Tool for ComposioTool {
 
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{action}'. Use 'list', 'list_accounts', 'execute', or 'connect'."
                 )),
@@ -1125,7 +1095,6 @@ fn extract_api_error_message(body: &str) -> Option<String> {
 }
 
 /// Build a compact hint string showing parameter key names from an `input_parameters` JSON Schema.
-///
 /// Used in the `list` output so the LLM can see what keys each action expects
 /// without dumping the full schema.
 fn format_input_params_hint(schema: Option<&serde_json::Value>) -> String {
@@ -1158,16 +1127,7 @@ fn format_input_params_hint(schema: Option<&serde_json::Value>) -> String {
     format!(" [params: {}]", keys.join(", "))
 }
 
-fn floor_char_boundary_compat(text: &str, index: usize) -> usize {
-    let mut end = index.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
-
 /// Build a human-readable schema hint from a full tool schema response.
-///
 /// Used in execute error messages so the LLM can see the expected parameter
 /// names and types to self-correct on the next attempt.
 fn format_schema_hint(schema: &serde_json::Value) -> Option<String> {
@@ -1201,7 +1161,7 @@ fn format_schema_hint(schema: &serde_json::Value) -> Option<String> {
             // Truncate long descriptions to keep the hint concise.
             // Use char boundary to avoid panic on multi-byte UTF-8.
             let short = if desc.len() > 80 {
-                let end = floor_char_boundary_compat(desc, 77);
+                let end = desc.floor_char_boundary(77);
                 format!("{}...", &desc[..end])
             } else {
                 desc.to_string()
@@ -1559,14 +1519,6 @@ mod tests {
     }
 
     #[test]
-    fn floor_char_boundary_compat_handles_multibyte_offsets() {
-        let text = "abc😀def";
-        // Byte offset 5 is inside the 4-byte emoji, so boundary should floor to 3.
-        assert_eq!(floor_char_boundary_compat(text, 5), 3);
-        assert_eq!(floor_char_boundary_compat(text, usize::MAX), text.len());
-    }
-
-    #[test]
     fn normalize_action_cache_key_merges_underscore_and_hyphen_variants() {
         assert_eq!(
             normalize_action_cache_key(" GMAIL_FETCH_EMAILS ").as_deref(),
@@ -1821,7 +1773,7 @@ mod tests {
 
     #[test]
     fn resolve_picks_first_usable_when_multiple_accounts_exist() {
-        // Regression test for issue #959: previously returned None when
+        // Regression test for previously returned None when
         // multiple accounts existed, causing the LLM to loop on the OAuth URL.
         let accounts = vec![
             ComposioConnectedAccount {

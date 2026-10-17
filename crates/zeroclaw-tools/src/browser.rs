@@ -1,12 +1,9 @@
 //! Browser automation tool with pluggable backends.
-//!
-//! By default this uses Vercel's `agent-browser` CLI for automation.
-//! Optionally, a Rust-native backend can be enabled at build time via
-//! `--features browser-native` and selected through config.
-//! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
+use crate::helpers::domain_guard;
 use anyhow::Context;
 use async_trait::async_trait;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::net::ToSocketAddrs;
@@ -14,8 +11,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::debug;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Computer-use sidecar settings.
@@ -61,13 +58,19 @@ impl Default for ComputerUseConfig {
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    allowed_private_hosts: Vec<String>,
     session_name: Option<String>,
     backend: String,
-    #[allow(dead_code)] // read only with browser-native feature
+    headed: Option<bool>,
+    /// Test-only override for the agent-browser binary path; `None` in every
+    /// constructor and set only by `set_agent_browser_bin_for_tests`, so
+    /// production always launches the installed `agent-browser`.
+    agent_browser_bin: Option<std::path::PathBuf>,
+    #[cfg(feature = "browser-native")]
     native_headless: bool,
-    #[allow(dead_code)]
+    #[cfg(feature = "browser-native")]
     native_webdriver_url: String,
-    #[allow(dead_code)]
+    #[cfg(feature = "browser-native")]
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
     #[cfg(feature = "browser-native")]
@@ -204,16 +207,18 @@ impl BrowserTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
         session_name: Option<String>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         Self::new_with_backend(
             security,
             allowed_domains,
             session_name,
             "agent_browser".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -223,23 +228,39 @@ impl BrowserTool {
         allowed_domains: Vec<String>,
         session_name: Option<String>,
         backend: String,
+        headed: Option<bool>,
         native_headless: bool,
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
-    ) -> Self {
-        Self {
+        allowed_private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        #[cfg(not(feature = "browser-native"))]
+        let _ = (native_headless, &native_webdriver_url, &native_chrome_path);
+        Ok(Self {
             security,
-            allowed_domains: normalize_domains(allowed_domains),
+            allowed_domains: domain_guard::normalize_allowed_domains(
+                allowed_domains,
+                "browser.allowed_domains",
+            )?,
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "browser.allowed_private_hosts",
+            )?,
             session_name,
             backend,
+            headed,
+            agent_browser_bin: None,
+            #[cfg(feature = "browser-native")]
             native_headless,
+            #[cfg(feature = "browser-native")]
             native_webdriver_url,
+            #[cfg(feature = "browser-native")]
             native_chrome_path,
             computer_use,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
-        }
+        })
     }
 
     /// Check if agent-browser CLI is available
@@ -298,9 +319,16 @@ impl BrowserTool {
         }
 
         let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"endpoint": endpoint})),
+                "browser: invalid computer_use endpoint URL"
+            );
+            anyhow::Error::msg(format!(
                 "Invalid browser.computer_use.endpoint: '{endpoint}'. Expected http(s) URL"
-            )
+            ))
         })?;
 
         let scheme = parsed.scheme();
@@ -308,11 +336,17 @@ impl BrowserTool {
             anyhow::bail!("browser.computer_use.endpoint must use http:// or https://");
         }
 
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("browser.computer_use.endpoint must include host"))?;
+        let host = parsed.host_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "browser: browser.computer_use.endpoint must include host"
+            );
+            anyhow::Error::msg("browser.computer_use.endpoint must include host")
+        })?;
 
-        let host_is_private = is_private_host(host);
+        let host_is_private = domain_guard::is_private_or_local_host(host);
         if !self.computer_use.allow_remote_endpoint && !host_is_private {
             anyhow::bail!(
                 "browser.computer_use.endpoint host '{host}' is public. Set browser.computer_use.allow_remote_endpoint=true to allow it"
@@ -429,20 +463,44 @@ impl BrowserTool {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("URL userinfo is not allowed");
+        }
+
+        if self.allowed_domains.is_empty() && self.allowed_private_hosts.is_empty() {
             anyhow::bail!(
                 "Browser tool enabled but no allowed_domains configured. \
                 Add [browser].allowed_domains in config.toml"
             );
         }
 
-        let host = extract_host(url)?;
+        let host_str = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
 
-        if is_private_host(&host) {
+        let is_ipv6 = host_str.parse::<std::net::Ipv6Addr>().is_ok();
+        let host = if is_ipv6 {
+            format!("[{host_str}]")
+        } else {
+            host_str.to_lowercase()
+        };
+
+        let private_host = domain_guard::is_private_or_local_host(&host);
+        let private_host_allowed = private_host
+            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
+
+        if private_host && !private_host_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
+        if private_host_allowed {
+            return Ok(());
+        }
+
+        if !domain_guard::host_matches_allowlist(&host, &self.allowed_domains) {
             anyhow::bail!("Host '{host}' not in browser.allowed_domains");
         }
 
@@ -451,28 +509,16 @@ impl BrowserTool {
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
-        let agent_browser_bin = if cfg!(target_os = "windows") {
-            "agent-browser.cmd"
-        } else {
-            "agent-browser"
-        };
-        let mut cmd = Command::new(agent_browser_bin);
-
-        // When running as a service (systemd/OpenRC), the process may lack
-        // HOME which browsers need for profile directories.
-        if is_service_environment() {
-            ensure_browser_env(&mut cmd);
-        }
-
-        // Add session if configured
-        if let Some(ref session) = self.session_name {
-            cmd.arg("--session").arg(session);
-        }
+        let mut cmd = self.agent_browser_command();
 
         // Add --json for machine-readable output
         cmd.args(args).arg("--json");
 
-        debug!("Running: agent-browser {} --json", args.join(" "));
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Running: agent-browser {} --json", args.join(" "))
+        );
 
         let output = cmd
             .stdout(Stdio::piped())
@@ -484,7 +530,11 @@ impl BrowserTool {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !stderr.is_empty() {
-            debug!("agent-browser stderr: {}", stderr);
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("agent-browser stderr: {}", stderr)
+            );
         }
 
         // Parse JSON response
@@ -506,6 +556,52 @@ impl BrowserTool {
                 error: Some(stderr.trim().to_string()),
             })
         }
+    }
+
+    fn agent_browser_command(&self) -> Command {
+        let mut cmd = match &self.agent_browser_bin {
+            Some(bin) => Command::new(bin),
+            None => {
+                let agent_browser_bin = if cfg!(target_os = "windows") {
+                    "agent-browser.cmd"
+                } else {
+                    "agent-browser"
+                };
+                Command::new(agent_browser_bin)
+            }
+        };
+
+        match self.headed {
+            Some(true) => {
+                cmd.env("AGENT_BROWSER_HEADED", "1");
+            }
+            Some(false) => {
+                cmd.env_remove("AGENT_BROWSER_HEADED");
+            }
+            None => {}
+        }
+
+        // When running as a service (systemd/OpenRC), the process may lack
+        // HOME which browsers need for profile directories.
+        if is_service_environment() {
+            ensure_browser_env(&mut cmd);
+        }
+
+        // Add session if configured
+        if let Some(ref session) = self.session_name {
+            cmd.arg("--session").arg(session);
+        }
+
+        cmd
+    }
+
+    /// Point `agent_browser_command` at a fake binary for tests. The only
+    /// setter for [`Self::agent_browser_bin`]: production keeps `None` and
+    /// launches the installed `agent-browser`. Unix-only because every
+    /// caller drives a `#!/bin/sh` fake binary.
+    #[cfg(all(test, unix))]
+    fn set_agent_browser_bin_for_tests(&mut self, bin: std::path::PathBuf) {
+        self.agent_browser_bin = Some(bin);
     }
 
     /// Execute a browser action via agent-browser CLI
@@ -688,7 +784,9 @@ impl BrowserTool {
 
             Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&output).unwrap_or_default(),
+                output: serde_json::to_string_pretty(&output)
+                    .unwrap_or_default()
+                    .into(),
                 error: None,
             })
         }
@@ -722,10 +820,177 @@ impl BrowserTool {
         params: &serde_json::Map<String, Value>,
         key: &str,
     ) -> anyhow::Result<i64> {
-        params
-            .get(key)
-            .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid '{key}' parameter"))
+        params.get(key).and_then(Value::as_i64).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "browser: Missing or invalid '{key}' parameter"
+            );
+            anyhow::Error::msg("Missing or invalid '{key}' parameter")
+        })
+    }
+
+    /// Validates screenshot destination path against workspace policy.
+    /// Runs before any backend (agent-browser, rust-native, ComputerUse) writes a screenshot file.
+    ///
+    /// Applies the same guards as `file_write` / `file_edit`:
+    /// 1. String-level `is_path_allowed` — rejects null bytes, `..` traversal, URL-encoded traversal
+    /// 2. `resolve_tool_path` + `canonicalize` parent — resolves relative/tilde paths
+    /// 3. `is_resolved_path_allowed` — confirms canonical parent is inside workspace allowlist
+    /// 4. `is_runtime_config_path` — rejects `config.toml`, `config.toml.bak`, `.config.toml.tmp-*`
+    /// 5. `symlink_metadata` — rejects existing symlink targets
+    ///
+    /// Replaces the raw path with the canonical target so backends write the checked string.
+    async fn validate_screenshot_path(&self, action: &mut BrowserAction) -> anyhow::Result<()> {
+        let BrowserAction::Screenshot { path, .. } = action else {
+            return Ok(());
+        };
+        let Some(path_str) = path.as_ref() else {
+            return Ok(());
+        };
+
+        // One canonical target validator shared by every backend. It returns
+        // the checked target as a lossless UTF-8 string — never a lossy
+        // conversion — so the backends write exactly the path that was allowed.
+        *path = Some(self.validate_screenshot_target(path_str).await?);
+        Ok(())
+    }
+
+    /// Allocate a workspace target for an agent-browser screenshot that
+    /// arrived with no `path`, mirroring the `screenshot` tool's
+    /// `screenshot_{timestamp}.png` default with a distinct
+    /// `browser_screenshot_` prefix and millisecond timestamps so two calls
+    /// inside the same second do not collide. The name is resolved against
+    /// the workspace by the same `validate_screenshot_target` flow that
+    /// covers an explicit relative path (there is no second resolver), so
+    /// the backend writes inside the workspace allowlist and the produced
+    /// image can be declared. An allocated name that already exists is a
+    /// plain error: `validate_screenshot_target` permits an existing
+    /// regular file, so the never-overwrite check lives here, at the
+    /// allocation site.
+    async fn allocate_agent_browser_screenshot_target(&self) -> anyhow::Result<String> {
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f");
+        let filename = format!("browser_screenshot_{timestamp}.png");
+        let full = self.security.resolve_tool_path(&filename);
+        if full.exists() {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-allocated-target-exists",
+                &[("filename", &filename)],
+            );
+            anyhow::bail!("{msg}");
+        }
+        Ok(filename)
+    }
+
+    /// The single canonical screenshot-destination validator. Applies the same
+    /// guards as `file_write` / `file_edit`:
+    /// 1. String-level `is_path_allowed` — rejects null bytes, `..` traversal,
+    ///    URL-encoded traversal.
+    /// 2. `resolve_tool_path` + `canonicalize` parent — resolves relative/tilde
+    ///    paths.
+    /// 3. `is_resolved_path_allowed` — canonical parent inside the workspace
+    ///    allowlist.
+    /// 4. `is_runtime_config_path` — rejects `config.toml`, `config.toml.bak`,
+    ///    `.config.toml.tmp-*`.
+    /// 5. `symlink_metadata` — rejects existing symlink targets.
+    /// 6. Rejects canonical destinations that are not valid UTF-8.
+    ///
+    /// Shared by the local backends (`validate_screenshot_path`) and the
+    /// ComputerUse flow (`validate_screenshot_path_for_computer_use`) so one
+    /// policy cannot drift between them.
+    ///
+    /// Returns the validated target as a lossless UTF-8 string. Every backend
+    /// consumes the destination as a string (command argument, JSON value, or
+    /// `tokio::fs::write(&str)`), so a canonical destination that is not valid
+    /// UTF-8 is rejected here: a lossy conversion could change the pathname and
+    /// name a location that never passed the allowlist.
+    async fn validate_screenshot_target(&self, raw_path: &str) -> anyhow::Result<String> {
+        // String-level reject (null bytes, .. traversal, URL-encoded traversal)
+        if !self.security.is_path_allowed(raw_path) {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-path-not-allowed",
+                &[("path", raw_path)],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Resolve relative / tilde paths against the workspace directory.
+        let full = self.security.resolve_tool_path(raw_path);
+
+        // The file does not exist yet, so canonicalize the *parent* directory
+        // to verify it is inside the workspace allowlist.
+        let parent = full.parent().unwrap_or(&full);
+        let canonical = tokio::fs::canonicalize(parent).await.with_context(|| {
+            crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-parent-not-exist",
+                &[
+                    ("path", raw_path),
+                    ("parent", &parent.display().to_string()),
+                ],
+            )
+        })?;
+
+        if !self.security.is_resolved_path_allowed(&canonical) {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-path-outside-workspace",
+                &[
+                    ("path", raw_path),
+                    ("canonical", &canonical.display().to_string()),
+                ],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // Build the final *target* path (parent + file name) so we can apply
+        // the same target-level guards the file_write / file_edit tools use.
+        let Some(file_name) = full.file_name() else {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-missing-filename",
+                &[("path", raw_path)],
+            );
+            anyhow::bail!("{msg}");
+        };
+        let resolved_target = canonical.join(file_name);
+
+        if self.security.is_runtime_config_path(&resolved_target) {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-runtime-config-target",
+                &[
+                    ("path", raw_path),
+                    ("target", &resolved_target.display().to_string()),
+                ],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // If the target already exists and is a symlink, refuse to follow it.
+        if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await
+            && meta.file_type().is_symlink()
+        {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-symlink-target",
+                &[("target", &resolved_target.display().to_string())],
+            );
+            anyhow::bail!("{msg}");
+        }
+
+        // The allowlist above validated the byte-preserving PathBuf. Every
+        // backend receives the destination as a UTF-8 string, and a lossy
+        // conversion (`to_string_lossy`) would silently replace non-UTF-8
+        // bytes with U+FFFD — naming a pathname that never passed the policy.
+        // Fail closed here, while we still hold the checked target: on Unix a
+        // valid UTF-8 input can canonicalize (through a symlink) to a parent
+        // containing non-UTF-8 bytes.
+        let Some(resolved_str) = resolved_target.to_str() else {
+            let msg = crate::i18n::get_required_tool_string_with_args(
+                "tool-browser-screenshot-error-path-not-utf8",
+                &[("path", raw_path)],
+            );
+            anyhow::bail!("{msg}");
+        };
+
+        Ok(resolved_str.to_string())
     }
 
     fn validate_computer_use_action(
@@ -735,10 +1000,15 @@ impl BrowserTool {
     ) -> anyhow::Result<()> {
         match action {
             "open" => {
-                let url = params
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("Missing 'url' for open action"))?;
+                let url = params.get("url").and_then(Value::as_str).ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'url' for open action"
+                    );
+                    anyhow::Error::msg("Missing 'url' for open action")
+                })?;
                 self.validate_url(url)?;
             }
             "mouse_move" | "mouse_click" => {
@@ -762,6 +1032,57 @@ impl BrowserTool {
         Ok(())
     }
 
+    /// Validates the screenshot path for the ComputerUse backend before the
+    /// sidecar round-trip. Applies the same canonical workspace policy /
+    /// runtime-config / symlink guards as the local backends (via
+    /// [`Self::validate_screenshot_target`]) and classifies the raw destination
+    /// into absent / valid string / invalid input.
+    async fn validate_screenshot_path_for_computer_use(
+        &self,
+        action_str: &str,
+        args: Value,
+    ) -> anyhow::Result<Value> {
+        if action_str != "screenshot" {
+            // Not a screenshot action, pass through unchanged
+            return Ok(args);
+        }
+
+        let path = args.get("path").cloned();
+
+        // Classify path into Absent/String/NonString
+        match &path {
+            None | Some(Value::Null) => {
+                // Absent: no path or null → inline PNG return
+                Ok(args)
+            }
+            Some(Value::String(s)) if s.is_empty() => {
+                // Absent: empty string → inline PNG return
+                Ok(args)
+            }
+            Some(Value::String(path_str)) => {
+                // String: validate against workspace through the one canonical
+                // validator shared with the local backends.
+                let mut args = args;
+                let resolved_target = self.validate_screenshot_target(path_str).await?;
+
+                // Store the validated path for local write after sidecar returns PNG.
+                // Do NOT forward the path to the sidecar - it returns PNG bytes.
+                if let Some(obj) = args.as_object_mut() {
+                    obj.insert("path".to_string(), Value::String(resolved_target));
+                }
+                Ok(args)
+            }
+            Some(_) => {
+                // NonString: integer, array, object → reject
+                let msg = crate::i18n::get_required_tool_string_with_args(
+                    "tool-browser-screenshot-error-computeruse-non-string-path",
+                    &[("path", &format!("{path:?}"))],
+                );
+                anyhow::bail!("{msg}");
+            }
+        }
+    }
+
     async fn execute_computer_use_action(
         &self,
         action: &str,
@@ -769,10 +1090,47 @@ impl BrowserTool {
     ) -> anyhow::Result<ToolResult> {
         let endpoint = self.computer_use_endpoint_url()?;
 
-        let mut params = args
-            .as_object()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("browser args must be a JSON object"))?;
+        // Validate screenshot path but do NOT forward it to the sidecar.
+        // The sidecar returns PNG bytes, and we perform the validated local write.
+        let validated_path = if action == "screenshot" {
+            match self
+                .validate_screenshot_path_for_computer_use(action, args.clone())
+                .await
+            {
+                Ok(validated_args) => {
+                    // Extract the validated path from the returned args
+                    validated_args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        // Build params without the path - sidecar should return PNG bytes
+        let mut params = args.as_object().cloned().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "browser: screenshot args must be a JSON object"
+            );
+            anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                "tool-browser-screenshot-error-args-not-object",
+            ))
+        })?;
+
+        // Remove path from params - we'll handle the write locally after validation
+        params.remove("path");
         params.remove("action");
 
         self.validate_computer_use_action(action, &params)?;
@@ -819,8 +1177,82 @@ impl BrowserTool {
             .await
             .context("Failed to read computer-use sidecar response body")?;
 
+        // A path-bearing screenshot is the ONLY flow that transfers bytes from
+        // the sidecar to the local filesystem. For that flow the tool must fail
+        // closed: success requires a well-formed ComputerUseResponse with
+        // success != false, a non-empty PNG payload, and a completed local
+        // write. A non-JSON or structurally invalid 2xx body must NOT fall
+        // through to a generic success (which would report success without
+        // creating the requested file).
+        let is_path_bearing_screenshot =
+            action == "screenshot" && validated_path.as_deref().is_some_and(|p| !p.is_empty());
+
         if let Ok(parsed) = serde_json::from_str::<ComputerUseResponse>(&body) {
             if status.is_success() && parsed.success.unwrap_or(true) {
+                // If this was a screenshot with a validated non-empty path, write the PNG
+                // locally. Bind the validated path structurally (the path-bearing flag
+                // above guarantees a non-empty Some here) instead of unwrapping a latent
+                // panic site.
+                if let Some(path_str) = validated_path.as_deref().filter(|p| !p.is_empty()) {
+                    // Extract PNG data from the response
+                    let png_data = parsed
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("png_base64"))
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                                "tool-browser-screenshot-error-sidecar-no-png-data",
+                            ))
+                        })?;
+
+                    // Decode and validate the PNG payload: it must decode to a
+                    // non-empty buffer with a PNG signature. Base64-decodable
+                    // arbitrary bytes are NOT a valid screenshot — writing them
+                    // to the `.png` destination would turn the sidecar boundary
+                    // into an arbitrary decoded-byte write.
+                    let png_bytes = base64::engine::general_purpose::STANDARD
+                        .decode(png_data)
+                        .with_context(|| "Failed to decode PNG base64 data")?;
+                    if png_bytes.is_empty() {
+                        anyhow::bail!(crate::i18n::get_required_tool_string(
+                            "tool-browser-screenshot-error-sidecar-empty-png",
+                        ));
+                    }
+                    const PNG_SIGNATURE: &[u8] =
+                        &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+                    if !png_bytes.starts_with(PNG_SIGNATURE) {
+                        anyhow::bail!(crate::i18n::get_required_tool_string(
+                            "tool-browser-screenshot-error-sidecar-not-png",
+                        ));
+                    }
+
+                    tokio::fs::write(path_str, &png_bytes)
+                        .await
+                        .with_context(|| format!("Failed to write screenshot to {path_str}"))?;
+
+                    // Return success with the path information; the written
+                    // PNG is declared as an attachment so the model can see
+                    // it without anyone scanning the text for the path.
+                    let output = serde_json::to_string_pretty(&json!({
+                        "backend": "computer_use",
+                        "action": action,
+                        "path": path_str,
+                        "bytes": png_bytes.len(),
+                    }))
+                    .unwrap_or_default();
+
+                    return Ok(ToolResult {
+                        success: true,
+                        output: output.into(),
+                        error: None,
+                    }
+                    .with_attachment(RenderedMarker {
+                        target: path_str.to_string(),
+                        kind: MarkerKind::Image,
+                    }));
+                }
+
                 let output = parsed
                     .data
                     .map(|data| serde_json::to_string_pretty(&data).unwrap_or_default())
@@ -835,7 +1267,7 @@ impl BrowserTool {
 
                 return Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 });
             }
@@ -852,22 +1284,31 @@ impl BrowserTool {
 
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error,
             });
         }
 
         if status.is_success() {
+            if is_path_bearing_screenshot {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_tool_string(
+                        "tool-browser-screenshot-error-sidecar-non-json-success",
+                    )),
+                });
+            }
             return Ok(ToolResult {
                 success: true,
-                output: body,
+                output: body.into(),
                 error: None,
             });
         }
 
         Ok(ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some(format!(
                 "computer-use sidecar request failed with status {status}: {}",
                 body.trim()
@@ -877,15 +1318,57 @@ impl BrowserTool {
 
     async fn execute_action(
         &self,
-        action: BrowserAction,
+        mut action: BrowserAction,
         backend: ResolvedBackend,
     ) -> anyhow::Result<ToolResult> {
-        match backend {
+        // Validate screenshot path before any backend writes a file
+        let mut screenshot_target: Option<String> = None;
+        if matches!(action, BrowserAction::Screenshot { .. }) {
+            // A pathless screenshot on the agent-browser backend would
+            // otherwise save to that backend's own default directory,
+            // outside the workspace allowlist, and its printed path could
+            // never be declared. Allocate a workspace name here so the same
+            // validated flow below covers the call; rust-native keeps
+            // inlining a pathless capture.
+            if let (BrowserAction::Screenshot { path, .. }, ResolvedBackend::AgentBrowser) =
+                (&mut action, backend)
+                && path.is_none()
+            {
+                *path = Some(self.allocate_agent_browser_screenshot_target().await?);
+            }
+            self.validate_screenshot_path(&mut action).await?;
+            if let BrowserAction::Screenshot {
+                path: Some(target), ..
+            } = &action
+            {
+                screenshot_target = Some(target.clone());
+            }
+        }
+
+        let result = match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
+        };
+
+        // A screenshot the backend wrote to the validated target is a
+        // produced image: declare it so the model can see it. Nothing
+        // downstream infers attachments from the path printed in the text,
+        // and the text itself is unchanged. (A screenshot with no `path`
+        // argument is allocated a workspace target before dispatch on the
+        // agent-browser backend, so it is declared here too; the
+        // rust-native path still inlines the PNG instead of saving it.)
+        match (result, screenshot_target) {
+            (Ok(mut result), Some(target)) if result.success => {
+                result = result.with_attachment(RenderedMarker {
+                    target,
+                    kind: MarkerKind::Image,
+                });
+                Ok(result)
+            }
+            (result, _) => result,
         }
     }
 
@@ -898,13 +1381,13 @@ impl BrowserTool {
                 .unwrap_or_default();
             Ok(ToolResult {
                 success: true,
-                output,
+                output: output.into(),
                 error: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: resp.error,
             })
         }
@@ -1015,7 +1498,7 @@ impl Tool for BrowserTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "File path for screenshot"
+                    "description": "File path for screenshot (agent-browser default: browser_screenshot_<timestamp>.png in the workspace)"
                 },
                 "ms": {
                     "type": "integer",
@@ -1045,40 +1528,40 @@ impl Tool for BrowserTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         let backend = match self.resolve_backend().await {
             Ok(selected) => selected,
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error.to_string()),
                 });
             }
         };
 
         // Parse action from args
-        let action_str = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'action' parameter"))?;
+        let action_str = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "browser: Missing 'action' parameter"
+            );
+            anyhow::Error::msg("Missing 'action' parameter")
+        })?;
 
         if !is_supported_browser_action(action_str) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown action: {action_str}")),
             });
         }
@@ -1090,7 +1573,7 @@ impl Tool for BrowserTool {
         if is_computer_use_only_action(action_str) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(unavailable_action_for_backend_error(action_str, backend)),
             });
         }
@@ -1100,7 +1583,7 @@ impl Tool for BrowserTool {
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(e.to_string()),
                 });
             }
@@ -1417,7 +1900,22 @@ mod native_backend {
                         }
                         "fill" => {
                             let fill = fill_value.ok_or_else(|| {
-                                anyhow::anyhow!("find_action='fill' requires fill_value")
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Reject
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "find_action": "fill",
+                                            "missing": "fill_value",
+                                        })
+                                    ),
+                                    "browser: fill action requires fill_value"
+                                );
+                                anyhow::Error::msg("find_action='fill' requires fill_value")
                             })?;
                             let _ = element.clear().await;
                             element.send_keys(&fill).await?;
@@ -1532,7 +2030,15 @@ mod native_backend {
 
         fn active_client(&self) -> Result<&Client> {
             self.client.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("No active native browser session. Run browser action='open' first")
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: no active native browser session"
+                );
+                anyhow::Error::msg(
+                    "No active native browser session. Run browser action='open' first",
+                )
             })
         }
     }
@@ -1569,10 +2075,10 @@ mod native_backend {
     fn selector_for_find(by: &str, value: &str) -> String {
         let escaped = css_attr_escape(value);
         match by {
-            "role" => format!(r#"[role=\"{escaped}\"]"#),
+            "role" => format!("[role=\"{escaped}\"]"),
             "label" => format!("label={value}"),
-            "placeholder" => format!(r#"[placeholder=\"{escaped}\"]"#),
-            "testid" => format!(r#"[data-testid=\"{escaped}\"]"#),
+            "placeholder" => format!("[placeholder=\"{escaped}\"]"),
+            "testid" => format!("[data-testid=\"{escaped}\"]"),
             _ => format!("text={value}"),
         }
     }
@@ -1660,7 +2166,7 @@ mod native_backend {
 
         if trimmed.starts_with('@') {
             let escaped = css_attr_escape(trimmed);
-            return SelectorKind::Css(format!(r#"[data-zc-ref=\"{escaped}\"]"#));
+            return SelectorKind::Css(format!("[data-zc-ref=\"{escaped}\"]"));
         }
 
         SelectorKind::Css(trimmed.to_string())
@@ -1730,7 +2236,7 @@ mod native_backend {
             .unwrap_or_else(|| "null".to_string());
 
         format!(
-            r#"(() => {{
+            r#"return (() => {{
   const interactiveOnly = {interactive_only};
   const compact = {compact};
   const maxDepth = {depth_literal};
@@ -1794,6 +2300,66 @@ mod native_backend {
 }})();"#
         )
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn snapshot_script_starts_with_return() {
+            let script = snapshot_script(true, false, None);
+            assert!(
+                script.starts_with("return (() => {"),
+                "snapshot_script must start with 'return (() => {{' for WebDriver ExecuteScript; got: {:?}",
+                &script[..60]
+            );
+        }
+
+        #[test]
+        fn selector_for_find_role_emits_normal_css_attribute() {
+            let sel = selector_for_find("role", "button");
+            assert_eq!(sel, r#"[role="button"]"#);
+        }
+
+        #[test]
+        fn selector_for_find_placeholder_emits_normal_css_attribute() {
+            let sel = selector_for_find("placeholder", "Search");
+            assert_eq!(sel, r#"[placeholder="Search"]"#);
+        }
+
+        #[test]
+        fn selector_for_find_testid_emits_normal_css_attribute() {
+            let sel = selector_for_find("testid", "submit-btn");
+            assert_eq!(sel, r#"[data-testid="submit-btn"]"#);
+        }
+
+        #[test]
+        fn parse_selector_at_ref_emits_normal_css_attribute() {
+            let sel = parse_selector("@elem");
+            let SelectorKind::Css(css) = sel else {
+                panic!("expected Css selector, got XPath");
+            };
+            assert_eq!(css, r#"[data-zc-ref="@elem"]"#);
+        }
+
+        #[test]
+        fn css_attr_escape_escapes_backslashes() {
+            let escaped = css_attr_escape(r#"path\to\file"#);
+            assert_eq!(escaped, r#"path\\to\\file"#);
+        }
+
+        #[test]
+        fn css_attr_escape_escapes_double_quotes() {
+            let escaped = css_attr_escape(r#"he said "hello""#);
+            assert_eq!(escaped, r#"he said \"hello\""#);
+        }
+
+        #[test]
+        fn css_attr_escape_handles_both() {
+            let escaped = css_attr_escape(r#"a\"b"#);
+            assert_eq!(escaped, r#"a\\\"b"#);
+        }
+    }
 }
 
 // ── Action parsing ──────────────────────────────────────────────
@@ -1802,10 +2368,15 @@ mod native_backend {
 fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<BrowserAction> {
     match action_str {
         "open" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'url' for open action"))?;
+            let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'url' for open action"
+                );
+                anyhow::Error::msg("Missing 'url' for open action")
+            })?;
             Ok(BrowserAction::Open { url: url.into() })
         }
         "snapshot" => Ok(BrowserAction::Snapshot {
@@ -1826,7 +2397,15 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for click"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for click"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for click")
+                })?;
             Ok(BrowserAction::Click {
                 selector: selector.into(),
             })
@@ -1835,11 +2414,24 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for fill"))?;
-            let value = args
-                .get("value")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'value' for fill"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for fill"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for fill")
+                })?;
+            let value = args.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'value' for fill"
+                );
+                anyhow::Error::msg("Missing 'value' for fill")
+            })?;
             Ok(BrowserAction::Fill {
                 selector: selector.into(),
                 value: value.into(),
@@ -1849,11 +2441,24 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for type"))?;
-            let text = args
-                .get("text")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'text' for type"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for type"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for type")
+                })?;
+            let text = args.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'text' for type"
+                );
+                anyhow::Error::msg("Missing 'text' for type")
+            })?;
             Ok(BrowserAction::Type {
                 selector: selector.into(),
                 text: text.into(),
@@ -1863,20 +2468,59 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_text"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for get_text"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for get_text")
+                })?;
             Ok(BrowserAction::GetText {
                 selector: selector.into(),
             })
         }
         "get_title" => Ok(BrowserAction::GetTitle),
         "get_url" => Ok(BrowserAction::GetUrl),
-        "screenshot" => Ok(BrowserAction::Screenshot {
-            path: args.get("path").and_then(|v| v.as_str()).map(String::from),
-            full_page: args
-                .get("full_page")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-        }),
+        "screenshot" => {
+            // Parse the raw optional destination once into absent / valid
+            // string / invalid input. A present non-string `path` (number,
+            // object, …) is invalid input and must be rejected up front — the
+            // same contract the ComputerUse path enforces — instead of being
+            // silently coerced to `None` (which would make the local backends
+            // take an inline screenshot while ComputerUse rejects the same
+            // input). An empty string means absent (inline screenshot), also
+            // matching ComputerUse.
+            match args.get("path") {
+                None | Some(serde_json::Value::Null) => Ok(BrowserAction::Screenshot {
+                    path: None,
+                    full_page: args
+                        .get("full_page")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }),
+                Some(serde_json::Value::String(s)) if s.is_empty() => {
+                    Ok(BrowserAction::Screenshot {
+                        path: None,
+                        full_page: args
+                            .get("full_page")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                }
+                Some(serde_json::Value::String(s)) => Ok(BrowserAction::Screenshot {
+                    path: Some(s.clone()),
+                    full_page: args
+                        .get("full_page")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                }),
+                Some(_) => Err(anyhow::Error::msg(crate::i18n::get_required_tool_string(
+                    "tool-browser-screenshot-error-non-string-path",
+                ))),
+            }
+        }
         "wait" => Ok(BrowserAction::Wait {
             selector: args
                 .get("selector")
@@ -1886,17 +2530,30 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             text: args.get("text").and_then(|v| v.as_str()).map(String::from),
         }),
         "press" => {
-            let key = args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'key' for press"))?;
+            let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'key' for press"
+                );
+                anyhow::Error::msg("Missing 'key' for press")
+            })?;
             Ok(BrowserAction::Press { key: key.into() })
         }
         "hover" => {
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for hover"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for hover"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for hover")
+                })?;
             Ok(BrowserAction::Hover {
                 selector: selector.into(),
             })
@@ -1905,7 +2562,15 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let direction = args
                 .get("direction")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'direction' for scroll"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'direction' for scroll"
+                    );
+                    anyhow::Error::msg("Missing 'direction' for scroll")
+                })?;
             Ok(BrowserAction::Scroll {
                 direction: direction.into(),
                 pixels: args
@@ -1918,25 +2583,51 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             let selector = args
                 .get("selector")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for is_visible"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'selector' for is_visible"
+                    );
+                    anyhow::Error::msg("Missing 'selector' for is_visible")
+                })?;
             Ok(BrowserAction::IsVisible {
                 selector: selector.into(),
             })
         }
         "close" => Ok(BrowserAction::Close),
         "find" => {
-            let by = args
-                .get("by")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'by' for find"))?;
-            let value = args
-                .get("value")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'value' for find"))?;
+            let by = args.get("by").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'by' for find"
+                );
+                anyhow::Error::msg("Missing 'by' for find")
+            })?;
+            let value = args.get("value").and_then(|v| v.as_str()).ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "browser: Missing 'value' for find"
+                );
+                anyhow::Error::msg("Missing 'value' for find")
+            })?;
             let action = args
                 .get("find_action")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'find_action' for find"))?;
+                .ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "browser: Missing 'find_action' for find"
+                    );
+                    anyhow::Error::msg("Missing 'find_action' for find")
+                })?;
             Ok(BrowserAction::Find {
                 by: by.into(),
                 value: value.into(),
@@ -2003,7 +2694,7 @@ fn unavailable_action_for_backend_error(action: &str, backend: ResolvedBackend) 
     )
 }
 
-#[allow(dead_code)] // called from browser-native feature paths and tests
+#[cfg(any(feature = "browser-native", test))]
 fn is_recoverable_rust_native_error(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}").to_ascii_lowercase();
 
@@ -2017,14 +2708,6 @@ fn is_recoverable_rust_native_error(err: &anyhow::Error) -> bool {
     }
 
     message.contains("webdriver") && (message.contains("timed out") || message.contains("timeout"))
-}
-
-fn normalize_domains(domains: Vec<String>) -> Vec<String> {
-    domains
-        .into_iter()
-        .map(|d| d.trim().to_lowercase())
-        .filter(|d| !d.is_empty())
-        .collect()
 }
 
 fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
@@ -2051,151 +2734,56 @@ fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
     std::net::TcpStream::connect_timeout(&addr, timeout).is_ok()
 }
 
-fn extract_host(url_str: &str) -> anyhow::Result<String> {
-    // Simple host extraction without url crate
-    let url = url_str.trim();
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .or_else(|| url.strip_prefix("file://"))
-        .unwrap_or(url);
-
-    // Extract host — handle bracketed IPv6 addresses like [::1]:8080
-    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
-
-    let host = if authority.starts_with('[') {
-        // IPv6: take everything up to and including the closing ']'
-        authority.find(']').map_or(authority, |i| &authority[..=i])
-    } else {
-        // IPv4 or hostname: take everything before the port separator
-        authority.split(':').next().unwrap_or(authority)
-    };
-
-    if host.is_empty() {
-        anyhow::bail!("Invalid URL: no host");
-    }
-
-    Ok(host.to_lowercase())
-}
-
-fn is_private_host(host: &str) -> bool {
-    // Strip brackets from IPv6 addresses like [::1]
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-
-    if bare == "localhost" || bare.ends_with(".localhost") {
-        return true;
-    }
-
-    // .local TLD (mDNS)
-    if bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local")
-    {
-        return true;
-    }
-
-    // Parse as IP address to catch all representations (decimal, hex, octal, mapped)
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
-        };
-    }
-
-    false
-}
-
-/// Returns `true` for any IPv4 address that is not globally routable.
-fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, _, _] = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        // Shared address space (100.64/10)
-        || (a == 100 && (64..=127).contains(&b))
-        // Reserved (240.0.0.0/4)
-        || a >= 240
-        // Documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
-        || (a == 192 && b == 0)
-        || (a == 198 && b == 51)
-        || (a == 203 && b == 0)
-        // Benchmarking (198.18.0.0/15)
-        || (a == 198 && (18..=19).contains(&b))
-}
-
-/// Returns `true` for any IPv6 address that is not globally routable.
-fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    v6.is_loopback()
-        || v6.is_unspecified()
-        || v6.is_multicast()
-        // Unique-local (fc00::/7) — IPv6 equivalent of RFC 1918
-        || (segs[0] & 0xfe00) == 0xfc00
-        // Link-local (fe80::/10)
-        || (segs[0] & 0xffc0) == 0xfe80
-        // IPv4-mapped addresses
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
-}
-
 /// Detect whether the current process is running inside a service environment
 /// (e.g. systemd, OpenRC, or launchd) where the browser sandbox and
 /// environment setup may be restricted.
 fn is_service_environment() -> bool {
-    if std::env::var_os("INVOCATION_ID").is_some() {
-        return true;
-    }
-    if std::env::var_os("JOURNAL_STREAM").is_some() {
+    service_environment_from_markers(
+        std::env::var_os("INVOCATION_ID").is_some(),
+        std::env::var_os("JOURNAL_STREAM").is_some(),
+        std::env::var_os("HOME").is_some(),
+    )
+}
+
+fn service_environment_from_markers(
+    has_invocation_id: bool,
+    has_journal_stream: bool,
+    has_home: bool,
+) -> bool {
+    if has_invocation_id || has_journal_stream {
         return true;
     }
     #[cfg(target_os = "linux")]
-    if std::path::Path::new("/run/openrc").exists() && std::env::var_os("HOME").is_none() {
-        return true;
+    {
+        !has_home
     }
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("HOME").is_none() {
-        return true;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = has_home;
+        false
     }
-    false
 }
 
 /// Ensure environment variables required by headless browsers are present
 /// when running inside a service context.
 fn ensure_browser_env(cmd: &mut Command) {
-    if std::env::var_os("HOME").is_none() {
+    let has_home = std::env::var_os("HOME").is_some();
+    let chromium_flags = std::env::var("CHROMIUM_FLAGS").unwrap_or_default();
+    ensure_browser_env_from(cmd, has_home, &chromium_flags);
+}
+
+fn ensure_browser_env_from(cmd: &mut Command, has_home: bool, chromium_flags: &str) {
+    if !has_home {
         cmd.env("HOME", "/tmp");
     }
-    let existing = std::env::var("CHROMIUM_FLAGS").unwrap_or_default();
-    if !existing.contains("--no-sandbox") {
-        let new_flags = if existing.is_empty() {
+    if !chromium_flags.contains("--no-sandbox") {
+        let new_flags = if chromium_flags.is_empty() {
             "--no-sandbox --disable-dev-shm-usage".to_string()
         } else {
-            format!("{existing} --no-sandbox --disable-dev-shm-usage")
+            format!("{chromium_flags} --no-sandbox --disable-dev-shm-usage")
         };
         cmd.env("CHROMIUM_FLAGS", new_flags);
     }
-}
-
-fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
-    allowed.iter().any(|pattern| {
-        if pattern == "*" {
-            return true;
-        }
-        if pattern.starts_with("*.") {
-            // Wildcard subdomain match
-            let suffix = &pattern[1..]; // ".example.com"
-            host.ends_with(suffix) || host == &pattern[2..]
-        } else {
-            // Exact match or subdomain
-            host == pattern || host.ends_with(&format!(".{pattern}"))
-        }
-    })
 }
 
 #[cfg(test)]
@@ -2203,124 +2791,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalize_domains_works() {
-        let domains = vec![
-            "  Example.COM  ".into(),
-            "docs.example.com".into(),
-            String::new(),
-        ];
-        let normalized = normalize_domains(domains);
-        assert_eq!(normalized, vec!["example.com", "docs.example.com"]);
-    }
-
-    #[test]
-    fn extract_host_works() {
-        assert_eq!(
-            extract_host("https://example.com/path").unwrap(),
-            "example.com"
-        );
-        assert_eq!(
-            extract_host("https://Sub.Example.COM:8080/").unwrap(),
-            "sub.example.com"
-        );
-    }
-
-    #[test]
-    fn extract_host_handles_ipv6() {
-        // IPv6 with brackets (required for URLs with ports)
-        assert_eq!(extract_host("https://[::1]/path").unwrap(), "[::1]");
-        // IPv6 with brackets and port
-        assert_eq!(
-            extract_host("https://[2001:db8::1]:8080/path").unwrap(),
-            "[2001:db8::1]"
-        );
-        // IPv6 with brackets, trailing slash
-        assert_eq!(extract_host("https://[fe80::1]/").unwrap(), "[fe80::1]");
-    }
-
-    #[test]
-    fn is_private_host_detects_local() {
-        assert!(is_private_host("localhost"));
-        assert!(is_private_host("app.localhost"));
-        assert!(is_private_host("printer.local"));
-        assert!(is_private_host("127.0.0.1"));
-        assert!(is_private_host("192.168.1.1"));
-        assert!(is_private_host("10.0.0.1"));
-        assert!(!is_private_host("example.com"));
-        assert!(!is_private_host("google.com"));
-    }
-
-    #[test]
-    fn is_private_host_blocks_multicast_and_reserved() {
-        assert!(is_private_host("224.0.0.1")); // multicast
-        assert!(is_private_host("255.255.255.255")); // broadcast
-        assert!(is_private_host("100.64.0.1")); // shared address space
-        assert!(is_private_host("240.0.0.1")); // reserved
-        assert!(is_private_host("192.0.2.1")); // documentation
-        assert!(is_private_host("198.51.100.1")); // documentation
-        assert!(is_private_host("203.0.113.1")); // documentation
-        assert!(is_private_host("198.18.0.1")); // benchmarking
-    }
-
-    #[test]
-    fn is_private_host_catches_ipv6() {
-        assert!(is_private_host("::1"));
-        assert!(is_private_host("[::1]"));
-        assert!(is_private_host("0.0.0.0"));
-    }
-
-    #[test]
-    fn is_private_host_catches_mapped_ipv4() {
-        // IPv4-mapped IPv6 addresses
-        assert!(is_private_host("::ffff:127.0.0.1"));
-        assert!(is_private_host("::ffff:10.0.0.1"));
-        assert!(is_private_host("::ffff:192.168.1.1"));
-    }
-
-    #[test]
-    fn is_private_host_catches_ipv6_private_ranges() {
-        // Unique-local (fc00::/7)
-        assert!(is_private_host("fd00::1"));
-        assert!(is_private_host("fc00::1"));
-        // Link-local (fe80::/10)
-        assert!(is_private_host("fe80::1"));
-        // Public IPv6 should pass
-        assert!(!is_private_host("2001:db8::1"));
-    }
-
-    #[test]
     fn validate_url_blocks_ipv6_ssrf() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["*".into()], None);
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
         assert!(tool.validate_url("https://[::1]/").is_err());
         assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
         assert!(
             tool.validate_url("https://[::ffff:10.0.0.1]:8080/")
                 .is_err()
         );
-    }
-
-    #[test]
-    fn host_matches_allowlist_exact() {
-        let allowed = vec!["example.com".into()];
-        assert!(host_matches_allowlist("example.com", &allowed));
-        assert!(host_matches_allowlist("sub.example.com", &allowed));
-        assert!(!host_matches_allowlist("notexample.com", &allowed));
-    }
-
-    #[test]
-    fn host_matches_allowlist_wildcard() {
-        let allowed = vec!["*.example.com".into()];
-        assert!(host_matches_allowlist("sub.example.com", &allowed));
-        assert!(host_matches_allowlist("example.com", &allowed));
-        assert!(!host_matches_allowlist("other.com", &allowed));
-    }
-
-    #[test]
-    fn host_matches_allowlist_star() {
-        let allowed = vec!["*".into()];
-        assert!(host_matches_allowlist("anything.com", &allowed));
-        assert!(host_matches_allowlist("example.org", &allowed));
     }
 
     #[test]
@@ -2351,10 +2830,83 @@ mod tests {
     #[test]
     fn browser_tool_default_backend_is_agent_browser() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
         assert_eq!(
             tool.configured_backend().unwrap(),
             BrowserBackendKind::AgentBrowser
+        );
+    }
+
+    #[test]
+    fn agent_browser_command_inherits_headed_env_by_default() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .map(|(_, value)| value),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_browser_command_clears_headed_env_when_configured_false() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "agent_browser".into(),
+            Some(false),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .map(|(_, value)| value),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn agent_browser_command_sets_headed_env_when_configured() {
+        let headed_key = std::ffi::OsStr::new("AGENT_BROWSER_HEADED");
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["example.com".into()],
+            None,
+            "agent_browser".into(),
+            Some(true),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        let cmd = tool.agent_browser_command();
+
+        assert_eq!(
+            cmd.as_std()
+                .get_envs()
+                .find(|(key, _)| *key == headed_key)
+                .and_then(|(_, value)| value)
+                .and_then(|value| value.to_str()),
+            Some("1")
         );
     }
 
@@ -2366,11 +2918,14 @@ mod tests {
             vec!["example.com".into()],
             None,
             "auto".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
 
@@ -2382,11 +2937,14 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             tool.configured_backend().unwrap(),
             BrowserBackendKind::ComputerUse
@@ -2401,6 +2959,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2408,7 +2967,9 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
-        );
+            Vec::new(),
+        )
+        .unwrap();
 
         assert!(tool.computer_use_endpoint_url().is_err());
     }
@@ -2421,6 +2982,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2429,7 +2991,9 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
-        );
+            Vec::new(),
+        )
+        .unwrap();
 
         assert!(tool.computer_use_endpoint_url().is_ok());
     }
@@ -2442,6 +3006,7 @@ mod tests {
             vec!["example.com".into()],
             None,
             "computer_use".into(),
+            None,
             true,
             "http://127.0.0.1:9515".into(),
             None,
@@ -2450,7 +3015,9 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
-        );
+            Vec::new(),
+        )
+        .unwrap();
 
         assert!(
             tool.validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
@@ -2469,14 +3036,14 @@ mod tests {
     #[test]
     fn browser_tool_name() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
         assert_eq!(tool.name(), "browser");
     }
 
     #[test]
     fn browser_tool_validates_url() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None).unwrap();
 
         // Valid
         assert!(tool.validate_url("https://example.com").is_ok());
@@ -2499,7 +3066,7 @@ mod tests {
     #[test]
     fn browser_tool_empty_allowlist_blocks() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec![], None);
+        let tool = BrowserTool::new(security, vec![], None).unwrap();
         assert!(tool.validate_url("https://example.com").is_err());
     }
 
@@ -2537,12 +3104,12 @@ mod tests {
             "broken pipe while writing webdriver command",
             "WebDriver request timed out",
         ] {
-            let err = anyhow::anyhow!(message);
+            let err = anyhow::Error::msg(message);
             assert!(is_recoverable_rust_native_error(&err), "{message}");
         }
 
         let allowlist_error =
-            anyhow::anyhow!("URL host 'localhost' is not in browser allowlist [example.com]");
+            anyhow::Error::msg("URL host 'localhost' is not in browser allowlist [example.com]");
         assert!(!is_recoverable_rust_native_error(&allowlist_error));
     }
 
@@ -2553,7 +3120,7 @@ mod tests {
             "URL host '127.0.0.1' is private and disallowed",
             "Action 'mouse_move' is unavailable for backend 'rust_native'",
         ] {
-            let err = anyhow::anyhow!(message);
+            let err = anyhow::Error::msg(message);
             assert!(!is_recoverable_rust_native_error(&err), "{message}");
         }
     }
@@ -2570,76 +3137,52 @@ mod tests {
 
     #[test]
     fn ensure_browser_env_sets_home_when_missing() {
-        let original_home = std::env::var_os("HOME");
-        unsafe { std::env::remove_var("HOME") };
-
         let mut cmd = Command::new("true");
-        ensure_browser_env(&mut cmd);
-        // Function completes without panic — HOME and CHROMIUM_FLAGS set on cmd.
+        ensure_browser_env_from(&mut cmd, false, "");
 
-        if let Some(home) = original_home {
-            unsafe { std::env::set_var("HOME", home) };
-        }
+        let home = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == "HOME").then_some(value).flatten());
+        assert_eq!(home, Some(std::ffi::OsStr::new("/tmp")));
     }
 
     #[test]
     fn ensure_browser_env_sets_chromium_flags() {
-        let original = std::env::var_os("CHROMIUM_FLAGS");
-        unsafe { std::env::remove_var("CHROMIUM_FLAGS") };
-
         let mut cmd = Command::new("true");
-        ensure_browser_env(&mut cmd);
+        ensure_browser_env_from(&mut cmd, true, "--headless");
 
-        if let Some(val) = original {
-            unsafe { std::env::set_var("CHROMIUM_FLAGS", val) };
-        }
+        let flags = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == "CHROMIUM_FLAGS").then_some(value).flatten());
+        assert_eq!(
+            flags,
+            Some(std::ffi::OsStr::new(
+                "--headless --no-sandbox --disable-dev-shm-usage"
+            ))
+        );
     }
 
     #[test]
     fn is_service_environment_detects_invocation_id() {
-        let original = std::env::var_os("INVOCATION_ID");
-        unsafe { std::env::set_var("INVOCATION_ID", "test-unit-id") };
-
-        assert!(is_service_environment());
-
-        if let Some(val) = original {
-            unsafe { std::env::set_var("INVOCATION_ID", val) };
-        } else {
-            unsafe { std::env::remove_var("INVOCATION_ID") };
-        }
+        assert!(service_environment_from_markers(true, false, true));
     }
 
     #[test]
     fn is_service_environment_detects_journal_stream() {
-        let original = std::env::var_os("JOURNAL_STREAM");
-        unsafe { std::env::set_var("JOURNAL_STREAM", "8:12345") };
+        assert!(service_environment_from_markers(false, true, true));
+    }
 
-        assert!(is_service_environment());
-
-        if let Some(val) = original {
-            unsafe { std::env::set_var("JOURNAL_STREAM", val) };
-        } else {
-            unsafe { std::env::remove_var("JOURNAL_STREAM") };
-        }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_service_environment_detects_missing_home_on_linux() {
+        assert!(service_environment_from_markers(false, false, false));
     }
 
     #[test]
     fn is_service_environment_false_in_normal_context() {
-        let inv = std::env::var_os("INVOCATION_ID");
-        let journal = std::env::var_os("JOURNAL_STREAM");
-        unsafe { std::env::remove_var("INVOCATION_ID") };
-        unsafe { std::env::remove_var("JOURNAL_STREAM") };
-
-        if std::env::var_os("HOME").is_some() {
-            assert!(!is_service_environment());
-        }
-
-        if let Some(val) = inv {
-            unsafe { std::env::set_var("INVOCATION_ID", val) };
-        }
-        if let Some(val) = journal {
-            unsafe { std::env::set_var("JOURNAL_STREAM", val) };
-        }
+        assert!(!service_environment_from_markers(false, false, true));
     }
 
     #[test]
@@ -2657,5 +3200,1583 @@ mod tests {
         } else {
             assert_eq!(cmd, "agent-browser");
         }
+    }
+
+    // ── allowed_private_hosts opt-in tests ──────────────────────
+
+    fn private_host_tool(
+        allowed_domains: Vec<&str>,
+        allowed_private_hosts: Vec<&str>,
+    ) -> BrowserTool {
+        let security = Arc::new(SecurityPolicy::default());
+        BrowserTool::new_with_backend(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            None,
+            "agent_browser".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_localhost() {
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://localhost:8080").is_ok());
+        assert!(tool.validate_url("https://localhost:8443").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_rfc1918() {
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://192.168.1.5").is_ok());
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+        assert!(tool.validate_url("http://172.16.0.1").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_does_not_loosen_file_scheme() {
+        // file:// is always blocked, regardless of allowed_private_hosts.
+        let tool = private_host_tool(vec!["*"], vec!["*"]);
+        let err = tool
+            .validate_url("file:///etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file://"));
+    }
+
+    #[test]
+    fn allowed_private_hosts_entry_permits_listed_host() {
+        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_does_not_permit_unlisted_host() {
+        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("http://10.0.0.2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn empty_private_allowlist_still_rejects_private() {
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_satisfies_allowlist_requirement() {
+        // allowed_domains empty + allowed_private_hosts=["*"] should not surface
+        // the "no allowed_domains configured" error for private hosts.
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://localhost").is_ok());
+    }
+
+    #[test]
+    fn specific_private_host_alone_satisfies_allowlist_requirement() {
+        let tool = private_host_tool(vec![], vec!["192.168.1.5"]);
+        assert!(tool.validate_url("http://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_does_not_widen_public_allowlist() {
+        // Public hosts are still subject to allowed_domains when private hosts
+        // are wide-open — the bypass is scoped to private/local hosts only.
+        let tool = private_host_tool(vec!["example.com"], vec!["*"]);
+        let err = tool
+            .validate_url("https://other.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_domains"));
+    }
+
+    #[test]
+    fn userinfo_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
+        // Default-shipped posture: allowed_domains = ["*"], no private
+        // allowlist. `extract_host` would otherwise treat
+        // `example.com@127.0.0.1` as the host and accept it.
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("http://example.com@127.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn userinfo_url_targeting_private_host_rejected_under_wildcard_private_allowlist() {
+        // Even with the private bypass wide open, userinfo is rejected before
+        // host classification — so this is a parser-mismatch defense, not a
+        // policy decision the operator can opt around.
+        let tool = private_host_tool(vec!["*"], vec!["*"]);
+        let err = tool
+            .validate_url("http://example.com@127.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn userinfo_url_with_password_rejected() {
+        // `user:pass@host` form — same parser hole, same fix.
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://user:pass@10.0.0.1/")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    #[test]
+    fn query_only_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("http://127.0.0.1?x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local/private host"),
+            "expected private-host block, got: {err}",
+        );
+    }
+
+    #[test]
+    fn fragment_only_url_targeting_private_host_rejected_under_wildcard_public_allowlist() {
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("http://127.0.0.1#x")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local/private host"),
+            "expected private-host block, got: {err}",
+        );
+    }
+
+    // ============ Screenshot path validation tests ============
+
+    use zeroclaw_config::policy::AutonomyLevel;
+
+    fn screenshot_tool_with_workspace(ws: &std::path::Path) -> BrowserTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.to_path_buf(),
+            allowed_roots: vec![ws.to_path_buf()],
+            ..SecurityPolicy::default()
+        });
+        BrowserTool::new(security, vec!["*".into()], None).unwrap()
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_allows_path_inside_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let shots = ws.join("shots");
+        tokio::fs::create_dir_all(&shots).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("shots/page.png".into()),
+            full_page: false,
+        };
+
+        // Canonicalize the expected workspace path first (macOS fix)
+        let expected_canonical = std::fs::canonicalize(&ws).unwrap();
+
+        tool.validate_screenshot_path(&mut action).await.unwrap();
+
+        // Verify path is replaced with canonical form
+        if let BrowserAction::Screenshot { path, .. } = action {
+            let canonical_path = path.unwrap();
+            // Compare canonical forms, not raw strings
+            assert!(canonical_path.starts_with(expected_canonical.to_string_lossy().as_ref()));
+            assert!(canonical_path.ends_with("page.png"));
+        } else {
+            panic!("action should still be Screenshot");
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_rejects_path_outside_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // Create a file in the outside directory so canonicalize succeeds
+        let outside_file = outside.join("page.png");
+        tokio::fs::write(&outside_file, b"test").await.unwrap();
+
+        // Use absolute path that's not in allowed_roots
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone()], // outside is NOT in allowed_roots
+            ..SecurityPolicy::default()
+        });
+
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+        let mut action = BrowserAction::Screenshot {
+            path: Some(outside_file.to_string_lossy().to_string()),
+            full_page: false,
+        };
+
+        let err = tool
+            .validate_screenshot_path(&mut action)
+            .await
+            .unwrap_err();
+        // Should be rejected as outside workspace
+        assert!(
+            err.to_string().contains("outside-workspace")
+                || err.to_string().contains("outside/page.png")
+                || err.to_string().contains("not in the workspace allowlist"),
+            "Expected outside-workspace rejection, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_rejects_traversal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("../../etc/passwd".into()),
+            full_page: false,
+        };
+
+        let err = tool
+            .validate_screenshot_path(&mut action)
+            .await
+            .unwrap_err();
+        // String-level traversal should be rejected with path-not-allowed error
+        assert!(
+            err.to_string().contains("not in the workspace allowlist")
+                || err.to_string().contains("../../etc/passwd"),
+            "Expected traversal rejection, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_noop_when_path_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: None,
+            full_page: false,
+        };
+
+        tool.validate_screenshot_path(&mut action).await.unwrap();
+        assert!(matches!(
+            action,
+            BrowserAction::Screenshot { path: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_screenshot_path_rejects_runtime_config_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let config_dir = tmp.path().join("config");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+
+        // Create an actual config.toml file in the config directory
+        let config_path = config_dir.join("config.toml");
+        tokio::fs::write(&config_path, b"").await.unwrap();
+
+        // Create the config file so is_runtime_config_path detects it
+        tokio::fs::write(&config_path, b"test").await.unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone(), config_dir.clone()],
+            config_path: Some(config_path.clone()),
+            ..SecurityPolicy::default()
+        });
+
+        let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
+
+        let mut action = BrowserAction::Screenshot {
+            path: Some(config_path.to_string_lossy().to_string()),
+            full_page: false,
+        };
+
+        // Should be rejected as runtime-config target
+        let err = tool
+            .validate_screenshot_path(&mut action)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("runtime config") || err.to_string().contains("Refusing"),
+            "Expected runtime-config rejection, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_screenshot_path_rejects_existing_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // Create a symlink inside workspace pointing outside
+        let link_path = ws.join("page.png");
+        let target_path = outside.join("real.txt");
+        tokio::fs::write(&target_path, b"real").await.unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("page.png".into()),
+            full_page: false,
+        };
+
+        let err = tool
+            .validate_screenshot_path(&mut action)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    /// Path-identity regression: a valid UTF-8 alias can resolve (through a
+    /// symlink) to a canonical parent whose name contains non-UTF-8 bytes. The
+    /// allowlist validates the byte-preserving `PathBuf`, but the backends
+    /// consume the destination as a UTF-8 string — a lossy conversion would
+    /// silently rewrite the pathname and name a location that never passed the
+    /// policy. `execute_action` must reject such a target before either local
+    /// backend receives the action. If the validator call is removed, this
+    /// fails (the backends would otherwise succeed or error without the
+    /// specific allowlist rejection).
+    ///
+    /// Linux-only: the fixture needs a directory whose name carries a raw
+    /// non-UTF-8 byte, and macOS (APFS) rejects such pathnames at
+    /// `create_dir_all` time with `EILSEQ`, so the fixture cannot be built
+    /// there.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn execute_action_rejects_non_utf8_canonical_target_before_backend_dispatch() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+
+        // A real directory (inside the workspace allowlist) whose name carries a
+        // raw non-UTF-8 byte, so the outside-workspace gate does not fire first.
+        let mut raw_name = b"nonutf8-".to_vec();
+        raw_name.push(0xFF);
+        let non_utf8_dir = ws.join(std::path::PathBuf::from(OsString::from_vec(raw_name)));
+        tokio::fs::create_dir_all(non_utf8_dir.join("shots"))
+            .await
+            .unwrap();
+
+        // UTF-8 symlink alias inside the workspace -> the non-UTF-8 directory.
+        symlink(&non_utf8_dir, ws.join("alias")).unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+
+        // AgentBrowser: the rejection must come from the validator, before
+        // dispatch (the backend would otherwise never see this exact error).
+        let action = BrowserAction::Screenshot {
+            path: Some("alias/shots/page.png".into()),
+            full_page: false,
+        };
+        let err = tool
+            .execute_action(action, ResolvedBackend::AgentBrowser)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-UTF-8"),
+            "a non-UTF-8 canonical target must be rejected by the validator before backend \
+             dispatch, got: {err}"
+        );
+
+        // RustNative: same gate, same rejection, before the local write.
+        let action2 = BrowserAction::Screenshot {
+            path: Some("alias/shots/page.png".into()),
+            full_page: false,
+        };
+        let err = tool
+            .execute_action(action2, ResolvedBackend::RustNative)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-UTF-8"),
+            "a non-UTF-8 canonical target must be rejected for rust_native too, got: {err}"
+        );
+    }
+
+    /// ComputerUse shares the same canonical target validator, so a non-UTF-8
+    /// canonical destination is rejected locally — before the sidecar round
+    /// trip — and is never forwarded.
+    ///
+    /// Linux-only for the same reason as
+    /// `execute_action_rejects_non_utf8_canonical_target_before_backend_dispatch`:
+    /// macOS rejects the raw-byte pathname fixture with `EILSEQ`.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn computer_use_rejects_non_utf8_canonical_target_before_sidecar() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+
+        let mut raw_name = b"nonutf8-".to_vec();
+        raw_name.push(0xFF);
+        let non_utf8_dir = ws.join(std::path::PathBuf::from(OsString::from_vec(raw_name)));
+        tokio::fs::create_dir_all(non_utf8_dir.join("shots"))
+            .await
+            .unwrap();
+        symlink(&non_utf8_dir, ws.join("alias")).unwrap();
+
+        // ComputerUse tool whose workspace is the temp `ws` (the shared helper
+        // pins `current_dir`).
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            test_computer_use_config(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let err = tool
+            .validate_screenshot_path_for_computer_use(
+                "screenshot",
+                json!({"path": "alias/shots/page.png"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-UTF-8"),
+            "computer_use must reject a non-UTF-8 canonical target before the sidecar call, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn validate_screenshot_path_allows_existing_regular_file_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        // Create a regular file (not symlink) inside workspace
+        let file_path = ws.join("existing.png");
+        tokio::fs::write(&file_path, b"existing").await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let mut action = BrowserAction::Screenshot {
+            path: Some("existing.png".into()),
+            full_page: false,
+        };
+
+        // Should succeed - regular files are OK
+        tool.validate_screenshot_path(&mut action).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_action_rejects_malicious_screenshot_before_local_backend_dispatch() {
+        // Production-boundary regression for the `execute_action` wiring
+        // (line ~1302): a screenshot action carrying a traversal path must be
+        // rejected by `validate_screenshot_path` before either local backend
+        // (AgentBrowser or RustNative) receives it. If that call is removed,
+        // the validation error never fires and this assertion fails — the
+        // backend-specific error does not mention the path or the allowlist.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let tool = screenshot_tool_with_workspace(&ws);
+        let action = BrowserAction::Screenshot {
+            path: Some("../etc/passwd".into()),
+            full_page: false,
+        };
+
+        let err = tool
+            .execute_action(action, ResolvedBackend::AgentBrowser)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not in the workspace allowlist"),
+            "traversal path must be rejected by the screenshot-path validator before backend \
+             dispatch (the specific allowlist rejection, not any error echoing the path), got: {err}"
+        );
+
+        // The mut-borrow contract still holds for the second local backend.
+        let action2 = BrowserAction::Screenshot {
+            path: Some("../etc/passwd".into()),
+            full_page: false,
+        };
+        let err = tool
+            .execute_action(action2, ResolvedBackend::RustNative)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not in the workspace allowlist"),
+            "traversal path must be rejected at execute_action for rust_native too, got: {err}"
+        );
+    }
+
+    /// The same real 1×1 PNG the `image_info` tests use: the fake
+    /// agent-browser must write decodable image bytes, not a marker string.
+    #[cfg(unix)]
+    const MINIMAL_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+        0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08, 0xD7, 0x63, 0xF8,
+        0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, 0x00, 0x00, 0x00,
+        0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    /// The [`MINIMAL_PNG`] bytes as a POSIX `printf` format string: octal
+    /// escapes only, so the fake binary needs no `base64` (whose decode flag
+    /// differs between macOS and GNU) and no here-doc quoting tricks.
+    #[cfg(unix)]
+    fn minimal_png_sh_literal() -> String {
+        let mut out = String::with_capacity(MINIMAL_PNG.len() * 4);
+        for byte in MINIMAL_PNG {
+            out.push_str(&format!("\\{byte:03o}"));
+        }
+        out
+    }
+
+    /// Write a fake `agent-browser` shell script into `dir` (mode 0o755):
+    /// given `screenshot <path> --json` it writes [`MINIMAL_PNG`] to
+    /// `<path>` and prints the agent-browser success JSON echoing that path,
+    /// so the tests exercise the real command execution and declaration
+    /// path. A missing or option-shaped path argument is a failure, which
+    /// keeps a misrouted no-path invocation from scribbling on the cwd.
+    #[cfg(unix)]
+    fn write_fake_agent_browser(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let png = minimal_png_sh_literal();
+        let script = format!(
+            "#!/bin/sh\n\
+             set -e\n\
+             # fake agent-browser: `screenshot <path> --json` writes a real PNG\n\
+             case \"$2\" in -*|'') echo 'fake agent-browser: expected a path argument' >&2; exit 1 ;; esac\n\
+             printf '{png}' > \"$2\"\n\
+             printf '{{\"success\":true,\"data\":{{\"path\":\"%s\"}}}}\\n' \"$2\"\n"
+        );
+        let bin = dir.join("fake-agent-browser");
+        std::fs::write(&bin, script).expect("fake agent-browser script must be writable");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("fake agent-browser script must be executable");
+        bin
+    }
+
+    /// Production-boundary proof for the pathless agent-browser screenshot:
+    /// `execute_action` must allocate a workspace target before dispatch
+    /// (the backend's own default directory is outside the allowlist and
+    /// its printed path may never be promoted), hand it to the real command
+    /// path, and declare the file the backend wrote. Deleting the
+    /// allocation `if` in `execute_action` fails the attachment assert; so
+    /// does deleting the declaration match below it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_browser_pathless_screenshot_declares_the_allocated_workspace_image() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let bin = write_fake_agent_browser(tmp.path());
+        let mut tool = screenshot_tool_with_workspace(&ws);
+        tool.set_agent_browser_bin_for_tests(bin);
+
+        let result = tool
+            .execute_action(
+                BrowserAction::Screenshot {
+                    path: None,
+                    full_page: false,
+                },
+                ResolvedBackend::AgentBrowser,
+            )
+            .await
+            .expect("a pathless agent-browser screenshot must succeed");
+
+        assert!(result.success);
+        let attachments = result.output.attachments();
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the allocated workspace target must be declared as exactly one attachment"
+        );
+        assert_eq!(attachments[0].kind, MarkerKind::Image);
+        let target = attachments[0].target.as_str();
+        let target_path = std::path::Path::new(target);
+        assert!(
+            target_path.is_absolute(),
+            "the declared target must be the canonical absolute path, got: {target}"
+        );
+        let ws_canonical = std::fs::canonicalize(&ws).unwrap();
+        assert_eq!(
+            target_path.parent(),
+            Some(ws_canonical.as_path()),
+            "the target's parent must canonicalize to the workspace tempdir, got: {target}"
+        );
+        let filename = target_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the allocated filename must be valid UTF-8");
+        assert!(
+            filename.starts_with("browser_screenshot_") && filename.ends_with(".png"),
+            "the allocated name must carry the browser_screenshot_ prefix and .png suffix, got: {filename}"
+        );
+
+        let written = std::fs::read(target_path).expect("the backend must write the target");
+        let png_signature: &[u8] = &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        assert!(
+            written.starts_with(png_signature),
+            "the file at the allocated target must be a real PNG"
+        );
+
+        let text = result.output.as_str();
+        assert!(
+            text.contains(target),
+            "the text must carry agent-browser's own path echo, got: {text}"
+        );
+        assert!(
+            !text.contains("(media attachment omitted)"),
+            "the marker must ride the attachment declaration, never the tool text: {text}"
+        );
+
+        // The declaration must survive the carrier protocol in both shapes:
+        // the native envelope (`render_native_attachments` round trip) and
+        // the prompt carrier, with `image_refs` naming the same target.
+        let native_envelope = json!({
+            "tool_call_id": "call-1",
+            "content": text,
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(attachments),
+        })
+        .to_string();
+        let native_parts = zeroclaw_api::tool_carrier::parse_native_tool_carrier(&native_envelope)
+            .expect("the native envelope must parse");
+        assert!(native_parts.declared);
+        let native_classified = zeroclaw_api::tool_carrier::classify("tool", &native_envelope)
+            .expect("a tool-role message must classify");
+        assert_eq!(
+            zeroclaw_api::tool_carrier::image_refs(&native_classified),
+            vec![target.to_string()]
+        );
+
+        let prompt_carrier =
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(text, attachments);
+        let prompt_parts = zeroclaw_api::tool_carrier::classify("user", &prompt_carrier)
+            .expect("the prompt carrier must classify");
+        assert!(prompt_parts.declared);
+        assert_eq!(
+            zeroclaw_api::tool_carrier::image_refs(&prompt_parts),
+            vec![target.to_string()]
+        );
+    }
+
+    /// The allocation only fills in a missing path: an explicit target must
+    /// pass through unchanged. The backend writes the requested file and
+    /// the declaration names exactly that file, with no allocated
+    /// `browser_screenshot_` name created alongside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_browser_explicit_path_screenshot_declares_the_explicit_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let bin = write_fake_agent_browser(tmp.path());
+        let mut tool = screenshot_tool_with_workspace(&ws);
+        tool.set_agent_browser_bin_for_tests(bin);
+
+        let result = tool
+            .execute_action(
+                BrowserAction::Screenshot {
+                    path: Some("explicit_shot.png".into()),
+                    full_page: false,
+                },
+                ResolvedBackend::AgentBrowser,
+            )
+            .await
+            .expect("an explicit-path agent-browser screenshot must succeed");
+
+        assert!(result.success);
+        let attachments = result.output.attachments();
+        assert_eq!(
+            attachments.len(),
+            1,
+            "the explicit target must still be declared exactly once"
+        );
+        assert_eq!(attachments[0].kind, MarkerKind::Image);
+        let ws_canonical = std::fs::canonicalize(&ws).unwrap();
+        let target = std::path::Path::new(attachments[0].target.as_str());
+        assert_eq!(
+            target.parent(),
+            Some(ws_canonical.as_path()),
+            "the explicit target must resolve inside the workspace, got: {target:?}"
+        );
+        assert_eq!(
+            target.file_name().and_then(|name| name.to_str()),
+            Some("explicit_shot.png"),
+            "the declared target must be the explicit file, not an allocated name"
+        );
+        let written = std::fs::read(target).expect("the backend must write the explicit target");
+        assert!(
+            written.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']),
+            "the explicit target must hold the real PNG bytes"
+        );
+
+        let workspace_files: Vec<String> = std::fs::read_dir(&ws)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        assert_eq!(
+            workspace_files,
+            vec!["explicit_shot.png".to_string()],
+            "only the explicit target may exist in the workspace"
+        );
+    }
+
+    /// Write a fake `agent-browser` that answers `get title --json` with a
+    /// caller-chosen title string, for the text-only negative control.
+    #[cfg(unix)]
+    fn write_fake_agent_browser_title(dir: &std::path::Path, title: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\n\
+             set -e\n\
+             # fake agent-browser: `get title --json` echoes a fixed title\n\
+             printf '{{\"success\":true,\"data\":{{\"title\":\"%s\"}}}}\\n' '{title}'\n"
+        );
+        let bin = dir.join("fake-agent-browser-title");
+        std::fs::write(&bin, script).expect("fake agent-browser script must be writable");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("fake agent-browser script must be executable");
+        bin
+    }
+
+    /// Negative control for the producer: a non-screenshot agent-browser
+    /// result whose text names a real, permitted PNG inside the workspace
+    /// declares nothing. The path reaches the model as text, and neither
+    /// carrier shape yields an image ref from it. Only the screenshot
+    /// producer declares images; no text is scanned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_browser_text_result_naming_a_png_declares_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let png_path = std::fs::canonicalize(&ws).unwrap().join("real.png");
+        std::fs::write(&png_path, MINIMAL_PNG).unwrap();
+        let png_str = png_path.to_str().expect("tempdir path is UTF-8");
+        assert!(
+            png_path.is_file(),
+            "precondition: a real PNG exists at {png_str}"
+        );
+
+        let bin = write_fake_agent_browser_title(tmp.path(), png_str);
+        let mut tool = screenshot_tool_with_workspace(&ws);
+        tool.set_agent_browser_bin_for_tests(bin);
+
+        let result = tool
+            .execute_action(BrowserAction::GetTitle, ResolvedBackend::AgentBrowser)
+            .await
+            .expect("the fake get-title call must succeed");
+
+        assert!(result.success);
+        let attachments = result.output.attachments();
+        assert!(
+            attachments.is_empty(),
+            "a text result naming a PNG must declare nothing, got: {attachments:?}"
+        );
+        let text = result.output.as_str();
+        assert!(
+            text.contains(png_str),
+            "the PNG path must reach the model as text verbatim, got: {text}"
+        );
+
+        let native_envelope = json!({
+            "tool_call_id": "call-1",
+            "content": text,
+            "attachments": zeroclaw_api::tool_carrier::render_native_attachments(attachments),
+        })
+        .to_string();
+        let native_classified = zeroclaw_api::tool_carrier::classify("tool", &native_envelope)
+            .expect("a tool-role message must classify");
+        assert!(
+            zeroclaw_api::tool_carrier::image_refs(&native_classified).is_empty(),
+            "the native carrier must not turn the quoted path into an image ref"
+        );
+
+        let prompt_carrier =
+            zeroclaw_api::tool_carrier::render_prompt_tool_carrier(text, attachments);
+        let prompt_parts = zeroclaw_api::tool_carrier::classify("user", &prompt_carrier)
+            .expect("the prompt carrier must classify");
+        assert!(
+            zeroclaw_api::tool_carrier::image_refs(&prompt_parts).is_empty(),
+            "the prompt carrier must not turn the quoted path into an image ref"
+        );
+    }
+
+    /// `Tool::execute` raw-input boundary: a present non-string `path` must be
+    /// rejected up front — the same contract the ComputerUse path enforces —
+    /// rather than silently coerced to `None` (which would make the local
+    /// backends take an inline screenshot while ComputerUse rejects the same
+    /// input).
+    #[tokio::test]
+    async fn execute_rejects_present_non_string_screenshot_path() {
+        // Parser boundary (no backend dependency): a present non-string path
+        // must be rejected at parse time, never coerced to `None`. This is the
+        // mutation-sensitive assertion — reverting the parser's non-string
+        // branch back to `None` coercion makes `expect_err` fail regardless of
+        // whether a backend is available in the test environment.
+        let parse_err = parse_browser_action("screenshot", &json!({ "path": 123 }))
+            .expect_err("a present non-string path must be rejected by the parser")
+            .to_string();
+        assert!(
+            parse_err.contains("must be a string"),
+            "the parser must name the string contract, got: {parse_err}"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let tool = screenshot_tool_with_workspace(&ws);
+
+        // Local backend path (default). The non-string path must produce a
+        // rejection ToolResult, never a silent inline screenshot.
+        let result = tool
+            .execute(json!({
+                "action": "screenshot",
+                "path": 123,
+            }))
+            .await
+            .expect("execute must not panic on a non-string path");
+        assert!(
+            !result.success,
+            "a present non-string path must be rejected, not coerced to None; got: {:?}",
+            result.output
+        );
+
+        // ComputerUse path: same contract, non-string path rejected.
+        let tool = browser_tool_with_computer_use(test_computer_use_config());
+        let result = tool
+            .execute(json!({
+                "action": "screenshot",
+                "path": json!({"nested": "object"}),
+            }))
+            .await
+            .expect("execute must not panic on a non-string path");
+        assert!(
+            !result.success,
+            "computer_use must reject a present non-string path too; got: {:?}",
+            result.output
+        );
+    }
+
+    // ============ ComputerUse dispatch tests ============
+
+    fn test_computer_use_config() -> ComputerUseConfig {
+        ComputerUseConfig {
+            endpoint: "http://127.0.0.1:8787".to_string(),
+            api_key: None,
+            timeout_ms: 5000,
+            allow_remote_endpoint: true,
+            window_allowlist: vec![],
+            max_coordinate_x: None,
+            max_coordinate_y: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn browser_tool_with_computer_use(config: ComputerUseConfig) -> BrowserTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::current_dir().unwrap(),
+            allowed_roots: vec![std::env::current_dir().unwrap()],
+            ..SecurityPolicy::default()
+        });
+        BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_traversal_path_before_sidecar() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Start a mock server to pass the endpoint reachability check
+        let server = MockServer::start().await;
+
+        // Mock the reachability check (GET request)
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Mock the POST endpoint - should NOT be called because traversal is rejected before sidecar
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = browser_tool_with_computer_use(config);
+
+        let args = json!({
+            "action": "screenshot",
+            "path": "../etc/passwd"
+        });
+
+        // Validation happens in execute_computer_use_action, returns ToolResult with error
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected validation to fail");
+        let error = result.error.expect("Expected error in result");
+        assert!(
+            error.contains("not in the workspace allowlist") || error.contains("../etc/passwd"),
+            "Expected traversal rejection, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_runtime_config_target_before_sidecar() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let config_dir = tmp.path().join("config");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&config_dir).await.unwrap();
+        let config_path = config_dir.join("config.toml");
+        tokio::fs::write(&config_path, b"").await.unwrap();
+
+        // POST must never be reached: the ComputerUse runtime-config guard
+        // rejects before any sidecar action request.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone(), config_dir.clone()],
+            config_path: Some(config_path.clone()),
+            ..SecurityPolicy::default()
+        });
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let args = json!({
+            "action": "screenshot",
+            "path": config_path.to_string_lossy().to_string()
+        });
+
+        // Validation happens in execute_computer_use_action, returns ToolResult with error.
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected runtime-config rejection");
+        let error = result.error.expect("Expected error in result");
+        assert!(
+            error.contains("runtime config") || error.contains("Refusing"),
+            "Expected runtime-config rejection, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn computer_use_dispatch_rejects_symlink_target_before_sidecar() {
+        use std::os::unix::fs::symlink;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let outside = tmp.path().join("outside");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+
+        // Create a symlink inside the workspace pointing outside.
+        let link_path = ws.join("page.png");
+        let target_path = outside.join("real.txt");
+        tokio::fs::write(&target_path, b"real").await.unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        // POST must never be reached: the ComputerUse symlink-target guard
+        // rejects before any sidecar action request.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone()],
+            ..SecurityPolicy::default()
+        });
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let args = json!({
+            "action": "screenshot",
+            "path": "page.png"
+        });
+
+        // Validation happens in execute_computer_use_action, returns ToolResult with error.
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected symlink-target rejection");
+        let error = result.error.expect("Expected error in result");
+        assert!(
+            error.contains("symlink"),
+            "Expected symlink-target rejection, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_writes_validated_png_locally_without_forwarding_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        // Create the page.png file so canonicalize succeeds
+        let page_path = ws.join("page.png");
+        tokio::fs::write(&page_path, b"test").await.unwrap();
+
+        // Mock the reachability check (GET request)
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Mock the POST endpoint to return PNG data
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {"png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Setup security policy that allows the temp directory
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![tmp.path().to_path_buf()], // Allow the entire temp directory
+            ..SecurityPolicy::default()
+        });
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap();
+
+        // Use absolute path to the created file
+        let args = json!({
+            "action": "screenshot",
+            "path": page_path.to_string_lossy().to_string()
+        });
+
+        // Should succeed - path is validated locally but NOT forwarded to the
+        // sidecar. The sidecar returns PNG bytes and ZeroClaw performs the
+        // validated local write.
+        let result = tool.execute(args).await.unwrap();
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
+
+        // The fail-closed contract: exactly one sidecar action request, and the
+        // destination path is absent from its params.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let params = body.get("params").unwrap().as_object().unwrap();
+        assert!(
+            !params.contains_key("path"),
+            "Path should not be forwarded to sidecar"
+        );
+
+        // ZeroClaw performed the validated local write: the pre-existing file
+        // was overwritten with the decoded PNG bytes from the sidecar.
+        let expected_png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+            .unwrap();
+        let written = tokio::fs::read(&page_path).await.unwrap();
+        assert_eq!(
+            written, expected_png,
+            "local screenshot write must match the sidecar PNG"
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_does_not_forward_path_and_writes_local_target() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Positive remote-sidecar contract: the validated destination is NOT
+        // transmitted to the sidecar (the path is removed before the request),
+        // and the returned PNG is written only to the validated local target.
+        // A non-loopback sidecar address exercises the same flow — the old
+        // filesystem-sharing rejection (endpoint_is_remote_filesystem) is gone.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&ws).await.unwrap();
+
+        let server = MockServer::start().await;
+        // The sidecar must NOT receive a `path` field in the screenshot params.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(
+                serde_json::json!({"action": "screenshot"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": { "png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: ws.clone(),
+            allowed_roots: vec![ws.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "computer_use".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            config,
+            Vec::new(),
+        )
+        .unwrap();
+
+        let result = tool
+            .execute(json!({
+                "action": "screenshot",
+                "path": "screenshot.png"
+            }))
+            .await
+            .expect("execute must succeed");
+        assert!(
+            result.success,
+            "a valid screenshot from the sidecar must write the validated local target: {:?}",
+            result.error
+        );
+
+        // The local target was written with the PNG bytes.
+        let written = tokio::fs::read(ws.join("screenshot.png"))
+            .await
+            .expect("the validated local target must be written");
+        assert!(
+            written.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']),
+            "the written bytes must be a PNG, not arbitrary decoded data"
+        );
+
+        // The destination was not transmitted: every sidecar request body must
+        // be free of a `path` field.
+        let requests = server.received_requests().await.expect("infallible");
+        for req in &requests {
+            let body: serde_json::Value = req.body_json().expect("request body is JSON");
+            assert!(
+                body.get("params").and_then(|p| p.get("path")).is_none(),
+                "the validated destination must NOT be forwarded to the sidecar: {body}"
+            );
+        }
+
+        // The written screenshot is declared as the one image attachment; the
+        // JSON text (including the printed path) is unchanged, and nothing
+        // about the declaration rewrites the output.
+        assert!(result.success, "precondition: the screenshot succeeded");
+        assert_eq!(
+            result.output.attachments().len(),
+            1,
+            "a written screenshot declares exactly one attachment"
+        );
+        assert_eq!(
+            result.output.attachments()[0].kind,
+            zeroclaw_api::media::MarkerKind::Image
+        );
+        let expected_target = std::fs::canonicalize(ws.join("screenshot.png"))
+            .expect("canonical target")
+            .display()
+            .to_string();
+        assert_eq!(
+            result.output.attachments()[0].target,
+            expected_target,
+            "the declared target is the validated local destination"
+        );
+        assert!(
+            result.output.as_str().contains("\"path\""),
+            "the text still carries the path field verbatim: {}",
+            result.output.as_str()
+        );
+        assert!(
+            !result.output.as_str().contains("[IMAGE:"),
+            "the declaration never rides the text as marker syntax"
+        );
+    }
+
+    /// Fail-closed contract for a path-bearing screenshot: the tool must NOT
+    /// report success (or write the destination) unless the sidecar returned a
+    /// well-formed ComputerUseResponse with success != false and a valid
+    /// non-empty PNG payload. A malformed or unsuccessful 2xx body must fail
+    /// and leave the destination unwritten.
+    #[tokio::test]
+    async fn computer_use_dispatch_fails_closed_on_malformed_screenshot_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let not_a_png_b64 = base64::engine::general_purpose::STANDARD.encode(b"not a png");
+        // Each case is (name, wire body, expected error fragment). The
+        // non-JSON case sends genuinely non-JSON bytes via `set_body_raw`
+        // (a `set_body_json(json!("..."))` would transmit a *valid* JSON
+        // string, exercising a different branch). Every case is a 200 so the
+        // failure must come from response handling, not the HTTP layer.
+        let cases: Vec<(&str, ResponseTemplate, &str)> = vec![
+            (
+                "non-json-2xx",
+                ResponseTemplate::new(200)
+                    .set_body_raw(b"this is not json {{{".to_vec(), "text/plain"),
+                "non-JSON",
+            ),
+            (
+                "success-false",
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": false, "error": "boom"})),
+                "boom",
+            ),
+            (
+                "empty-base64",
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": true, "data": {"png_base64": ""}})),
+                "empty screenshot payload",
+            ),
+            (
+                "non-png-bytes",
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"success": true, "data": {"png_base64": not_a_png_b64}})),
+                "non-PNG screenshot payload",
+            ),
+        ];
+
+        for (name, response_template, expected_error_fragment) in cases {
+            let server = MockServer::start().await;
+            let tmp = tempfile::TempDir::new().unwrap();
+            let ws = tmp.path().join("ws");
+            tokio::fs::create_dir_all(&ws).await.unwrap();
+
+            // Reachability probe (GET) so the action POST is actually issued.
+            Mock::given(method("GET"))
+                .and(path("/"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            // The action POST must happen exactly once. If a pre-dispatch
+            // failure short-circuits before the sidecar request, the POST
+            // never fires and the test would otherwise pass on an unwritten
+            // file alone — so the exact-once expectation makes that impossible.
+            Mock::given(method("POST"))
+                .and(path("/"))
+                .respond_with(response_template)
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let security = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: ws.clone(),
+                allowed_roots: vec![ws.clone()],
+                ..SecurityPolicy::default()
+            });
+            let mut config = test_computer_use_config();
+            config.endpoint = server.uri();
+            let tool = BrowserTool::new_with_backend(
+                security,
+                vec!["*".into()],
+                None,
+                "computer_use".into(),
+                None,
+                true,
+                "http://127.0.0.1:9515".into(),
+                None,
+                config,
+                Vec::new(),
+            )
+            .unwrap();
+
+            let target = ws.join("shot.png");
+            let result = tool
+                .execute(json!({
+                    "action": "screenshot",
+                    "path": "shot.png"
+                }))
+                .await;
+
+            // A malformed/unsuccessful sidecar response must fail the tool:
+            // either as an Ok(success=false) ToolResult or as an Err — never a
+            // success. Each shape must surface its own expected error, and the
+            // destination must remain unwritten.
+            let error_text = match &result {
+                Ok(r) => {
+                    assert!(
+                        !r.success,
+                        "{name}: must fail closed, got success with output {:?}",
+                        r.output
+                    );
+                    r.error.clone().unwrap_or_default()
+                }
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                error_text.contains(expected_error_fragment),
+                "{name}: expected error containing {expected_error_fragment:?}, got: {error_text}"
+            );
+            assert!(
+                !tokio::fs::try_exists(&target)
+                    .await
+                    .expect("filesystem must be readable"),
+                "{name}: the destination must NOT be written on a failed screenshot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_rejects_non_string_path_before_sidecar() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Start a mock server to pass the endpoint reachability check in resolve_backend()
+        let server = MockServer::start().await;
+
+        // Mock the reachability check (GET request) - should return 200
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // Mock the screenshot action (POST request) - should NOT be called because
+        // path validation happens before the sidecar request. Exact zero is
+        // asserted so a regression that forwards a non-string path fails here.
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {"ok": true}
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = browser_tool_with_computer_use(config);
+
+        // Integer path - should fail before reaching sidecar
+        let args = json!({
+            "action": "screenshot",
+            "path": 12345
+        });
+        // Validation happens in execute_computer_use_action, returns ToolResult with error
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected validation to fail");
+        let error = result.error.expect("Expected error in result");
+        assert!(
+            error.contains("string") || error.contains("path"),
+            "Expected non-string path error, got: {}",
+            error
+        );
+
+        // Array path
+        let args = json!({
+            "action": "screenshot",
+            "path": ["path1", "path2"]
+        });
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected validation to fail");
+        let error = result.error.expect("Expected error in result");
+        assert!(
+            error.contains("string") || error.contains("path"),
+            "Expected non-string path error, got: {}",
+            error
+        );
+
+        // Object path
+        let args = json!({
+            "action": "screenshot",
+            "path": {"key": "value"}
+        });
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success, "Expected validation to fail");
+        let error = result.error.expect("Expected error in result");
+        assert!(
+            error.contains("string") || error.contains("path"),
+            "Expected non-string path error, got: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn computer_use_dispatch_passes_through_empty_string_path() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Empty string path → inline PNG semantics, no path validation, forwarded to sidecar
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {"png_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = test_computer_use_config();
+        config.endpoint = server.uri();
+        let tool = browser_tool_with_computer_use(config);
+
+        // Empty string path → inline PNG, no local write
+        let args = json!({
+            "action": "screenshot",
+            "path": ""
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
     }
 }

@@ -1,11 +1,10 @@
 //! Hardware memory read tool — read actual memory/register values from Nucleo via probe-rs.
-//!
 //! Use when user asks to "read register values", "read memory at address", "dump lower memory", etc.
 //! Requires probe feature and Nucleo connected via USB.
 
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// RAM base for Nucleo-F401RE (STM32F401)
 const NUCLEO_RAM_BASE: u64 = 0x2000_0000;
@@ -63,7 +62,7 @@ impl Tool for HardwareMemoryReadTool {
         if self.boards.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "No peripherals configured. Add nucleo-f401re to config.toml [peripherals.boards]."
                         .into(),
@@ -78,17 +77,16 @@ impl Tool for HardwareMemoryReadTool {
             .or_else(|| self.boards.first().cloned())
             .unwrap_or_else(|| "nucleo-f401re".into());
 
-        let chip = Self::chip_for_board(&board);
-        if chip.is_none() {
+        let Some(_chip) = Self::chip_for_board(&board) else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Memory read only supports nucleo-f401re, nucleo-f411re. Got: {}",
                     board
                 )),
             });
-        }
+        };
 
         let address_str = args
             .get("address")
@@ -103,18 +101,18 @@ impl Tool for HardwareMemoryReadTool {
 
         #[cfg(feature = "probe")]
         {
-            match probe_read_memory(chip.unwrap(), _address, _length) {
+            match probe_read_memory(_chip, _address, _length) {
                 Ok(output) => {
                     return Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     });
                 }
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!(
                             "probe-rs read failed: {}. Ensure Nucleo is connected via USB and built with --features probe.",
                             e
@@ -128,7 +126,7 @@ impl Tool for HardwareMemoryReadTool {
         {
             Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     "Memory read requires probe feature. Build with: cargo build --features hardware,probe"
                         .into(),
@@ -149,13 +147,37 @@ fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<
     use probe_rs::Session;
     use probe_rs::SessionConfig;
 
-    let mut session = Session::auto_attach(chip, SessionConfig::default())
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let mut session = Session::auto_attach(chip, SessionConfig::default()).map_err(|e| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "chip": chip,
+                    "error": format!("{}", e),
+                })),
+            "hardware_memory_read: probe-rs auto_attach failed"
+        );
+        anyhow::Error::msg(format!("{}", e))
+    })?;
 
     let mut core = session.core(0)?;
     let mut buf = vec![0u8; length];
-    core.read_8(address, &mut buf)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    core.read_8(address, &mut buf).map_err(|e| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "chip": chip,
+                    "address": address,
+                    "length": length,
+                    "error": format!("{}", e),
+                })),
+            "hardware_memory_read: probe-rs read_8 failed"
+        );
+        anyhow::Error::msg(format!("{}", e))
+    })?;
 
     // Format as hex dump: address | bytes (16 per line)
     let mut out = format!("Memory read from 0x{:08X} ({} bytes):\n\n", address, length);
@@ -180,4 +202,64 @@ fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<
         out.push_str(&format!("0x{:08X}  {:48}  {}\n", addr, hex, ascii));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn execute_with_empty_boards_returns_error() {
+        let tool = HardwareMemoryReadTool::new(Vec::new());
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("No peripherals configured"))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_unsupported_board_returns_error() {
+        let tool = HardwareMemoryReadTool::new(vec!["arduino-uno".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Memory read only supports"))
+        );
+    }
+
+    #[cfg(not(feature = "probe"))]
+    #[tokio::test]
+    async fn execute_without_probe_feature_returns_build_hint() {
+        let tool = HardwareMemoryReadTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("requires probe feature"))
+        );
+    }
+
+    #[cfg(feature = "probe")]
+    #[tokio::test]
+    async fn execute_probe_attach_failure_returns_error() {
+        let tool = HardwareMemoryReadTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("probe-rs read failed"))
+        );
+    }
 }

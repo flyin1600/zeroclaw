@@ -1,17 +1,13 @@
 //! Response cache — avoid burning tokens on repeated prompts.
-//!
-//! Stores LLM responses in a separate SQLite table keyed by a SHA-256 hash of
-//! `(model, system_prompt_hash, user_prompt)`. Entries expire after a
-//! configurable TTL (default: 1 hour). The cache is optional and disabled by
-//! default — users opt in via `[memory] response_cache_enabled = true`.
 
+use crate::sqlite_permissions::{check_sqlite_storage, prepare_sqlite_storage};
 use anyhow::Result;
 use chrono::{Duration, Local};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// An in-memory hot cache entry for the two-tier response cache.
 struct InMemoryEntry {
@@ -21,15 +17,8 @@ struct InMemoryEntry {
     accessed_at: std::time::Instant,
 }
 
-/// Two-tier response cache: in-memory LRU (hot) + SQLite (warm).
-///
-/// The hot cache avoids SQLite round-trips for frequently repeated prompts.
-/// On miss from hot cache, falls through to SQLite. On hit from SQLite,
-/// the entry is promoted to the hot cache.
 pub struct ResponseCache {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
     ttl_minutes: i64,
     max_entries: usize,
     hot_cache: Mutex<HashMap<String, InMemoryEntry>>,
@@ -49,11 +38,12 @@ impl ResponseCache {
         max_entries: usize,
         hot_max_entries: usize,
     ) -> Result<Self> {
-        let db_dir = workspace_dir.join("memory");
-        std::fs::create_dir_all(&db_dir)?;
-        let db_path = db_dir.join("response_cache.db");
+        let db_path = prepare_sqlite_storage(workspace_dir, "response_cache.db")?;
 
-        let conn = Connection::open(&db_path)?;
+        let flags = rusqlite::OpenFlags::default();
+        #[cfg(unix)]
+        let flags = flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let conn = Connection::open_with_flags(&db_path, flags)?;
 
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -74,10 +64,10 @@ impl ResponseCache {
             CREATE INDEX IF NOT EXISTS idx_rc_accessed ON response_cache(accessed_at);
             CREATE INDEX IF NOT EXISTS idx_rc_created ON response_cache(created_at);",
         )?;
+        check_sqlite_storage(&db_path)?;
 
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path,
             ttl_minutes: i64::from(ttl_minutes),
             max_entries,
             hot_cache: Mutex::new(HashMap::new()),
@@ -100,7 +90,6 @@ impl ResponseCache {
     }
 
     /// Look up a cached response. Returns `None` on miss or expired entry.
-    ///
     /// Two-tier lookup: checks the in-memory hot cache first, then falls
     /// through to SQLite. On a SQLite hit the entry is promoted to hot cache.
     #[allow(clippy::cast_sign_loss)]
@@ -206,6 +195,10 @@ impl ResponseCache {
 
     /// Promote an entry to the in-memory hot cache, evicting the oldest if full.
     fn promote_to_hot(&self, key: &str, response: &str, token_count: u32) {
+        if self.max_entries == 0 {
+            return;
+        }
+
         let mut hot = self.hot_cache.lock();
 
         // If already present, just update (keep original created_at for TTL)
@@ -264,7 +257,7 @@ impl ResponseCache {
         Ok((count as usize, hits as u64, tokens_saved as u64))
     }
 
-    /// Wipe the entire cache (useful for `zeroclaw cache clear`).
+    /// Wipe the entire response cache.
     pub fn clear(&self) -> Result<usize> {
         self.hot_cache.lock().clear();
         let conn = self.conn.lock();
@@ -278,10 +271,102 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn assert_owner_only_sqlite_storage(memory_dir: &Path, db_path: &Path) {
+        assert_eq!(mode(memory_dir), 0o700);
+        assert_eq!(mode(db_path), 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(db_path, suffix);
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o600);
+            }
+        }
+    }
+
     fn temp_cache(ttl_minutes: u32) -> (TempDir, ResponseCache) {
         let tmp = TempDir::new().unwrap();
         let cache = ResponseCache::new(tmp.path(), ttl_minutes, 1000).unwrap();
         (tmp, cache)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_cache_hardens_fresh_storage_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        let db_path = memory_dir.join("response_cache.db");
+
+        let _cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
+
+        assert_owner_only_sqlite_storage(&memory_dir, &db_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_cache_rejects_permissive_storage_and_reopens_after_operator_repair() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::set_permissions(&memory_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let db_path = memory_dir.join("response_cache.db");
+        let seeding_conn = Connection::open(&db_path).unwrap();
+        seeding_conn
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE IF NOT EXISTS response_cache (
+                     prompt_hash TEXT PRIMARY KEY,
+                     model TEXT NOT NULL,
+                     response TEXT NOT NULL,
+                     token_count INTEGER NOT NULL DEFAULT 0,
+                     created_at TEXT NOT NULL,
+                     accessed_at TEXT NOT NULL,
+                     hit_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO response_cache
+                     (prompt_hash, model, response, created_at, accessed_at)
+                 VALUES ('seed', 'local', 'private output', '2026-01-01', '2026-01-01');",
+            )
+            .unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
+            if sidecar.exists() {
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o666)).unwrap();
+            }
+        }
+
+        assert!(ResponseCache::new(tmp.path(), 60, 1000).is_err());
+        assert_eq!(mode(&db_path), 0o666);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
+            if sidecar.exists() {
+                assert_eq!(mode(&sidecar), 0o666);
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
+        assert_owner_only_sqlite_storage(&memory_dir, &db_path);
+        let response: String = cache
+            .conn
+            .lock()
+            .query_row(
+                "SELECT response FROM response_cache WHERE prompt_hash = 'seed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(response, "private output");
     }
 
     #[test]
@@ -497,6 +582,18 @@ mod tests {
 
         let (count, _, _) = cache.stats().unwrap();
         assert_eq!(count, 0, "cache with max_entries=0 should evict everything");
+    }
+
+    #[test]
+    fn max_entries_zero_does_not_return_hot_hit() {
+        let tmp = TempDir::new().unwrap();
+        let cache = ResponseCache::new(tmp.path(), 60, 0).unwrap();
+
+        let key = ResponseCache::cache_key("gpt-4", None, "test");
+        cache.put(&key, "gpt-4", "response", 10).unwrap();
+
+        let result = cache.get(&key).unwrap();
+        assert_eq!(result, None, "zero-capacity cache must not hit hot cache");
     }
 
     #[test]

@@ -1,25 +1,28 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/config.schema.json",
   "productName": "ZeroClaw",
-  "version": "0.7.4",
+  "version": "0.8.5",
   "identifier": "ai.zeroclawlabs.desktop",
   "build": {
-    "devUrl": "http://127.0.0.1:42617/_app/",
-    "frontendDist": "http://127.0.0.1:42617/_app/"
+    "frontendDist": "splash"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
+        "label": "splash",
+        "url": "index.html",
         "title": "ZeroClaw",
-        "width": 1200,
-        "height": 800,
-        "resizable": true,
+        "width": 480,
+        "height": 380,
+        "resizable": false,
         "fullscreen": false,
-        "visible": false
+        "center": true,
+        "visible": true
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; script-src 'self' 'unsafe-inline' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; img-src 'self' http://127.0.0.1:* data:"
+      "csp": "default-src 'self' 'unsafe-inline' http://127.0.0.1:* ws://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* ipc: http://ipc.localhost; script-src 'self' 'unsafe-inline' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; img-src 'self' http://127.0.0.1:* data:"
     }
   },
   "bundle": {

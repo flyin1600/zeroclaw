@@ -1,16 +1,12 @@
-// Pipeline tool: collapses multi-step tool chains into a single inference call.
-//
-// The agent invokes `execute_pipeline` with a JSON payload describing steps,
-// and this tool executes them sequentially (or in parallel) with result
-// interpolation between steps.
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolExecutionContext, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
+
+use crate::tool_search::ToolAccessPolicy;
 
 /// Errors specific to pipeline execution.
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
@@ -42,6 +38,22 @@ pub struct PipelineRequest {
     pub steps: Vec<PipelineStep>,
     #[serde(default)]
     pub parallel: bool,
+    /// What to include in the tool output. Defaults to every step's result.
+    #[serde(default)]
+    pub result: PipelineResultMode,
+}
+
+/// Controls what `execute_pipeline` returns to the caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineResultMode {
+    /// Return every step's result as a JSON array (default; backward compatible).
+    #[default]
+    All,
+    /// Return only the final step's raw output. Use when earlier steps produce
+    /// large intermediate blobs (e.g. base64) that must not flow back into the
+    /// model context.
+    Last,
 }
 
 /// Result of a single pipeline step.
@@ -58,15 +70,27 @@ pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
+    access_policy: Option<ToolAccessPolicy>,
 }
 
 impl PipelineTool {
+    pub const NAME: &'static str = "execute_pipeline";
+
     pub fn new(config: PipelineConfig, tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self::with_access_policy(config, tools, None)
+    }
+
+    pub fn with_access_policy(
+        config: PipelineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+        access_policy: Option<ToolAccessPolicy>,
+    ) -> Self {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
         Self {
             config,
             tools,
             allowed_set,
+            access_policy,
         }
     }
 
@@ -78,15 +102,37 @@ impl PipelineTool {
             .map(|t| t.as_ref())
     }
 
+    fn policy_allows_exact_name(&self, name: &str) -> bool {
+        let Some(policy) = self.access_policy.as_ref() else {
+            return true;
+        };
+        let denied = policy
+            .denied
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == name));
+        let allowed = policy
+            .allowed
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|tool| tool == name));
+        let caller_allowed = policy
+            .caller_allowed
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|tool| tool == name));
+        !denied && allowed && caller_allowed
+    }
+
     /// Validate the pipeline request before execution.
     fn validate(&self, request: &PipelineRequest) -> std::result::Result<(), PipelineError> {
         if request.steps.len() > self.config.max_steps {
             return Err(PipelineError::TooManySteps(self.config.max_steps));
         }
 
-        // Check all tools are on the allowlist before executing any.
+        // Validate the full request before any sequential or parallel step starts.
         for step in &request.steps {
-            if !self.allowed_set.contains(&step.tool) {
+            let globally_allowed = self.allowed_set.contains(&step.tool);
+            let caller_allowed = self.policy_allows_exact_name(&step.tool);
+            let child_exists = self.find_tool(&step.tool).is_some();
+            if !globally_allowed || !caller_allowed || !child_exists {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
         }
@@ -100,6 +146,7 @@ impl PipelineTool {
         steps: &[PipelineStep],
     ) -> std::result::Result<Vec<StepResult>, PipelineError> {
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
+        let context = ToolExecutionContext::current().unwrap_or_default();
 
         for (i, step) in steps.iter().enumerate() {
             let tool = self
@@ -109,14 +156,14 @@ impl PipelineTool {
             // Interpolate previous step results into args.
             let interpolated_args = interpolate_args(&step.args, &results);
 
-            let tool_result =
-                tool.execute(interpolated_args)
-                    .await
-                    .map_err(|e| PipelineError::StepFailed {
-                        index: i,
-                        tool: step.tool.clone(),
-                        message: e.to_string(),
-                    })?;
+            let tool_result = tool
+                .execute_with_context(interpolated_args, &context)
+                .await
+                .map_err(|e| PipelineError::StepFailed {
+                    index: i,
+                    tool: step.tool.clone(),
+                    message: e.to_string(),
+                })?;
 
             if !tool_result.success {
                 return Err(PipelineError::StepFailed {
@@ -124,7 +171,7 @@ impl PipelineTool {
                     tool: step.tool.clone(),
                     message: tool_result
                         .error
-                        .unwrap_or_else(|| tool_result.output.clone()),
+                        .unwrap_or_else(|| tool_result.output.clone().into_string()),
                 });
             }
 
@@ -132,7 +179,7 @@ impl PipelineTool {
                 index: i,
                 tool: step.tool.clone(),
                 success: true,
-                output: tool_result.output,
+                output: tool_result.output.into_string(),
             });
         }
 
@@ -147,6 +194,7 @@ impl PipelineTool {
         use tokio::task::JoinSet;
 
         let mut join_set = JoinSet::new();
+        let context = ToolExecutionContext::current().unwrap_or_default();
 
         for (i, step) in steps.iter().enumerate() {
             let tool = self
@@ -161,8 +209,9 @@ impl PipelineTool {
             let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
 
             if let Some(tool_arc) = tool_arc {
+                let context = context.clone();
                 join_set.spawn(async move {
-                    let result = tool_arc.execute(args).await;
+                    let result = tool_arc.execute_with_context(args, &context).await;
                     (i, tool_name, result)
                 });
             }
@@ -190,7 +239,7 @@ impl PipelineTool {
                     tool: tool_name,
                     message: tool_result
                         .error
-                        .unwrap_or_else(|| tool_result.output.clone()),
+                        .unwrap_or_else(|| tool_result.output.clone().into_string()),
                 });
             }
 
@@ -198,7 +247,7 @@ impl PipelineTool {
                 index,
                 tool: tool_name,
                 success: true,
-                output: tool_result.output,
+                output: tool_result.output.into_string(),
             });
         }
 
@@ -210,14 +259,20 @@ impl PipelineTool {
 
 #[async_trait]
 impl Tool for PipelineTool {
+    fn requires_unrestricted_principal(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &str {
-        "execute_pipeline"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
         "Execute a multi-step tool pipeline in a single call. Steps run sequentially by default \
          with result interpolation (use {{step[N].result}} to reference prior outputs), \
-         or in parallel when 'parallel: true' is set."
+         or in parallel when 'parallel: true' is set. Set 'result: \"last\"' to return only the \
+         final step's output (recommended when an earlier step yields a large blob, e.g. base64, \
+         that should not flow back into the context); the default 'all' returns every step's result."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -246,6 +301,12 @@ impl Tool for PipelineTool {
                     "type": "boolean",
                     "description": "Run steps in parallel (no interpolation). Default: false",
                     "default": false
+                },
+                "result": {
+                    "type": "string",
+                    "enum": ["all", "last"],
+                    "description": "What to return: 'all' (default) = every step's result as JSON; 'last' = only the final step's raw output. Use 'last' to keep large intermediate blobs (e.g. base64) out of the context.",
+                    "default": "all"
                 }
             },
             "required": ["steps"]
@@ -253,14 +314,22 @@ impl Tool for PipelineTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
-        let request: PipelineRequest = serde_json::from_value(args)
-            .map_err(|e| anyhow::anyhow!("Invalid pipeline request: {e}"))?;
+        let request: PipelineRequest = serde_json::from_value(args).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "pipeline: invalid request"
+            );
+            anyhow::Error::msg(format!("Invalid pipeline request: {e}"))
+        })?;
 
         // Validate before execution.
         if let Err(e) = self.validate(&request) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             });
         }
@@ -273,17 +342,23 @@ impl Tool for PipelineTool {
 
         match results {
             Ok(step_results) => {
-                let output = serde_json::to_string_pretty(&step_results)
-                    .unwrap_or_else(|_| "Pipeline completed".to_string());
+                let output = match request.result {
+                    PipelineResultMode::Last => step_results
+                        .last()
+                        .map(|s| s.output.clone())
+                        .unwrap_or_default(),
+                    PipelineResultMode::All => serde_json::to_string_pretty(&step_results)
+                        .unwrap_or_else(|_| "Pipeline completed".to_string()),
+                };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -291,7 +366,6 @@ impl Tool for PipelineTool {
 }
 
 /// Interpolate `{{step[N].result}}` references in tool arguments.
-///
 /// Single-pass replacement: values containing `{{` after substitution are stripped
 /// to prevent injection.
 pub fn interpolate_args(
@@ -377,6 +451,95 @@ fn resolve_template(template: &str, prior_results: &[StepResult]) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ContextAwareStep {
+        tokens: Arc<std::sync::Mutex<Vec<tokio_util::sync::CancellationToken>>>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(ContextAwareStep);
+
+    #[async_trait]
+    impl Tool for ContextAwareStep {
+        fn name(&self) -> &str {
+            "context_step"
+        }
+        fn description(&self) -> &str {
+            "Records a pipeline step's execution context"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            anyhow::bail!("pipeline steps must receive an explicit context")
+        }
+        async fn execute_with_context(
+            &self,
+            _args: serde_json::Value,
+            context: &ToolExecutionContext,
+        ) -> Result<ToolResult> {
+            context
+                .run(async {
+                    let token = ToolExecutionContext::current()
+                        .unwrap()
+                        .cancellation_token()
+                        .unwrap()
+                        .clone();
+                    self.tokens.lock().unwrap().push(token);
+                    Ok(ToolResult::ok("step completed"))
+                })
+                .await
+        }
+    }
+
+    async fn assert_steps_inherit_context(parallel: bool) {
+        let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool = PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 2,
+                allowed_tools: vec!["context_step".into()],
+            },
+            vec![Arc::new(ContextAwareStep {
+                tokens: tokens.clone(),
+            })],
+        );
+        let token = tokio_util::sync::CancellationToken::new();
+        let context = ToolExecutionContext::new(Some(token.clone()));
+        let result = tool
+            .execute_with_context(
+                serde_json::json!({
+                    "steps": [
+                        {"tool": "context_step", "args": {}},
+                        {"tool": "context_step", "args": {}}
+                    ],
+                    "parallel": parallel
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(ToolExecutionContext::current().is_none());
+        let tokens = tokens.lock().unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.iter().all(|token| !token.is_cancelled()));
+        token.cancel();
+        assert!(
+            tokens
+                .iter()
+                .all(tokio_util::sync::CancellationToken::is_cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_context_pipeline_sequential_steps_inherit_token() {
+        assert_steps_inherit_context(false).await;
+    }
+
+    #[tokio::test]
+    async fn tool_context_pipeline_parallel_steps_inherit_token() {
+        assert_steps_inherit_context(true).await;
+    }
 
     // ── Interpolation ──────────────────────────────────────
 
@@ -517,6 +680,7 @@ mod tests {
                 },
             ],
             parallel: false,
+            result: PipelineResultMode::default(),
         };
 
         let err = tool.validate(&request).unwrap_err();
@@ -538,6 +702,7 @@ mod tests {
                 args: serde_json::json!({}),
             }],
             parallel: false,
+            result: PipelineResultMode::default(),
         };
 
         let err = tool.validate(&request).unwrap_err();
@@ -551,7 +716,19 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(
+            config,
+            vec![
+                Arc::new(EchoTool {
+                    name: "shell".into(),
+                    output: String::new(),
+                }),
+                Arc::new(EchoTool {
+                    name: "file_read".into(),
+                    output: String::new(),
+                }),
+            ],
+        );
 
         let request = PipelineRequest {
             steps: vec![
@@ -565,6 +742,7 @@ mod tests {
                 },
             ],
             parallel: false,
+            result: PipelineResultMode::default(),
         };
 
         assert!(tool.validate(&request).is_ok());
@@ -582,9 +760,145 @@ mod tests {
         let request = PipelineRequest {
             steps: vec![],
             parallel: false,
+            result: PipelineResultMode::default(),
         };
 
         assert!(tool.validate(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_step_denied_by_agent_policy() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec![
+                "file_read".to_string(),
+                PipelineTool::NAME.to_string(),
+            ]),
+            ..ToolAccessPolicy::default()
+        };
+        let tool = PipelineTool::with_access_policy(
+            config,
+            vec![Arc::new(EchoTool {
+                name: "shell".into(),
+                output: String::new(),
+            })],
+            Some(policy),
+        );
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "shell".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        let err = tool.validate(&request).unwrap_err();
+        assert!(matches!(err, PipelineError::UnknownTool(ref name) if name == "shell"));
+    }
+
+    #[test]
+    fn validate_allows_intersection_of_pipeline_and_agent_policy() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec![
+                "file_read".to_string(),
+                PipelineTool::NAME.to_string(),
+            ]),
+            ..ToolAccessPolicy::default()
+        };
+        let tool = PipelineTool::with_access_policy(
+            config,
+            vec![Arc::new(EchoTool {
+                name: "file_read".into(),
+                output: String::new(),
+            })],
+            Some(policy),
+        );
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "file_read".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        assert!(tool.validate(&request).is_ok());
+    }
+
+    #[test]
+    fn validate_uses_exact_names_for_every_policy_ceiling() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "plugin__danger".to_string()],
+        };
+        let cases = [
+            (
+                "namespaced plugin is not MCP-auto-admitted",
+                "plugin__danger",
+                ToolAccessPolicy {
+                    allowed: Some(vec![PipelineTool::NAME.to_string()]),
+                    ..ToolAccessPolicy::default()
+                },
+            ),
+            (
+                "denylist wins",
+                "shell",
+                ToolAccessPolicy {
+                    denied: Some(vec!["shell".to_string()]),
+                    ..ToolAccessPolicy::default()
+                },
+            ),
+            (
+                "caller allowlist narrows",
+                "shell",
+                ToolAccessPolicy {
+                    caller_allowed: Some(vec![PipelineTool::NAME.to_string()]),
+                    ..ToolAccessPolicy::default()
+                },
+            ),
+            (
+                "explicit empty allowlist denies all",
+                "shell",
+                ToolAccessPolicy {
+                    allowed: Some(Vec::new()),
+                    ..ToolAccessPolicy::default()
+                },
+            ),
+        ];
+
+        for (case, step, policy) in cases {
+            let tool = PipelineTool::with_access_policy(
+                config.clone(),
+                vec![Arc::new(EchoTool {
+                    name: step.to_string(),
+                    output: String::new(),
+                })],
+                Some(policy),
+            );
+            let request = PipelineRequest {
+                steps: vec![PipelineStep {
+                    tool: step.to_string(),
+                    args: serde_json::json!({}),
+                }],
+                parallel: false,
+                result: PipelineResultMode::default(),
+            };
+            assert!(
+                matches!(tool.validate(&request), Err(PipelineError::UnknownTool(_))),
+                "{case}"
+            );
+        }
     }
 
     // ── Template resolution ────────────────────────────────
@@ -613,5 +927,82 @@ mod tests {
     #[test]
     fn resolve_out_of_range_index() {
         assert_eq!(resolve_template("step[5].result", &[]), None);
+    }
+
+    // ── Result mode ────────────────────────────────────────
+
+    struct EchoTool {
+        name: String,
+        output: String,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(EchoTool);
+
+    #[async_trait::async_trait]
+    impl Tool for EchoTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "echo"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: self.output.clone().into(),
+                error: None,
+            })
+        }
+    }
+
+    fn echo_pipeline() -> PipelineTool {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["a".to_string(), "b".to_string()],
+        };
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(EchoTool {
+                name: "a".into(),
+                output: "FIRST_BIG_BLOB".into(),
+            }),
+            Arc::new(EchoTool {
+                name: "b".into(),
+                output: "final answer".into(),
+            }),
+        ];
+        PipelineTool::new(config, tools)
+    }
+
+    #[tokio::test]
+    async fn result_last_returns_only_final_output() {
+        let args = serde_json::json!({
+            "steps": [
+                {"tool": "a", "args": {}},
+                {"tool": "b", "args": {}}
+            ],
+            "result": "last"
+        });
+        let res = echo_pipeline().execute(args).await.unwrap();
+        assert!(res.success);
+        assert_eq!(res.output, "final answer");
+        assert!(!res.output.contains("FIRST_BIG_BLOB"));
+    }
+
+    #[tokio::test]
+    async fn result_all_is_default_and_includes_every_step() {
+        let args = serde_json::json!({
+            "steps": [
+                {"tool": "a", "args": {}},
+                {"tool": "b", "args": {}}
+            ]
+        });
+        let res = echo_pipeline().execute(args).await.unwrap();
+        assert!(res.success);
+        assert!(res.output.contains("FIRST_BIG_BLOB"));
+        assert!(res.output.contains("final answer"));
     }
 }

@@ -2,92 +2,146 @@
 
 Three ways to add a provider ZeroClaw doesn't ship with:
 
-1. **Point `openai-compatible` at the endpoint.** Works for ~80% of cases.
-2. **Use a first-class local-server adapter** (`llamacpp`, `sglang`, `vllm`). Thin wrappers with sensible defaults.
-3. **Implement the `Provider` trait** in Rust. For anything that's not OpenAI-compatible.
+1. **Use the `custom` slot.** For any OpenAI-compatible endpoint not covered by an existing canonical slot.
+2. **Use the first-class local-server slots** (`lmstudio`, `llamacpp`, `sglang`, `vllm`, `osaurus`, `litellm`). Thin wrappers with sensible defaults.
+3. **Implement the `ModelProvider` trait** in Rust. For anything that's not OpenAI-compatible.
 
-## OpenAI-compatible endpoint (easiest)
+## OpenAI-compatible endpoint: use the `custom` slot
 
-If the service speaks OpenAI chat-completions, this is a config-only change:
+If the service speaks OpenAI chat-completions, this is a config-only change. The `custom` slot requires `uri` (the family's endpoint enum has no default); reference it from an agent's `model_provider`.
 
-```toml
-[providers.models."custom:https://my-gateway.example.com"]
-kind = "openai-compatible"
-base_url = "https://my-gateway.example.com"
-model = "my-model-id"
-api_key = "..."                    # omit if the endpoint needs no auth
-```
+This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use: `custom` is the catch-all for endpoints not represented by a vendor slot.
 
-Then reference it:
+For a gateway that cannot accept image-bearing tool results, omit those payloads while retaining the surrounding tool text. Tool images are declared in an `attachments` array on the native tool-result carrier, so omitting them never edits the result text. This policy governs the native `role = "tool"` carrier's `attachments` array only; prompt-mode tool results (the count-line carrier delivered in a user message) resolve their declared images through a separate path and are unaffected by the setting. To opt in:
 
 ```toml
-default_model = "custom:https://my-gateway.example.com"
+[providers.models.custom.gateway]
+uri = "https://gateway.example.com/v1"
+model = "my-model"
+tool_result_image_policy = "omit"
 ```
 
-This is the same implementation used for Groq, Mistral, xAI, and every other OpenAI-compat provider in the [catalog](./catalog.md).
+### Connection warmup
+
+OpenAI-compatible providers warm the connection with `GET {base_url}/models`, using the same authentication and HTTP client settings as model listing.
+The probe consumes the response body and accepts non-success HTTP status codes, so a service without a models endpoint can still start.
+Chat-completion requests continue to use POST; warmup does not invoke inference or require a model catalog.
 
 ## First-class local-inference servers
 
-ZeroClaw ships tight adapters for three popular local-inference stacks. They're `openai-compatible` under the hood but with defaults and quality-of-life tuning pre-applied.
+ZeroClaw ships canonical slots for popular local-inference stacks. They're all OpenAI-compatible under the hood but with default `uri` values pre-applied so you can usually omit `uri` entirely.
 
-### llama.cpp
+### llama.cpp: slot `llamacpp`
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 llama-server -hf ggml-org/gpt-oss-20b-GGUF --jinja -c 133000 --host 127.0.0.1 --port 8033
 ```
 
-```toml
-[providers.models.llama]
-kind = "llamacpp"                          # alias: "llama.cpp"
-base_url = "http://127.0.0.1:8033/v1"      # omit to use default http://localhost:8080/v1
-model = "ggml-org/gpt-oss-20b-GGUF"
-# api_key only required if llama-server was started with --api-key
-```
+</div>
 
-### SGLang
+**Optional fields** apply to any compat-slot family (including `llamacpp`). The
+full set, derived from the schema:
 
-```bash
+{{#config-fields providers.models.custom}}
+
+**Controlling thinking mode** varies by model family. `think = false` sets the top-level `enable_thinking` field in the request. Some models (e.g. Qwen3) read this flag from the Jinja template via `chat_template_kwargs` instead:
+
+Other model families use different template variable names, check your model's chat template and set the appropriate key under `chat_template_kwargs`.
+
+### SGLang: slot `sglang`
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct --port 30000
 ```
 
-```toml
-[providers.models.sglang]
-kind = "sglang"
-base_url = "http://localhost:30000/v1"     # default
-model = "meta-llama/Llama-3.1-8B-Instruct"
-```
+</div>
 
-### vLLM
+### vLLM: slot `vllm`
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
+</div>
+
+### LM Studio, Osaurus, LiteLLM
+
+Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern, see the [catalog](./catalog.md).
+
+## Wire protocol: `wire_api = "responses"`
+
+New **OpenAI** provider slots that are *written to config* (`providers.models.openai.<alias>`, as created by `zeroclaw quickstart` or the gateway/config UI) default to `wire_api = "responses"` because OpenAI's recent GPT models use `POST /v1/responses` as the primary wire. Other bring-your-own-endpoint slots (`custom`, `llamacpp`, and OpenAI-compatible vendors) still default to the chat-completions wire; an endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
+
+When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProvider` (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Set `"chat_completions"` to force the legacy wire. Two cases keep chat-completions at runtime for backward compatibility, so no existing setup changes wire on upgrade:
+
+- A **persisted** `providers.models.openai.<alias>` entry that omits `wire_api` deserializes as unset and stays on chat-completions.
+- A **bare** `model_provider = "openai"` reference (or a dotted ref to a nonexistent alias) has no config entry to read; it is built from the family fallback and stays on chat-completions. The responses default applies only when a slot is actually written to config.
+
+`wire_api` is honored by the bring-your-own-endpoint families where the wire is operator-configurable: `openai`, `llamacpp`, and `custom` (plus the generic openai-compatible path). Branded vendor slots (`groq`, `mistral`, `deepseek`, …) have a fixed wire protocol and ignore the field, with one exception: `opencode` honors `wire_api = "responses"` because OpenCode Zen serves both wires. With no `uri` override, the OpenCode responses route targets `https://opencode.ai/zen/v1/responses`:
+
 ```toml
-[providers.models.vllm]
-kind = "vllm"
-base_url = "http://localhost:8000/v1"      # default
-model = "meta-llama/Llama-3.1-8B-Instruct"
+[providers.models.opencode.default]
+model    = "big-pickle"
+wire_api = "responses"
 ```
+
+The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares `wire_api = "responses"` reaches the endpoint over the responses wire.
+
+### OpenCode session affinity
+
+Every inference request to an `opencode.ai` host carries an `x-opencode-session` header on both wires, streaming and non-streaming. OpenCode uses it to pin one conversation's turns to the same upstream backend, which keeps that backend's prompt cache warm across turns; upstream also lists it under the guidance for keeping an account from being flagged, and some OpenCode Go models reject header-less requests outright. Model-catalog and warmup requests (`GET /models`) do not carry the header: they are not part of a conversation, so there is no backend to pin.
+
+The value is an opaque 128-bit hex token derived from the active conversation scope, so each conversation pins to its own backend and the same conversation keeps its backend across a daemon restart. The conversation's session key is **hashed, never sent**: session keys embed channel and user identifiers, and forwarding one verbatim would hand a third-party relay a per-user identifier. Inference requests made outside any conversation share one process-stable token instead.
+
+Nothing needs configuring. To pin the value yourself, for instance to share one affinity scope across replicas, set it explicitly and ZeroClaw leaves it alone:
+
+```toml
+[providers.models.opencode.default]
+model = "big-pickle"
+
+[providers.models.opencode.default.extra_headers]
+x-opencode-session = "my-fixed-scope"
+```
+
+Hosts other than `opencode.ai` and its subdomains never receive the header. To keep it that way, OpenCode requests follow a redirect only within the same host: a redirect to a different host is not followed, and the request fails with that redirect status.
 
 ## Validation
 
-Regardless of which approach:
+Regardless of approach:
 
-```bash
-zeroclaw models refresh --provider <name>   # list models the endpoint advertises
-zeroclaw agent -m "hello"                    # smoke-test with a one-shot message
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+zeroclaw config list                          # loads config; any validation failures print to stderr
+zeroclaw models refresh --model-provider <type>.<alias>   # list models the endpoint advertises
+zeroclaw agent -a <alias> -m "hello"          # smoke-test against the agent at `[agents.<alias>]`
 ```
 
-## Implementing a new `Provider` trait
+</div>
 
-If the endpoint isn't OpenAI-compatible and isn't one of the first-class local adapters, you need code.
+## Implementing a new `ModelProvider` trait
 
-The trait lives in `crates/zeroclaw-api/src/provider.rs`:
+If the endpoint isn't OpenAI-compatible and isn't one of the local-server slots, you need code.
+
+The trait lives in `crates/zeroclaw-api/src/model_provider.rs`:
 
 ```rust
 #[async_trait]
-pub trait Provider: Send + Sync {
+pub trait ModelProvider: Send + Sync {
     fn name(&self) -> &str;
     fn supports_streaming(&self) -> bool { true }
     fn supports_streaming_tool_events(&self) -> bool { false }
@@ -103,14 +157,26 @@ pub trait Provider: Send + Sync {
 
 Implementation pattern:
 
-1. Add a file to `crates/zeroclaw-providers/src/myprovider.rs`
-2. Implement `Provider` — translate `Vec<Message>` to the wire format, stream the response, emit `StreamEvent` values
-3. Register via the factory in `lib.rs`:
+1. Define the typed config in `crates/zeroclaw-config/src/schema.rs`:
    ```rust
-   factory.register("myprovider", |cfg| MyProvider::new(cfg).boxed());
+   pub struct MyProviderModelProviderConfig {
+       #[serde(flatten)]
+       pub base: ModelProviderConfig,
+       pub endpoint: MyProviderEndpoint,
+       // family-specific fields
+   }
+
+   pub enum MyProviderEndpoint { Default }
+   impl ModelEndpoint for MyProviderEndpoint {
+       fn uri(&self) -> &'static str {
+           match self { Self::Default => "https://my-provider.example.com/v1" }
+       }
+   }
    ```
-4. Add a feature flag in `Cargo.toml` if the provider pulls heavy deps
-5. Update `[providers.models.<name>] kind = "myprovider"` parser in the config schema
+2. Add the slot to `for_each_model_provider_slot!` in `crates/zeroclaw-config/src/providers.rs`. Every helper picks up the new slot automatically.
+3. Add the runtime impl in `crates/zeroclaw-providers/src/myprovider.rs`. Translate `Vec<Message>` to the wire format, stream the response, emit `StreamEvent` values.
+4. Wire the factory branch in `crates/zeroclaw-providers/src/lib.rs::create_provider_with_url_and_options`.
+5. Add a feature flag in `Cargo.toml` if the provider pulls heavy deps.
 
 See `anthropic.rs` as a reference for a provider with a fully custom wire format. See `compatible.rs` for the SSE-streaming OpenAI-compat pattern.
 
@@ -118,28 +184,42 @@ See `anthropic.rs` as a reference for a provider with a fully custom wire format
 
 ### Authentication errors
 
-- Verify the API key matches the endpoint (many providers use key prefixes — `sk-`, `gsk_`, `sk-ant-`)
-- Check the `base_url` includes the scheme (`http://` / `https://`) and the `/v1` path if the endpoint expects it
-- Endpoints behind a VPN or proxy? Confirm routing from the ZeroClaw host
+- Verify the API key matches the endpoint (many vendors use key prefixes: `sk-`, `gsk_`, `sk-ant-`).
+- Check that `uri` includes the scheme (`http://` / `https://`) and the `/v1` path if the endpoint expects it.
+- Endpoints behind a VPN or proxy? Confirm routing from the ZeroClaw host.
 
 ### Model not found
 
 - List what the endpoint advertises:
-  ```bash
-  curl -sS "$BASE_URL/models" -H "Authorization: Bearer $API_KEY" | jq
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+  curl -sS "$URI/models" -H "Authorization: Bearer $API_KEY" | jq
   ```
-- If the endpoint doesn't implement `/models`, send a direct chat request and read the error — most endpoints return the expected model family in the error body
-- Check that the endpoint exposes the model you're asking for; gateway services often expose only a subset
+
+</div>
+- If the endpoint doesn't implement `/models`, send a direct chat request and read the error, most endpoints return the expected model family in the error body.
+- Gateway services often expose only a subset of upstream models.
 
 ### Connection issues
 
-- `curl -I $BASE_URL` — does it respond?
-- Firewall, proxy, egress rules? VPS providers sometimes block outbound high ports
-- Provider status page if it's a hosted service
+- `curl -I $URI`, does it respond?
+- Firewall, proxy, egress rules? VPS providers sometimes block outbound high ports.
+- Vendor status page if it's a hosted service.
+
+### Gateway rejects `temperature`
+
+Some gateways (e.g. a LiteLLM proxy fronting `claude-opus-4-7`) return an error
+when a `temperature` field is present at all. ZeroClaw honors the `Option`
+contract: if you leave `temperature` unset in config, the field is **omitted**
+from the request body entirely and the backend picks its own default. Only set
+`temperature` explicitly when the endpoint accepts it.
 
 ## See also
 
-- [Overview](./overview.md) — provider model and how routing works
-- [Configuration](./configuration.md) — full `[providers.*]` schema
-- [Catalog](./catalog.md) — every ZeroClaw-provided provider
-- [Developing → Plugin protocol](../developing/plugin-protocol.md) — if a plugin works better than a first-class crate
+- [Overview](./overview.md): provider model and how per-agent dispatch works
+- [Configuration](./configuration.md): full `[providers.*]` schema, Azure typed config, regional and OAuth variants
+- [Catalog](./catalog.md): every canonical slot with a worked TOML example
+- [Developing → Plugin protocol](../developing/plugin-protocol.md): if a plugin works better than a first-class crate

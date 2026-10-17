@@ -7,7 +7,6 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
-use tracing::{info, warn};
 use zeroclaw_config::schema::HeartbeatConfig;
 
 // ── Structured task types ────────────────────────────────────────
@@ -73,7 +72,6 @@ impl fmt::Display for HeartbeatTask {
 // ── Health Metrics ───────────────────────────────────────────────
 
 /// Live health metrics for the heartbeat subsystem.
-///
 /// Shared via `Arc<ParkingMutex<>>` between the heartbeat worker,
 /// deadman watcher, and API consumers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,12 +133,6 @@ impl HeartbeatMetrics {
     }
 }
 
-/// Compute the adaptive interval for the next heartbeat tick.
-///
-/// Strategy:
-/// - On failures: exponential back-off `base * 2^failures` capped at `max_interval`.
-/// - When high-priority tasks are present: use `min_interval` for faster reaction.
-/// - Otherwise: use `base_interval`.
 pub fn compute_adaptive_interval(
     base_minutes: u32,
     min_minutes: u32,
@@ -195,12 +187,20 @@ impl HeartbeatEngine {
     /// Start the heartbeat loop (runs until cancelled)
     pub async fn run(&self) -> Result<()> {
         if !self.config.enabled {
-            info!("Heartbeat disabled");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "Heartbeat disabled"
+            );
             return Ok(());
         }
 
         let interval_mins = self.config.interval_minutes.max(1);
-        info!("💓 Heartbeat started: every {} minutes", interval_mins);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("💓 Heartbeat started: every {} minutes", interval_mins)
+        );
 
         let mut interval = time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
 
@@ -211,11 +211,23 @@ impl HeartbeatEngine {
             match self.tick().await {
                 Ok(tasks) => {
                     if tasks > 0 {
-                        info!("💓 Heartbeat: processed {} tasks", tasks);
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            &format!("💓 Heartbeat: processed {} tasks", tasks)
+                        );
                     }
                 }
                 Err(e) => {
-                    warn!("💓 Heartbeat error: {}", e);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("💓 Heartbeat error: {}", e)
+                    );
                     self.observer.record_event(&ObserverEvent::Error {
                         component: "heartbeat".into(),
                         message: e.to_string(),
@@ -253,17 +265,6 @@ impl HeartbeatEngine {
         Ok(tasks)
     }
 
-    /// Parse tasks from HEARTBEAT.md with structured metadata support.
-    ///
-    /// Supports both legacy flat format and new structured format:
-    ///
-    /// Legacy:
-    ///   `- Check email`  →  medium priority, active status
-    ///
-    /// Structured:
-    ///   `- [high] Check email`           →  high priority, active
-    ///   `- [low|paused] Review old PRs`  →  low priority, paused
-    ///   `- [completed] Old task`         →  medium priority, completed
     fn parse_tasks(content: &str) -> Vec<HeartbeatTask> {
         content
             .lines()
@@ -279,7 +280,6 @@ impl HeartbeatEngine {
     }
 
     /// Parse a single task line into a structured `HeartbeatTask`.
-    ///
     /// Format: `[priority|status] task text` or just `task text`.
     fn parse_task_line(text: &str) -> HeartbeatTask {
         if let Some(rest) = text.strip_prefix('[')
@@ -355,7 +355,6 @@ impl HeartbeatEngine {
     }
 
     /// Parse the Phase 1 LLM decision response.
-    ///
     /// Returns indices of tasks to run, or empty vec if skipped.
     pub fn parse_decision_response(response: &str, task_count: usize) -> Vec<usize> {
         let trimmed = response.trim().to_ascii_lowercase();

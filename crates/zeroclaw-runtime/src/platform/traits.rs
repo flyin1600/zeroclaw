@@ -15,10 +15,6 @@ mod tests {
             "dummy-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -31,13 +27,34 @@ mod tests {
             true
         }
 
+        fn shell_dialect(&self) -> ShellDialect {
+            #[cfg(windows)]
+            {
+                ShellDialect::WindowsCmd
+            }
+            #[cfg(not(windows))]
+            {
+                ShellDialect::Posix
+            }
+        }
+
         fn build_shell_command(
             &self,
             command: &str,
             workspace_dir: &Path,
         ) -> anyhow::Result<tokio::process::Command> {
+            #[cfg(windows)]
+            let mut cmd = {
+                let mut cmd = tokio::process::Command::new("cmd");
+                cmd.args(["/C", "echo", command]);
+                cmd
+            };
+
+            #[cfg(not(windows))]
             let mut cmd = tokio::process::Command::new("echo");
+            #[cfg(not(windows))]
             cmd.arg(command);
+
             cmd.current_dir(workspace_dir);
             Ok(cmd)
         }

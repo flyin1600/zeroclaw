@@ -13,30 +13,100 @@ pub use ngrok::NgrokTunnel;
 pub use none::NoneTunnel;
 pub use openvpn::OpenVpnTunnel;
 pub use pinggy::PinggyTunnel;
-pub use tailscale::TailscaleTunnel;
+pub use tailscale::{
+    TailnetSans, TailscaleSelf, TailscaleTunnel, is_tailscale_ip, parse_tailscale_self,
+    query_tailscale_self, tailnet_sans_from_status, tailscale_server_sans,
+};
 
 use anyhow::{Result, bail};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use zeroclaw_config::schema::{TailscaleTunnelConfig, TunnelConfig};
+use zeroclaw_config::schema::{Config, TailscaleTunnelConfig, TunnelConfig};
+
+// ── Daemon TCP services ──────────────────────────────────────────
+
+/// A local daemon listener that terminates its OWN TLS (the mutually
+/// authenticated WSS RPC plane, the server-authenticated enrollment endpoint).
+///
+/// A tunnel must publish these as raw TCP passthrough: terminating TLS at the
+/// tunnel would strip the client certificate the WSS plane requires and
+/// replace the daemon certificate that enrollment's short-auth-string binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpService {
+    /// Stable service label for logs and endpoint display (`wss`, `enroll`).
+    pub name: &'static str,
+    /// URL scheme a client uses to reach the service (`wss`, `https`).
+    pub scheme: &'static str,
+    /// Local address the tunnel forwards to.
+    pub target: SocketAddr,
+}
+
+/// A [`TcpService`] the tunnel actually published, with the endpoint clients use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedTcpService {
+    pub service: TcpService,
+    pub endpoint: String,
+}
+
+/// Resolve the daemon's enabled self-TLS listeners from live config.
+///
+/// Enrollment is only listed when the daemon actually runs it: alongside WSS
+/// (it refuses to start without `[wss]`) and not under a bring-your-own
+/// client CA, where it holds no signing key and parks the endpoint. A bind address that does not parse as an IP is
+/// skipped: the listener itself refuses such a bind, so there is nothing to
+/// forward to.
+pub fn daemon_tcp_services(config: &Config) -> Vec<TcpService> {
+    let mut services = Vec::new();
+    if !config.wss.enabled {
+        return services;
+    }
+    if let Some(target) = local_forward_target(&config.wss.bind, config.wss.port) {
+        services.push(TcpService {
+            name: "wss",
+            scheme: "wss",
+            target,
+        });
+    }
+    if config.enroll.enabled
+        && config.wss.external_client_ca().is_none()
+        && let Some(target) = local_forward_target(&config.enroll.bind, config.enroll.port)
+    {
+        services.push(TcpService {
+            name: "enroll",
+            scheme: "https",
+            target,
+        });
+    }
+    services
+}
+
+/// The address a same-host forwarder should dial for a listener bound to
+/// `bind:port`. A wildcard bind is reached on the loopback of its family;
+/// a specific bind is reached on that address.
+fn local_forward_target(bind: &str, port: u16) -> Option<SocketAddr> {
+    let ip: IpAddr = bind.trim().parse().ok()?;
+    let ip = match ip {
+        IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        other => other,
+    };
+    Some(SocketAddr::new(ip, port))
+}
 
 // ── Tunnel trait ─────────────────────────────────────────────────
 
-/// Agnostic tunnel abstraction — bring your own tunnel provider.
-///
-/// Implementations wrap an external tunnel binary (cloudflared, tailscale,
-/// ngrok, etc.) or a custom command. The gateway calls `start()` after
-/// binding its local port and `stop()` on shutdown.
 #[async_trait::async_trait]
 pub trait Tunnel: Send + Sync {
-    /// Human-readable provider name (e.g. "cloudflare", "tailscale")
+    /// Human-readable model_provider name (e.g. "cloudflare", "tailscale")
     fn name(&self) -> &str;
 
     /// Start the tunnel, exposing `local_host:local_port` externally.
     /// Returns the public URL on success.
     async fn start(&self, local_host: &str, local_port: u16) -> Result<String>;
 
-    /// Stop the tunnel process gracefully.
+    /// Stop the tunnel, ending the processes it started and withdrawing what it
+    /// published. The gateway calls this when it shuts down.
     async fn stop(&self) -> Result<()>;
 
     /// Check if the tunnel is still alive.
@@ -44,6 +114,17 @@ pub trait Tunnel: Send + Sync {
 
     /// Return the public URL if the tunnel is running.
     fn public_url(&self) -> Option<String>;
+
+    /// Publish daemon listeners that terminate their own TLS as raw TCP
+    /// passthrough, after `start`. Returns only the services actually
+    /// published. Providers without raw TCP passthrough publish nothing,
+    /// which keeps those listeners at their configured bind.
+    async fn publish_tcp_services(
+        &self,
+        _services: &[TcpService],
+    ) -> Result<Vec<PublishedTcpService>> {
+        Ok(Vec::new())
+    }
 }
 
 // ── Shared child-process handle ──────────────────────────────────
@@ -73,16 +154,25 @@ pub async fn kill_shared(proc: &SharedProcess) -> Result<()> {
 
 // ── Factory ──────────────────────────────────────────────────────
 
-/// Create a tunnel from config. Returns `None` for provider "none".
+/// Create a tunnel from config. Returns `None` for tunnel_provider "none".
 pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
-    match config.provider.as_str() {
+    match config.tunnel_provider.as_str() {
         "none" | "" => Ok(None),
 
         "cloudflare" => {
             let cf = config.cloudflare.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tunnel.provider = \"cloudflare\" but [tunnel.cloudflare] section is missing"
+                {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"tunnel_provider": "cloudflare"})),
+                    "tunnel create refused: provider selected but config block missing"
+                );
+                anyhow::Error::msg(
+                    "tunnel.tunnel_provider = \"cloudflare\" but [tunnel.cloudflare] section is missing"
                 )
+            }
             })?;
             Ok(Some(Box::new(CloudflareTunnel::new(cf.token.clone()))))
         }
@@ -100,7 +190,16 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 
         "ngrok" => {
             let ng = config.ngrok.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("tunnel.provider = \"ngrok\" but [tunnel.ngrok] section is missing")
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"tunnel_provider": "ngrok"})),
+                    "tunnel create refused: provider selected but config block missing"
+                );
+                anyhow::Error::msg(
+                    "tunnel.tunnel_provider = \"ngrok\" but [tunnel.ngrok] section is missing",
+                )
             })?;
             Ok(Some(Box::new(NgrokTunnel::new(
                 ng.auth_token.clone(),
@@ -110,8 +209,15 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 
         "openvpn" => {
             let ov = config.openvpn.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tunnel.provider = \"openvpn\" but [tunnel.openvpn] section is missing"
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"tunnel_provider": "openvpn"})),
+                    "tunnel create refused: provider selected but config block missing"
+                );
+                anyhow::Error::msg(
+                    "tunnel.tunnel_provider = \"openvpn\" but [tunnel.openvpn] section is missing",
                 )
             })?;
             Ok(Some(Box::new(OpenVpnTunnel::new(
@@ -125,8 +231,15 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 
         "custom" => {
             let cu = config.custom.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tunnel.provider = \"custom\" but [tunnel.custom] section is missing"
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"tunnel_provider": "custom"})),
+                    "tunnel create refused: provider selected but config block missing"
+                );
+                anyhow::Error::msg(
+                    "tunnel.tunnel_provider = \"custom\" but [tunnel.custom] section is missing",
                 )
             })?;
             Ok(Some(Box::new(CustomTunnel::new(
@@ -138,8 +251,15 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
 
         "pinggy" => {
             let pg = config.pinggy.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "tunnel.provider = \"pinggy\" but [tunnel.pinggy] section is missing"
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"tunnel_provider": "pinggy"})),
+                    "tunnel create refused: provider selected but config block missing"
+                );
+                anyhow::Error::msg(
+                    "tunnel.tunnel_provider = \"pinggy\" but [tunnel.pinggy] section is missing",
                 )
             })?;
             Ok(Some(Box::new(PinggyTunnel::new(
@@ -149,7 +269,7 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
         }
 
         other => bail!(
-            "Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, openvpn, pinggy, custom"
+            "Unknown tunnel_provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, openvpn, pinggy, custom"
         ),
     }
 }
@@ -186,7 +306,7 @@ mod tests {
     #[test]
     fn factory_empty_string_returns_none() {
         let cfg = TunnelConfig {
-            provider: String::new(),
+            tunnel_provider: String::new(),
             ..TunnelConfig::default()
         };
         let t = create_tunnel(&cfg).unwrap();
@@ -196,16 +316,16 @@ mod tests {
     #[test]
     fn factory_unknown_provider_errors() {
         let cfg = TunnelConfig {
-            provider: "wireguard".into(),
+            tunnel_provider: "wireguard".into(),
             ..TunnelConfig::default()
         };
-        assert_tunnel_err(&cfg, "Unknown tunnel provider");
+        assert_tunnel_err(&cfg, "Unknown tunnel_provider");
     }
 
     #[test]
     fn factory_cloudflare_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "cloudflare".into(),
+            tunnel_provider: "cloudflare".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.cloudflare]");
@@ -214,7 +334,7 @@ mod tests {
     #[test]
     fn factory_cloudflare_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "cloudflare".into(),
+            tunnel_provider: "cloudflare".into(),
             cloudflare: Some(CloudflareTunnelConfig {
                 token: "test-token".into(),
             }),
@@ -228,7 +348,7 @@ mod tests {
     #[test]
     fn factory_tailscale_defaults_ok() {
         let cfg = TunnelConfig {
-            provider: "tailscale".into(),
+            tunnel_provider: "tailscale".into(),
             ..TunnelConfig::default()
         };
         let t = create_tunnel(&cfg).unwrap();
@@ -239,7 +359,7 @@ mod tests {
     #[test]
     fn factory_ngrok_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "ngrok".into(),
+            tunnel_provider: "ngrok".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.ngrok]");
@@ -248,7 +368,7 @@ mod tests {
     #[test]
     fn factory_ngrok_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "ngrok".into(),
+            tunnel_provider: "ngrok".into(),
             ngrok: Some(NgrokTunnelConfig {
                 auth_token: "tok".into(),
                 domain: None,
@@ -263,7 +383,7 @@ mod tests {
     #[test]
     fn factory_custom_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "custom".into(),
+            tunnel_provider: "custom".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.custom]");
@@ -272,7 +392,7 @@ mod tests {
     #[test]
     fn factory_custom_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "custom".into(),
+            tunnel_provider: "custom".into(),
             custom: Some(CustomTunnelConfig {
                 start_command: "echo tunnel".into(),
                 health_url: None,
@@ -288,7 +408,7 @@ mod tests {
     #[test]
     fn factory_pinggy_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "pinggy".into(),
+            tunnel_provider: "pinggy".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.pinggy]");
@@ -297,7 +417,7 @@ mod tests {
     #[test]
     fn factory_pinggy_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "pinggy".into(),
+            tunnel_provider: "pinggy".into(),
             pinggy: Some(PinggyTunnelConfig {
                 token: Some("tok".into()),
                 region: None,
@@ -377,7 +497,7 @@ mod tests {
     #[test]
     fn factory_openvpn_missing_config_errors() {
         let cfg = TunnelConfig {
-            provider: "openvpn".into(),
+            tunnel_provider: "openvpn".into(),
             ..TunnelConfig::default()
         };
         assert_tunnel_err(&cfg, "[tunnel.openvpn]");
@@ -386,7 +506,7 @@ mod tests {
     #[test]
     fn factory_openvpn_with_config_ok() {
         let cfg = TunnelConfig {
-            provider: "openvpn".into(),
+            tunnel_provider: "openvpn".into(),
             openvpn: Some(OpenVpnTunnelConfig {
                 config_file: "client.ovpn".into(),
                 auth_file: None,
@@ -489,5 +609,133 @@ mod tests {
     async fn pinggy_health_false_before_start() {
         let tunnel = PinggyTunnel::new(None, None);
         assert!(!tunnel.health_check().await);
+    }
+
+    #[test]
+    fn local_forward_target_maps_wildcards_to_loopback() {
+        assert_eq!(
+            local_forward_target("0.0.0.0", 9781),
+            Some("127.0.0.1:9781".parse().unwrap())
+        );
+        assert_eq!(
+            local_forward_target("::", 9781),
+            Some("[::1]:9781".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn local_forward_target_keeps_specific_binds() {
+        assert_eq!(
+            local_forward_target("127.0.0.1", 9782),
+            Some("127.0.0.1:9782".parse().unwrap())
+        );
+        assert_eq!(
+            local_forward_target(" 192.168.2.10 ", 9782),
+            Some("192.168.2.10:9782".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn local_forward_target_rejects_non_ip_binds() {
+        assert_eq!(local_forward_target("localhost", 9781), None);
+        assert_eq!(local_forward_target("", 9781), None);
+    }
+
+    #[test]
+    fn daemon_tcp_services_empty_by_default() {
+        assert!(daemon_tcp_services(&Config::default()).is_empty());
+    }
+
+    #[test]
+    fn daemon_tcp_services_lists_wss_and_enroll_from_config() {
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        config.wss.bind = "127.0.0.1".into();
+        config.wss.port = 19781;
+        config.enroll.enabled = true;
+        config.enroll.bind = "0.0.0.0".into();
+        config.enroll.port = 19782;
+
+        assert_eq!(
+            daemon_tcp_services(&config),
+            vec![
+                TcpService {
+                    name: "wss",
+                    scheme: "wss",
+                    target: "127.0.0.1:19781".parse().unwrap(),
+                },
+                TcpService {
+                    name: "enroll",
+                    scheme: "https",
+                    target: "127.0.0.1:19782".parse().unwrap(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn daemon_tcp_services_skips_enroll_without_wss() {
+        // The daemon refuses to run enrollment without [wss]; there is no
+        // listener to forward to.
+        let mut config = Config::default();
+        config.enroll.enabled = true;
+        assert!(daemon_tcp_services(&config).is_empty());
+    }
+
+    #[test]
+    fn daemon_tcp_services_skips_enroll_under_external_client_ca() {
+        // With a bring-your-own client CA the daemon parks enrollment, so it
+        // must not be published or announced.
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        config.enroll.enabled = true;
+        // `EnrollConfig::default()` has an empty bind (serde supplies the real
+        // default); set it so enrollment is only excluded by the CA rule.
+        config.enroll.bind = "127.0.0.1".into();
+        config.enroll.port = 9782;
+        assert_eq!(
+            daemon_tcp_services(&config).len(),
+            2,
+            "precondition: enrollment is publishable without an external CA"
+        );
+        config.wss.client_auth = Some(zeroclaw_config::schema::WssClientAuthConfig {
+            enabled: true,
+            ca_cert_path: "/etc/zeroclaw/client-ca.pem".into(),
+            ..Default::default()
+        });
+        let services = daemon_tcp_services(&config);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name, "wss");
+
+        // A CA path with client auth disabled is not an external CA (the WSS
+        // starter rejects that combination); enrollment stays listed.
+        config.wss.client_auth.as_mut().unwrap().enabled = false;
+        assert_eq!(daemon_tcp_services(&config).len(), 2);
+    }
+
+    #[test]
+    fn daemon_tcp_services_wss_only_when_enroll_disabled() {
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        let services = daemon_tcp_services(&config);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].name, "wss");
+    }
+
+    #[tokio::test]
+    async fn providers_without_tcp_passthrough_publish_nothing() {
+        let services = [TcpService {
+            name: "wss",
+            scheme: "wss",
+            target: "127.0.0.1:9781".parse().unwrap(),
+        }];
+        let tunnel = NgrokTunnel::new("tok".into(), None);
+        assert!(
+            tunnel
+                .publish_tcp_services(&services)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

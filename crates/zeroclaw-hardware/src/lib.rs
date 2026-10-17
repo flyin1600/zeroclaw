@@ -1,7 +1,8 @@
+#![allow(clippy::to_string_in_format_args)]
 //! Hardware discovery — USB device enumeration and introspection.
-//!
 //! See `docs/hardware-peripherals-design.md` for the full design.
 
+pub mod catalog;
 pub mod device;
 pub mod gpio;
 pub mod peripherals;
@@ -33,17 +34,7 @@ pub mod pico_flash;
 #[cfg(feature = "hardware")]
 pub mod pico_code;
 
-/// Aardvark USB adapter transport (I2C / SPI / GPIO via aardvark-sys).
-#[cfg(feature = "hardware")]
-pub mod aardvark;
-
-/// Tools backed by the Aardvark transport (i2c_scan, i2c_read, i2c_write,
-/// spi_transfer, gpio_aardvark).
-#[cfg(feature = "hardware")]
-pub mod aardvark_tools;
-
 /// Datasheet management — search, download, and manage device datasheets.
-/// Used by DatasheetTool when an Aardvark is connected.
 #[cfg(feature = "hardware")]
 pub mod datasheet;
 
@@ -64,10 +55,6 @@ pub mod manifest;
 pub mod subprocess;
 pub mod tool_registry;
 
-#[cfg(feature = "hardware")]
-#[allow(unused_imports)]
-pub use aardvark::AardvarkTransport;
-
 use crate::device::DeviceRegistry;
 #[cfg(feature = "hardware")]
 use anyhow::Result;
@@ -81,7 +68,6 @@ pub use zeroclaw_config::schema::{HardwareConfig, HardwareTransport};
 
 /// Merge hardware tools from a [`HardwareBootResult`] into an existing tool
 /// registry, deduplicating by name.
-///
 /// Returns a tuple of `(device_summary, added_tool_names)`.
 pub fn merge_hardware_tools(
     tools: &mut Vec<Box<dyn zeroclaw_api::tool::Tool>>,
@@ -99,7 +85,12 @@ pub fn merge_hardware_tools(
             .collect();
         if !new_hw_tools.is_empty() {
             added_tool_names = new_hw_tools.iter().map(|t| t.name().to_string()).collect();
-            tracing::info!(count = new_hw_tools.len(), "Hardware registry tools added");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"count": new_hw_tools.len()})),
+                "Hardware registry tools added"
+            );
             tools.extend(new_hw_tools);
         }
     }
@@ -118,16 +109,6 @@ pub struct HardwareBootResult {
     pub context_files_prompt: String,
 }
 
-/// Load hardware context files from `~/.zeroclaw/hardware/` and return them
-/// concatenated as a single markdown string ready for system-prompt injection.
-///
-/// Reads (if they exist):
-/// 1. `~/.zeroclaw/hardware/HARDWARE.md`
-/// 2. `~/.zeroclaw/hardware/devices/<alias>.md` for each discovered alias
-/// 3. All `~/.zeroclaw/hardware/skills/*.md` files (sorted by name)
-///
-/// Missing files are silently skipped. Returns an empty string when no files
-/// are found.
 pub fn load_hardware_context_prompt(aliases: &[&str]) -> String {
     let home = match directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
         Some(h) => h,
@@ -154,7 +135,11 @@ pub fn load_hardware_context_from_dir(hw_dir: &std::path::Path, aliases: &[&str]
     let devices_dir = hw_dir.join("devices");
     for alias in aliases {
         let path = devices_dir.join(format!("{alias}.md"));
-        tracing::info!("loading device file: {:?}", path);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("loading device file: {:?}", path)
+        );
         if let Ok(content) = std::fs::read_to_string(&path)
             && !content.trim().is_empty()
         {
@@ -186,22 +171,26 @@ pub fn load_hardware_context_from_dir(hw_dir: &std::path::Path, aliases: &[&str]
     sections.join("\n\n")
 }
 
-/// Inject RPi self-discovery tools and system prompt context into the boot result.
-///
-/// Called from both `boot()` variants when the `peripheral-rpi` feature is active
-/// and the binary is running on Linux. If `/proc/device-tree/model` (or
-/// `/proc/cpuinfo`) identifies a Raspberry Pi, the four built-in GPIO/info
-/// tools are added to `tools` and the board description is appended to
-/// `context_files_prompt` so the LLM knows it is running on the device.
 #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
 fn inject_rpi_context(
     tools: &mut Vec<Box<dyn zeroclaw_api::tool::Tool>>,
     context_files_prompt: &mut String,
 ) {
     if let Some(ctx) = rpi::RpiSystemContext::discover() {
-        tracing::info!(board = %ctx.model.display_name(), ip = %ctx.ip_address, "RPi self-discovery complete");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({"board": ctx.model.display_name(), "ip": ctx.ip_address})
+            ),
+            "RPi self-discovery complete"
+        );
         if let Some(led) = ctx.model.onboard_led_gpio() {
-            tracing::info!(gpio = led, "Onboard ACT LED");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"gpio": led})),
+                "Onboard ACT LED"
+            );
         }
         println!("[registry] rpi0 ready \u{2192} /dev/gpiomem");
         if ctx.gpio_available {
@@ -233,16 +222,6 @@ fn inject_rpi_context(
     }
 }
 
-/// Boot the hardware subsystem: discover devices + load tool registry.
-///
-/// With the `hardware` feature: enumerates USB-serial devices, then
-/// pre-registers any config-specified serial boards not already found by
-/// discovery. [`HardwareSerialTransport`] opens the port lazily per-send,
-/// so this succeeds even when the port doesn't exist at startup.
-///
-/// Without the feature: loads plugin tools from `~/.zeroclaw/tools/` only,
-/// with an empty device registry (GPIO tools will report "no device found"
-/// if called, which is correct).
 #[cfg(feature = "hardware")]
 #[allow(unused_mut)] // tools and context_files_prompt are mutated on Linux+peripheral-rpi
 pub async fn boot(
@@ -280,14 +259,27 @@ pub async fn boot(
                 gpio: true,
                 ..DeviceCapabilities::default()
             };
-            registry_inner.attach_transport(&alias, transport, caps)
-                .unwrap_or_else(|e| tracing::warn!(alias = %alias, err = %e, "attach_transport: unexpected unknown alias"));
+            registry_inner
+                .attach_transport(&alias, transport, caps)
+                .unwrap_or_else(|e| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"alias": alias, "err": e.to_string()})
+                            ),
+                        "attach_transport: unexpected unknown alias"
+                    )
+                });
             // Mark path as registered so duplicate config entries are skipped.
             discovered_paths.insert(path.clone());
-            tracing::info!(
-                board = %board.board,
-                path = %path,
-                alias = %alias,
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({"board": board.board, "path": path, "alias": alias})
+                    ),
                 "pre-registered config board with lazy serial transport"
             );
         }
@@ -295,45 +287,16 @@ pub async fn boot(
 
     // BOOTSEL auto-detect: warn the user if a Pico is in BOOTSEL mode at startup.
     if uf2::find_rpi_rp2_mount().is_some() {
-        tracing::info!("Pico detected in BOOTSEL mode (RPI-RP2 drive found)");
-        tracing::info!("Say \"flash my pico\" to install ZeroClaw firmware automatically");
-    }
-
-    // Aardvark discovery: scan for Total Phase Aardvark USB adapters and
-    // register each one with AardvarkTransport + full I2C/SPI/GPIO capabilities.
-    {
-        use aardvark::AardvarkTransport;
-        use device::DeviceCapabilities;
-
-        let aardvark_ports = aardvark_sys::AardvarkHandle::find_devices();
-        for (i, &port) in aardvark_ports.iter().enumerate() {
-            let alias = registry_inner.register(
-                "aardvark",
-                Some(0x2b76),
-                None,
-                None,
-                Some("Total Phase Aardvark".to_string()),
-            );
-            let transport = std::sync::Arc::new(AardvarkTransport::new(i32::from(port), 100))
-                as std::sync::Arc<dyn transport::Transport>;
-            let caps = DeviceCapabilities {
-                gpio: true,
-                i2c: true,
-                spi: true,
-                ..DeviceCapabilities::default()
-            };
-            registry_inner
-                .attach_transport(&alias, transport, caps)
-                .unwrap_or_else(|e| {
-                    tracing::warn!(alias = %alias, err = %e, "aardvark attach_transport failed")
-                });
-            tracing::info!(
-                alias = %alias,
-                port_index = %i,
-                "aardvark adapter registered"
-            );
-            println!("[registry] {alias} ready \u{2192} Total Phase port {i}");
-        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Pico detected in BOOTSEL mode (RPI-RP2 drive found)"
+        );
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Say \"flash my pico\" to install ZeroClaw firmware automatically"
+        );
     }
 
     let devices = std::sync::Arc::new(tokio::sync::RwLock::new(registry_inner));
@@ -344,7 +307,12 @@ pub async fn boot(
     };
     let mut tools = registry.into_tools();
     if !tools.is_empty() {
-        tracing::info!(count = tools.len(), "Hardware registry tools loaded");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"count": tools.len()})),
+            "Hardware registry tools loaded"
+        );
     }
     let alias_strings: Vec<String> = {
         let reg = devices.read().await;
@@ -356,7 +324,11 @@ pub async fn boot(
     let alias_refs: Vec<&str> = alias_strings.iter().map(|s: &String| s.as_str()).collect();
     let mut context_files_prompt = load_hardware_context_prompt(&alias_refs);
     if !context_files_prompt.is_empty() {
-        tracing::info!("Hardware context files loaded");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Hardware context files loaded"
+        );
     }
     // RPi self-discovery: detect board model and inject GPIO tools + prompt context.
     #[cfg(all(feature = "peripheral-rpi", target_os = "linux"))]
@@ -382,8 +354,10 @@ pub async fn boot(
     };
     let mut tools = registry.into_tools();
     if !tools.is_empty() {
-        tracing::info!(
-            count = tools.len(),
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"count": tools.len()})),
             "Hardware registry tools loaded (plugins only)"
         );
     }
@@ -577,8 +551,19 @@ fn info_via_probe(chip: &str) -> anyhow::Result<()> {
     use probe_rs::{Session, SessionConfig};
 
     println!("Connecting to {} via USB (ST-Link)...", chip);
-    let session = Session::auto_attach(chip, SessionConfig::default())
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let session = Session::auto_attach(chip, SessionConfig::default()).map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "chip": chip,
+                    "error": format!("{}", e),
+                })),
+            "probe-rs auto_attach failed (info CLI path)"
+        );
+        anyhow::Error::msg(e.to_string())
+    })?;
 
     let target = session.target();
     println!();

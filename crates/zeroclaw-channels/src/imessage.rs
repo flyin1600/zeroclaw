@@ -1,18 +1,10 @@
 use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
-/// Extract plain text from an iMessage `attributedBody` typedstream blob.
-///
-/// Modern macOS (Ventura+) stores message content in `attributedBody` as an
-/// `NSMutableAttributedString` serialized via Apple's typedstream format,
-/// rather than the plain `text` column.
-///
-/// This follows the well-documented marker-based approach used by LangChain,
-/// steipete/imsg, and mac_apt (all MIT-licensed). See:
-/// <https://chrissardegna.com/blog/reverse-engineering-apples-typedstream-format/>
 fn extract_text_from_attributed_body(blob: &[u8]) -> Option<String> {
     // Find the start-of-text marker: [0x01, 0x2B]
     // 0x2B is the C-string type tag in Apple's typedstream format.
@@ -23,15 +15,6 @@ fn extract_text_from_attributed_body(blob: &[u8]) -> Option<String> {
         return None;
     }
 
-    // Read variable-length prefix immediately after the marker.
-    // The length determines text extent — we do NOT scan for an end marker,
-    // because byte pairs like [0x86, 0x84] can appear inside valid UTF-8
-    // (e.g. U+2184 LATIN SMALL LETTER REVERSED C encodes to E2 86 84).
-    //
-    //   0x00-0x7F => literal length (1 byte)
-    //   0x81      => next 2 bytes are little-endian u16 length
-    //   0x82      => next 4 bytes are little-endian u32 length
-    //   0x80, 0x83+ are not observed in iMessage typedstreams; reject gracefully.
     let (length, text_start) = match rest[0] {
         0x81 if rest.len() >= 3 => {
             let len = u16::from_le_bytes([rest[1], rest[2]]) as usize;
@@ -49,17 +32,18 @@ fn extract_text_from_attributed_body(blob: &[u8]) -> Option<String> {
     std::str::from_utf8(text_bytes).ok().map(str::to_owned)
 }
 
-/// Resolve message content from the `text` column with `attributedBody` fallback.
-///
-/// Prefers the plain `text` column when present. Falls back to parsing the
-/// typedstream blob in `attributedBody` (modern macOS). Logs a warning when
-/// `attributedBody` exists but cannot be parsed.
 fn resolve_message_content(rowid: i64, text: Option<String>, body: Option<Vec<u8>>) -> String {
     text.filter(|t| !t.trim().is_empty())
         .or_else(|| {
             let parsed = body.as_deref().and_then(extract_text_from_attributed_body);
             if parsed.is_none() && body.as_ref().is_some_and(|b| !b.is_empty()) {
-                tracing::warn!(rowid, "failed to parse attributedBody");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"rowid": rowid})),
+                    "failed to parse attributedBody"
+                );
             }
             parsed
         })
@@ -70,34 +54,39 @@ fn resolve_message_content(rowid: i64, text: Option<String>, body: Option<Vec<u8
 /// Polls the Messages database for new messages and sends replies via `osascript`.
 #[derive(Clone)]
 pub struct IMessageChannel {
-    allowed_contacts: Vec<String>,
+    /// The alias key under `[channels.imessage.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     poll_interval_secs: u64,
 }
 
 impl IMessageChannel {
-    pub fn new(allowed_contacts: Vec<String>) -> Self {
+    pub fn new(
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self {
-            allowed_contacts,
+            alias: alias.into(),
+            peer_resolver,
             poll_interval_secs: 3,
         }
     }
 
+    /// Return the alias under `[channels.imessage.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
     fn is_contact_allowed(&self, sender: &str) -> bool {
-        if self.allowed_contacts.iter().any(|u| u == "*") {
-            return true;
-        }
-        self.allowed_contacts
-            .iter()
-            .any(|u| u.eq_ignore_ascii_case(sender))
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, sender, crate::allowlist::Match::CaseInsensitive)
     }
 }
 
-/// Escape a string for safe interpolation into `AppleScript`.
-///
-/// This prevents injection attacks by escaping:
-/// - Backslashes (`\` → `\\`)
-/// - Double quotes (`"` → `\"`)
-/// - Newlines (`\n` → `\\n`, `\r` → `\\r`) to prevent code injection via line breaks
 fn escape_applescript(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -105,14 +94,6 @@ fn escape_applescript(s: &str) -> String {
         .replace('\r', "\\r")
 }
 
-/// Validate that a target looks like a valid phone number or email address.
-///
-/// This is a defense-in-depth measure to reject obviously malicious targets
-/// before they reach `AppleScript` interpolation.
-///
-/// Valid patterns:
-/// - Phone: starts with `+` followed by digits (with optional spaces/dashes)
-/// - Email: contains `@` with alphanumeric chars on both sides
 fn is_valid_imessage_target(target: &str) -> bool {
     let target = target.trim();
     if target.is_empty() {
@@ -148,6 +129,17 @@ fn is_valid_imessage_target(target: &str) -> bool {
     }
 
     false
+}
+
+impl ::zeroclaw_api::attribution::Attributable for IMessageChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::IMessage,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
 }
 
 #[async_trait]
@@ -192,13 +184,25 @@ end tell"#
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        tracing::info!("iMessage channel listening (AppleScript bridge)...");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "iMessage channel listening (AppleScript bridge)..."
+        );
 
         // Query the Messages SQLite database for new messages
         // The database is at ~/Library/Messages/chat.db
         let db_path = UserDirs::new()
             .map(|u| u.home_dir().join("Library/Messages/chat.db"))
-            .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "Cannot find home directory"
+                );
+                anyhow::Error::msg("Cannot find home directory")
+            })?;
 
         if !db_path.exists() {
             anyhow::bail!(
@@ -264,7 +268,16 @@ end tell"#
                 },
             )
             .await
-            .map_err(|e| anyhow::anyhow!("iMessage poll worker join error: {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "iMessage poll worker join error"
+                );
+                anyhow::Error::msg(format!("iMessage poll worker join error: {e}"))
+            })?;
             conn = returned_conn;
 
             match poll_result {
@@ -288,6 +301,7 @@ end tell"#
                             reply_target: sender.clone(),
                             content: text,
                             channel: "imessage".to_string(),
+                            channel_alias: Some(self.alias.clone()),
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -295,6 +309,9 @@ end tell"#
                             thread_ts: None,
                             interruption_scope_id: None,
                             attachments: vec![],
+                            subject: None,
+
+                            ..Default::default()
                         };
 
                         if tx.send(msg).await.is_err() {
@@ -303,7 +320,13 @@ end tell"#
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("iMessage poll error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "iMessage poll error"
+                    );
                 }
             }
         }
@@ -320,10 +343,17 @@ end tell"#
 
         db_path.exists()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API for third-party iMessage bots.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-/// Get the current max ROWID from the messages table.
-/// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
 #[cfg(test)]
 async fn get_max_rowid(db_path: &std::path::Path) -> anyhow::Result<i64> {
     let path = db_path.to_path_buf();
@@ -340,9 +370,6 @@ async fn get_max_rowid(db_path: &std::path::Path) -> anyhow::Result<i64> {
     Ok(result)
 }
 
-/// Fetch messages newer than `since_rowid`.
-/// Uses rusqlite with parameterized queries for security (CWE-89 prevention).
-/// The `since_rowid` parameter is bound safely, preventing SQL injection.
 #[cfg(test)]
 async fn fetch_new_messages(
     db_path: &std::path::Path,
@@ -389,68 +416,90 @@ mod tests {
 
     #[test]
     fn creates_with_contacts() {
-        let ch = IMessageChannel::new(vec!["+1234567890".into()]);
-        assert_eq!(ch.allowed_contacts.len(), 1);
+        let ch = IMessageChannel::new(
+            "imessage_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert_eq!(ch.poll_interval_secs, 3);
+        assert!(ch.is_contact_allowed("+1234567890"));
     }
 
     #[test]
     fn creates_with_empty_contacts() {
-        let ch = IMessageChannel::new(vec![]);
-        assert!(ch.allowed_contacts.is_empty());
+        let ch = IMessageChannel::new("imessage_test_alias", Arc::new(Vec::new));
+        assert!(!ch.is_contact_allowed("anyone"));
     }
 
     #[test]
     fn wildcard_allows_anyone() {
-        let ch = IMessageChannel::new(vec!["*".into()]);
+        let ch = IMessageChannel::new("imessage_test_alias", Arc::new(|| vec!["*".into()]));
         assert!(ch.is_contact_allowed("+1234567890"));
         assert!(ch.is_contact_allowed("random@icloud.com"));
-        assert!(ch.is_contact_allowed(""));
+        // "Anyone" means any identifiable contact. A blank sender names nobody,
+        // so there is nothing a deny rule could ever have written down and
+        // nothing to attribute the message to; the wildcard does not reach it.
+        assert!(!ch.is_contact_allowed(""));
+        assert!(!ch.is_contact_allowed("   "));
     }
 
     #[test]
     fn specific_contact_allowed() {
-        let ch = IMessageChannel::new(vec!["+1234567890".into(), "user@icloud.com".into()]);
+        let ch = IMessageChannel::new(
+            "imessage_test_alias",
+            Arc::new(|| vec!["+1234567890".into(), "user@icloud.com".into()]),
+        );
         assert!(ch.is_contact_allowed("+1234567890"));
         assert!(ch.is_contact_allowed("user@icloud.com"));
     }
 
     #[test]
     fn unknown_contact_denied() {
-        let ch = IMessageChannel::new(vec!["+1234567890".into()]);
+        let ch = IMessageChannel::new(
+            "imessage_test_alias",
+            Arc::new(|| vec!["+1234567890".into()]),
+        );
         assert!(!ch.is_contact_allowed("+9999999999"));
         assert!(!ch.is_contact_allowed("hacker@evil.com"));
     }
 
     #[test]
     fn contact_case_insensitive() {
-        let ch = IMessageChannel::new(vec!["User@iCloud.com".into()]);
+        let ch = IMessageChannel::new(
+            "imessage_test_alias",
+            Arc::new(|| vec!["User@iCloud.com".into()]),
+        );
         assert!(ch.is_contact_allowed("user@icloud.com"));
         assert!(ch.is_contact_allowed("USER@ICLOUD.COM"));
     }
 
     #[test]
     fn empty_allowlist_denies_all() {
-        let ch = IMessageChannel::new(vec![]);
+        let ch = IMessageChannel::new("imessage_test_alias", Arc::new(Vec::new));
         assert!(!ch.is_contact_allowed("+1234567890"));
         assert!(!ch.is_contact_allowed("anyone"));
     }
 
     #[test]
     fn name_returns_imessage() {
-        let ch = IMessageChannel::new(vec![]);
+        let ch = IMessageChannel::new("imessage_test_alias", Arc::new(Vec::new));
         assert_eq!(ch.name(), "imessage");
     }
 
     #[test]
     fn wildcard_among_others_still_allows_all() {
-        let ch = IMessageChannel::new(vec!["+111".into(), "*".into(), "+222".into()]);
+        let ch = IMessageChannel::new(
+            "imessage_test_alias",
+            Arc::new(|| vec!["+111".into(), "*".into(), "+222".into()]),
+        );
         assert!(ch.is_contact_allowed("totally-unknown"));
     }
 
     #[test]
     fn contact_with_spaces_exact_match() {
-        let ch = IMessageChannel::new(vec!["  spaced  ".into()]);
+        let ch = IMessageChannel::new(
+            "imessage_test_alias",
+            Arc::new(|| vec!["  spaced  ".into()]),
+        );
         assert!(ch.is_contact_allowed("  spaced  "));
         assert!(!ch.is_contact_allowed("spaced"));
     }

@@ -1,17 +1,16 @@
+pub mod platform;
 pub mod registry;
 
+use crate::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 use anyhow::Result;
 use zeroclaw_config::schema::Config;
 
-/// Integration status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IntegrationStatus {
     /// Fully implemented and ready to use
     Available,
     /// Configured and active
     Active,
-    /// Planned but not yet implemented
-    ComingSoon,
 }
 
 /// Integration category
@@ -19,12 +18,7 @@ pub enum IntegrationStatus {
 pub enum IntegrationCategory {
     Chat,
     AiModel,
-    Productivity,
-    MusicAudio,
-    SmartHome,
     ToolsAutomation,
-    MediaCreative,
-    Social,
     Platform,
 }
 
@@ -33,12 +27,7 @@ impl IntegrationCategory {
         match self {
             Self::Chat => "Chat Providers",
             Self::AiModel => "AI Models",
-            Self::Productivity => "Productivity",
-            Self::MusicAudio => "Music & Audio",
-            Self::SmartHome => "Smart Home",
             Self::ToolsAutomation => "Tools & Automation",
-            Self::MediaCreative => "Media & Creative",
-            Self::Social => "Social",
             Self::Platform => "Platforms",
         }
     }
@@ -47,182 +36,264 @@ impl IntegrationCategory {
         &[
             Self::Chat,
             Self::AiModel,
-            Self::Productivity,
-            Self::MusicAudio,
-            Self::SmartHome,
             Self::ToolsAutomation,
-            Self::MediaCreative,
-            Self::Social,
             Self::Platform,
         ]
     }
 }
 
-/// A registered integration
 pub struct IntegrationEntry {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub category: IntegrationCategory,
-    pub status_fn: fn(&Config) -> IntegrationStatus,
+    pub status: IntegrationStatus,
+    /// Canonical config map key for entries backed by a schema config slot —
+    /// the model-provider family key for AI-model entries and the
+    /// `ChannelsConfig` map key for chat entries. This is deliberately
+    /// separate from a runtime channel kind: multiple runtime backends can
+    /// share one config map. Config deep links must route on this key, never
+    /// on a slug of the human-readable `name`. `None` for entries without a
+    /// config section.
+    pub key: Option<String>,
 }
 
 /// Handle the `integrations` CLI command
 pub fn show_integration_info(config: &Config, name: &str) -> Result<()> {
-    let entries = registry::all_integrations();
+    let entries = registry::all_integrations(config);
     let name_lower = name.to_lowercase();
 
     let Some(entry) = entries.iter().find(|e| e.name.to_lowercase() == name_lower) else {
-        anyhow::bail!(
-            "Unknown integration: {name}. Check README for supported integrations or run `zeroclaw onboard` to configure channels/providers."
+        let message = get_required_cli_string_with_args(
+            "cli-integrations-unknown",
+            &[
+                ("name", name),
+                ("quickstart", "`zeroclaw quickstart`"),
+                (
+                    "channel_config",
+                    "`zeroclaw config set channels.<name>.<field>=<value>`",
+                ),
+            ],
         );
+        anyhow::bail!("{message}");
     };
 
-    let status = (entry.status_fn)(config);
-    let (icon, label) = match status {
-        IntegrationStatus::Active => ("✅", "Active"),
-        IntegrationStatus::Available => ("⚪", "Available"),
-        IntegrationStatus::ComingSoon => ("🔜", "Coming Soon"),
+    let icon = match entry.status {
+        IntegrationStatus::Active => "✅",
+        IntegrationStatus::Available => "⚪",
     };
+    let status = localized_integration_status(entry.status);
+    let category_heading = get_required_cli_string("cli-integrations-category-heading");
+    let status_heading = get_required_cli_string("cli-integrations-status-heading");
 
     println!();
     println!(
         "  {} {} — {}",
         icon,
-        console::style(entry.name).white().bold(),
+        console::style(&entry.name).white().bold(),
         entry.description
     );
-    println!("  Category: {}", entry.category.label());
-    println!("  Status:   {label}");
+    println!(
+        "  {}: {}",
+        category_heading,
+        localized_integration_category(entry.category)
+    );
+    println!("  {}: {}", status_heading, status);
     println!();
 
-    // Show setup hints based on integration
-    match entry.name {
-        "Telegram" => {
-            println!("  Setup:");
-            println!("    1. Message @BotFather on Telegram");
-            println!("    2. Create a bot and copy the token");
-            println!("    3. Run: zeroclaw onboard --channels-only");
-            println!("    4. Start: zeroclaw channel start");
+    // Setup hints. Channel-specific steps that are not yet covered by a
+    // standalone book walkthrough stay here so `zeroclaw integration info
+    // <name>` keeps producing actionable output. The Chat-category catch-all
+    // points operators at the per-channel config keys.
+    match entry.name.as_str() {
+        "Telegram" | "Discord" | "Slack" => {
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-setup-heading")
+            );
+            let preparation = match entry.name.as_str() {
+                "Telegram" => get_required_cli_string_with_args(
+                    "cli-integrations-chat-telegram-prepare",
+                    &[("botfather", "@BotFather"), ("channel", "Telegram")],
+                ),
+                "Discord" => get_required_cli_string_with_args(
+                    "cli-integrations-chat-discord-prepare",
+                    &[
+                        ("url", "https://discord.com/developers/applications"),
+                        ("intent", "MESSAGE CONTENT"),
+                    ],
+                ),
+                _ => get_required_cli_string_with_args(
+                    "cli-integrations-chat-slack-prepare",
+                    &[("url", "https://api.slack.com/apps")],
+                ),
+            };
+            println!("    1. {preparation}");
+            println!(
+                "    2. {}",
+                get_required_cli_string_with_args(
+                    "cli-integrations-chat-configure",
+                    &[("command", "zerocode"), ("channel", &entry.name)],
+                )
+            );
+            println!(
+                "    3. {}",
+                get_required_cli_string("cli-integrations-chat-bind")
+            );
+            println!(
+                "    4. {}",
+                get_required_cli_string("cli-integrations-chat-enable")
+            );
         }
-        "Discord" => {
-            println!("  Setup:");
-            println!("    1. Go to https://discord.com/developers/applications");
-            println!("    2. Create app → Bot → Copy token");
-            println!("    3. Enable MESSAGE CONTENT intent");
-            println!("    4. Run: zeroclaw onboard --channels-only");
-        }
-        "Slack" => {
-            println!("  Setup:");
-            println!("    1. Go to https://api.slack.com/apps");
-            println!("    2. Create app → Bot Token Scopes → Install");
-            println!("    3. Run: zeroclaw onboard --channels-only");
+        "iMessage" => {
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-setup-macos-heading")
+            );
+            println!(
+                "    {}",
+                get_required_cli_string("cli-integrations-chat-imessage-transport")
+            );
+            println!(
+                "    {}",
+                get_required_cli_string("cli-integrations-chat-imessage-permissions")
+            );
         }
         "OpenRouter" => {
-            println!("  Setup:");
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-setup-heading")
+            );
             println!("    1. Get API key at https://openrouter.ai/keys");
-            println!("    2. Run: zeroclaw onboard");
+            println!("    2. Run: zeroclaw quickstart --model-provider openrouter --api-key <key>");
             println!("    Access 200+ models with one key.");
         }
         "Ollama" => {
-            println!("  Setup:");
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-setup-heading")
+            );
             println!("    1. Install: brew install ollama");
             println!("    2. Pull a model: ollama pull llama3");
-            println!("    3. Set provider to 'ollama' in config.toml");
+            println!("    3. Set model_provider to 'ollama' in config.toml");
         }
-        "iMessage" => {
-            println!("  Setup (macOS only):");
-            println!("    Uses AppleScript bridge to send/receive iMessages.");
-            println!("    Requires Full Disk Access in System Settings → Privacy.");
-        }
-        "GitHub" => {
-            println!("  Setup:");
-            println!("    1. Create a personal access token at https://github.com/settings/tokens");
-            println!("    2. Add to config: [integrations.github] token = \"ghp_...\"");
+        "Git" => {
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-setup-heading")
+            );
+            println!("    1. Create a GitHub App (Settings → Developer settings → GitHub Apps)");
+            println!(
+                "       Permissions: Issues R/W, Pull requests R/W, Metadata R. Webhook: off."
+            );
+            println!("    2. Generate a private key (.pem) and install the app on your repos");
+            println!("    3. Run: zeroclaw config set channels.git.default.provider github");
+            println!("       Run: zeroclaw config set channels.git.default.app-id <id>");
+            println!(
+                "       Run: zeroclaw config set channels.git.default.private-key-path <path>"
+            );
+            println!("       Run: zeroclaw config set channels.git.default.enabled true");
+            println!("    4. Start: zeroclaw channel start");
         }
         "Browser" => {
-            println!("  Built-in:");
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-builtin-heading")
+            );
             println!("    ZeroClaw can control Chrome/Chromium for web tasks.");
             println!("    Uses headless browser automation.");
         }
         "Cron" => {
-            println!("  Built-in:");
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-builtin-heading")
+            );
             println!("    Schedule tasks in ~/.zeroclaw/workspace/cron/");
             println!("    Run: zeroclaw cron list");
         }
         "Weather" => {
-            println!("  Built-in:");
-            println!("    Fetches live conditions from wttr.in — no API key required.");
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-builtin-heading")
+            );
+            println!("    Fetches live conditions from wttr.in, no API key required.");
             println!("    Supports city names, IATA airport codes, GPS coordinates,");
             println!("    postal/zip codes, and Unicode location names.");
-            println!("    Ask the agent: \"What's the weather in Tulsa?\"");
         }
-        "Webhooks" => {
-            println!("  Built-in:");
-            println!("    HTTP endpoint for external triggers.");
-            println!("    Run: zeroclaw gateway");
+        _ if entry.category == IntegrationCategory::Chat => {
+            println!(
+                "  {}:",
+                get_required_cli_string("cli-integrations-setup-heading")
+            );
+            println!(
+                "    {}",
+                get_required_cli_string_with_args(
+                    "cli-integrations-chat-generic-setup",
+                    &[("command", "zerocode"), ("channel", &entry.name)],
+                )
+            );
         }
-        _ => {
-            if status == IntegrationStatus::ComingSoon {
-                println!("  This integration is planned. Stay tuned!");
-                println!("  Track progress: https://github.com/zeroclaw-labs/zeroclaw");
-            }
-        }
+        _ => {}
     }
 
     println!();
     Ok(())
 }
 
-#[cfg(all(test, zeroclaw_root_crate))]
+fn localized_integration_category(category: IntegrationCategory) -> String {
+    let key = match category {
+        IntegrationCategory::Chat => "cli-integrations-category-chat",
+        IntegrationCategory::AiModel => "cli-integrations-category-ai-model",
+        IntegrationCategory::ToolsAutomation => "cli-integrations-category-tools-automation",
+        IntegrationCategory::Platform => "cli-integrations-category-platform",
+    };
+    get_required_cli_string(key)
+}
+
+fn localized_integration_status(status: IntegrationStatus) -> String {
+    let key = match status {
+        IntegrationStatus::Available => "cli-integrations-status-available",
+        IntegrationStatus::Active => "cli-integrations-status-active",
+    };
+    get_required_cli_string(key)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn integration_category_all_includes_every_variant_once() {
         let all = IntegrationCategory::all();
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), 4);
 
         let labels: Vec<&str> = all.iter().map(|cat| cat.label()).collect();
         assert!(labels.contains(&"Chat Providers"));
         assert!(labels.contains(&"AI Models"));
-        assert!(labels.contains(&"Productivity"));
-        assert!(labels.contains(&"Music & Audio"));
-        assert!(labels.contains(&"Smart Home"));
         assert!(labels.contains(&"Tools & Automation"));
-        assert!(labels.contains(&"Media & Creative"));
-        assert!(labels.contains(&"Social"));
         assert!(labels.contains(&"Platforms"));
     }
 
     #[test]
     fn handle_command_info_is_case_insensitive_for_known_integrations() {
         let config = Config::default();
-        let first_name = registry::all_integrations()
-            .first()
-            .expect("registry should define at least one integration")
-            .name
-            .to_lowercase();
-
-        let result = handle_command(
-            crate::IntegrationCommands::Info { name: first_name },
-            &config,
+        let entries = registry::all_integrations(&config);
+        assert!(
+            !entries.is_empty(),
+            "registry should define at least one integration"
         );
 
-        assert!(result.is_ok());
+        let upper_name = entries[0].name.to_uppercase();
+        assert!(show_integration_info(&config, &upper_name).is_ok());
     }
 
     #[test]
     fn handle_command_info_returns_error_for_unknown_integration() {
         let config = Config::default();
-        let result = handle_command(
-            crate::IntegrationCommands::Info {
-                name: "definitely-not-a-real-integration".into(),
-            },
-            &config,
-        );
-
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("Unknown integration"));
+        let requested_name = "definitely-not-a-real-integration";
+        let err = show_integration_info(&config, requested_name).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains(requested_name));
+        assert!(message.contains("`zeroclaw quickstart`"));
+        assert!(message.contains("`zeroclaw config set channels.<name>.<field>=<value>`"));
     }
 }

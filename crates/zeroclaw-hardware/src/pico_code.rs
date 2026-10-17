@@ -1,22 +1,17 @@
 //! Phase 7 — Dynamic code tools: `device_read_code`, `device_write_code`, `device_exec`.
-//!
-//! These tools let the LLM read, write, and execute code on any connected
-//! hardware device.  The `DeviceRuntime` on each device determines which
-//! host-side tooling is used:
-//!
-//! - **MicroPython / CircuitPython** — `mpremote` for code read/write/exec.
-//! - **Arduino / Nucleus / Linux** — not yet implemented; returns a clear error.
-//!
-//! When the `device` parameter is omitted, each tool auto-selects the device
-//! only when **exactly one** device is registered.  If multiple devices are
-//! present the tool returns an error and requires an explicit `device` parameter.
 
 use super::device::{DeviceRegistry, DeviceRuntime};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(DeviceReadCodeTool, ToolKind::Plugin);
+tool_attribution!(DeviceWriteCodeTool, ToolKind::Plugin);
+tool_attribution!(DeviceExecTool, ToolKind::Plugin);
 
 /// Default timeout for `mpremote` operations (seconds).
 const MPREMOTE_TIMEOUT_SECS: u64 = 30;
@@ -29,12 +24,6 @@ const PORT_POLL_MS: u64 = 200;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Resolve the serial port path and runtime for a device.
-///
-/// If `device_alias` is provided, look it up; otherwise auto-selects the device
-/// only when exactly one device is registered.  With multiple devices present,
-/// returns an error requiring an explicit alias.
-/// Returns `(alias, port, runtime)` or an error `ToolResult`.
 async fn resolve_device_port(
     registry: &RwLock<DeviceRegistry>,
     device_alias: Option<&str>,
@@ -52,14 +41,14 @@ async fn resolve_device_port(
                 [] => {
                     return Err(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some("no device found — is a board connected via USB?".to_string()),
                     });
                 }
                 multiple => {
                     return Err(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!(
                             "multiple devices found ({}); specify the \"device\" parameter",
                             multiple.join(", ")
@@ -72,7 +61,7 @@ async fn resolve_device_port(
 
     let device = reg.get_device(&alias).ok_or_else(|| ToolResult {
         success: false,
-        output: String::new(),
+        output: String::new().into(),
         error: Some(format!("device '{alias}' not found in registry")),
     })?;
 
@@ -80,7 +69,7 @@ async fn resolve_device_port(
 
     let port = device.port().ok_or_else(|| ToolResult {
         success: false,
-        output: String::new(),
+        output: String::new().into(),
         error: Some(format!(
             "device '{alias}' has no serial port — is it connected?"
         )),
@@ -93,7 +82,7 @@ async fn resolve_device_port(
 fn unsupported_runtime(runtime: &DeviceRuntime, tool: &str) -> ToolResult {
     ToolResult {
         success: false,
-        output: String::new(),
+        output: String::new().into(),
         error: Some(format!(
             "{runtime} runtime is not yet supported for {tool} — coming soon"
         )),
@@ -138,7 +127,6 @@ async fn run_mpremote(args: &[&str], timeout_secs: u64) -> Result<(String, Strin
 // ── DeviceReadCodeTool ────────────────────────────────────────────────────────
 
 /// Tool: read the current `main.py` from a connected device.
-///
 /// The LLM uses this to understand the current program before modifying it.
 pub struct DeviceReadCodeTool {
     registry: Arc<RwLock<DeviceRegistry>>,
@@ -189,7 +177,7 @@ impl Tool for DeviceReadCodeTool {
             other => return Ok(unsupported_runtime(&other, "device_read_code")),
         }
 
-        tracing::info!(alias = %alias, port = %port, runtime = %runtime, "reading main.py from device");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "port": port, "runtime": format!("{:?}", runtime)})), "reading main.py from device");
 
         match run_mpremote(
             &["connect", &port, "cat", ":main.py"],
@@ -200,12 +188,13 @@ impl Tool for DeviceReadCodeTool {
             Ok((stdout, _stderr)) => Ok(ToolResult {
                 success: true,
                 output: if stdout.trim().is_empty() {
-                    format!("main.py on {alias} is empty or not found.")
+                    format!("main.py on {alias} is empty or not found.").into()
                 } else {
                     format!(
                         "Current main.py on {alias}:\n\n```python\n{}\n```",
                         stdout.trim()
                     )
+                    .into()
                 },
                 error: None,
             }),
@@ -216,13 +205,14 @@ impl Tool for DeviceReadCodeTool {
                         success: true,
                         output: format!(
                             "No main.py found on {alias} — the device has no program yet."
-                        ),
+                        )
+                        .into(),
                         error: None,
                     })
                 } else {
                     Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: String::new().into(),
                         error: Some(format!("Failed to read code from {alias}: {e}")),
                     })
                 }
@@ -234,7 +224,6 @@ impl Tool for DeviceReadCodeTool {
 // ── DeviceWriteCodeTool ───────────────────────────────────────────────────────
 
 /// Tool: write a complete program to a device as `main.py`.
-///
 /// This replaces the current `main.py` on the device and resets it so the new
 /// program starts executing immediately.
 pub struct DeviceWriteCodeTool {
@@ -282,7 +271,7 @@ impl Tool for DeviceWriteCodeTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: code".to_string()),
                 });
             }
@@ -291,7 +280,7 @@ impl Tool for DeviceWriteCodeTool {
         if code.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some("code parameter is empty — provide a program to write".to_string()),
             });
         }
@@ -309,7 +298,7 @@ impl Tool for DeviceWriteCodeTool {
             other => return Ok(unsupported_runtime(&other, "device_write_code")),
         }
 
-        tracing::info!(alias = %alias, port = %port, runtime = %runtime, code_len = code.len(), "writing main.py to device");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "port": port, "runtime": format!("{:?}", runtime), "code_len": code.len()})), "writing main.py to device");
 
         // Write code to an atomic, owner-only temp file via tempfile crate.
         let named_tmp = match tokio::task::spawn_blocking(|| {
@@ -324,14 +313,14 @@ impl Tool for DeviceWriteCodeTool {
             Ok(Err(e)) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("failed to create temp file: {e}")),
                 });
             }
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("temp file task failed: {e}")),
                 });
             }
@@ -343,7 +332,7 @@ impl Tool for DeviceWriteCodeTool {
             // named_tmp dropped here — auto-removes the file.
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("failed to write temp file: {e}")),
             });
         }
@@ -357,12 +346,23 @@ impl Tool for DeviceWriteCodeTool {
 
         // Explicit cleanup — log if removal fails rather than silently ignoring.
         if let Err(e) = named_tmp.close() {
-            tracing::warn!(path = %tmp_str, err = %e, "failed to clean up temp file");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": tmp_str, "err": e.to_string()})),
+                "failed to clean up temp file"
+            );
         }
 
         match result {
             Ok((_stdout, _stderr)) => {
-                tracing::info!(alias = %alias, "main.py deployed and device reset");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"alias": alias})),
+                    "main.py deployed and device reset"
+                );
 
                 // Wait for the serial port to reappear after reset.
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -379,7 +379,8 @@ impl Tool for DeviceWriteCodeTool {
                         output: format!(
                             "Code deployed to {alias} — main.py updated and device reset. \
                              {alias} is back online."
-                        ),
+                        )
+                        .into(),
                         error: None,
                     })
                 } else {
@@ -389,14 +390,15 @@ impl Tool for DeviceWriteCodeTool {
                             "Code deployed to {alias} — main.py updated and device reset. \
                              Note: serial port did not reappear within {PORT_WAIT_SECS}s; \
                              the device may still be booting."
-                        ),
+                        )
+                        .into(),
                         error: None,
                     })
                 }
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("Failed to deploy code to {alias}: {e}")),
             }),
         }
@@ -406,7 +408,6 @@ impl Tool for DeviceWriteCodeTool {
 // ── DeviceExecTool ────────────────────────────────────────────────────────────
 
 /// Tool: run a one-off code snippet on a device without modifying `main.py`.
-///
 /// Good for one-time commands, sensor reads, and testing code before committing.
 pub struct DeviceExecTool {
     registry: Arc<RwLock<DeviceRegistry>>,
@@ -453,7 +454,7 @@ impl Tool for DeviceExecTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some("missing required parameter: code".to_string()),
                 });
             }
@@ -462,7 +463,7 @@ impl Tool for DeviceExecTool {
         if code.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(
                     "code parameter is empty — provide a code snippet to execute".to_string(),
                 ),
@@ -482,7 +483,7 @@ impl Tool for DeviceExecTool {
             other => return Ok(unsupported_runtime(&other, "device_exec")),
         }
 
-        tracing::info!(alias = %alias, port = %port, runtime = %runtime, code_len = code.len(), "executing snippet on device");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"alias": alias, "port": port, "runtime": format!("{:?}", runtime), "code_len": code.len()})), "executing snippet on device");
 
         // Write snippet to an atomic, owner-only temp file via tempfile crate.
         let named_tmp = match tokio::task::spawn_blocking(|| {
@@ -497,14 +498,14 @@ impl Tool for DeviceExecTool {
             Ok(Err(e)) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("failed to create temp file: {e}")),
                 });
             }
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: String::new().into(),
                     error: Some(format!("temp file task failed: {e}")),
                 });
             }
@@ -516,7 +517,7 @@ impl Tool for DeviceExecTool {
             // named_tmp dropped here — auto-removes the file.
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("failed to write temp file: {e}")),
             });
         }
@@ -527,7 +528,13 @@ impl Tool for DeviceExecTool {
 
         // Explicit cleanup — log if removal fails rather than silently ignoring.
         if let Err(e) = named_tmp.close() {
-            tracing::warn!(path = %tmp_str, err = %e, "failed to clean up temp file");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": tmp_str, "err": e.to_string()})),
+                "failed to clean up temp file"
+            );
         }
 
         match result {
@@ -542,16 +549,16 @@ impl Tool for DeviceExecTool {
                 Ok(ToolResult {
                     success: true,
                     output: if output.is_empty() {
-                        format!("Code executed on {alias} — no output produced.")
+                        format!("Code executed on {alias}: no output produced.").into()
                     } else {
-                        format!("Output from {alias}:\n{output}")
+                        format!("Output from {alias}:\n{output}").into()
                     },
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: String::new().into(),
                 error: Some(format!("Failed to execute code on {alias}: {e}")),
             }),
         }
@@ -561,7 +568,6 @@ impl Tool for DeviceExecTool {
 // ── port wait helper ──────────────────────────────────────────────────────────
 
 /// Poll for a specific serial port to reappear after a device reset.
-///
 /// Returns `true` if the port exists within the timeout, `false` otherwise.
 async fn wait_for_port(
     port_path: &str,

@@ -44,10 +44,17 @@ impl Tool for SopListTool {
         let filter = args.get("filter").and_then(|v| v.as_str()).unwrap_or("");
         let filter_lower = filter.to_lowercase();
 
-        let engine = self
-            .engine
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {e}"))?;
+        let engine = self.engine.lock().map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "SOP engine lock poisoned"
+            );
+
+            anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
+        })?;
         let sops = engine.sops();
 
         if sops.is_empty() {
@@ -72,7 +79,7 @@ impl Tool for SopListTool {
         if filtered.is_empty() {
             return Ok(ToolResult {
                 success: true,
-                output: format!("No SOPs match filter '{filter}'."),
+                output: format!("No SOPs match filter '{filter}'.").into(),
                 error: None,
             });
         }
@@ -109,7 +116,7 @@ impl Tool for SopListTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -139,11 +146,16 @@ mod tests {
                 requires_confirmation: false,
                 kind: SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
         }
     }
 

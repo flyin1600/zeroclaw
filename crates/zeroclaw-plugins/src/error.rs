@@ -1,5 +1,6 @@
 //! Plugin error types.
 
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -10,17 +11,73 @@ pub enum PluginError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    /// Filesystem identity changed; never evidence of defective package contents.
+    #[error("plugin namespace changed: {0}")]
+    NamespaceChanged(String),
+
+    /// A package operation could not finish and kept the files it held at
+    /// `path`: for example a claimed package it could not restore without
+    /// replacing another occupant, or a staged package it could not publish.
+    /// `reason` says why.
+    #[error("plugin recovery retained bytes at {path}: {reason}")]
+    RecoveryRetained { path: String, reason: String },
+
+    /// An update claimed the installed package and could neither publish its
+    /// replacement nor put the claimed generation back. `preserved` holds that
+    /// generation, in a transaction whose lease is released on return, so
+    /// `PluginHost::recover_interrupted_update` can put it back, unless a
+    /// package of that name is installed by then.
+    #[error("plugin '{name}' was not replaced and its previous package could not be moved back ({cause}); it is preserved at {}", preserved.display())]
+    ReplacementInterrupted {
+        name: String,
+        preserved: PathBuf,
+        cause: String,
+    },
+
+    /// The platform or filesystem has no rename that refuses an existing
+    /// destination, so install removed the copy it staged and installed
+    /// nothing; a retry there fails the same way.
+    #[error(
+        "nothing was installed: this platform or filesystem cannot move a package without risking an existing entry ({0})"
+    )]
+    MoveUnsupported(String),
+
+    /// The same permanent publication refusal, but cleanup did not complete.
+    /// `path` names the failed cleanup operation, not a guarantee that all
+    /// original payload bytes remain. This is never a recommendation to retry.
+    #[error(
+        "nothing was installed: safe package move unavailable; cleanup could not be confirmed at {path}: {reason}"
+    )]
+    MoveUnsupportedCleanup { path: String, reason: String },
+
+    #[error("invalid plugin config: {0}")]
+    InvalidConfig(String),
+
+    #[error("invalid plugin instance identity: {0}")]
+    InvalidInstanceId(String),
+
+    #[error("invalid plugin endpoint: {0}")]
+    InvalidEndpoint(String),
+
     #[error("failed to load WASM module: {0}")]
     LoadFailed(String),
 
     #[error("plugin execution failed: {0}")]
     ExecutionFailed(String),
 
-    #[error("permission denied: plugin '{plugin}' requires '{permission}'")]
+    #[error("permission denied: plugin '{plugin}' is not authorized for '{permission}'")]
     PermissionDenied { plugin: String, permission: String },
 
     #[error("plugin '{0}' is already loaded")]
     AlreadyLoaded(String),
+
+    /// Something occupies a package name in the plugins directory that the host
+    /// has not admitted as that package, and it was left as found. Install
+    /// never overwrites it. `remove` deletes an unloaded directory only when it
+    /// is empty, or when admission rejects its own contents rather than its
+    /// signature. `reason` says why it was kept.
+    #[error("'{name}' in the plugins directory was left untouched: {reason}")]
+    UnadmittedPackage { name: String, reason: String },
 
     #[error("plugin capability not supported: {0}")]
     UnsupportedCapability(String),
@@ -36,6 +93,15 @@ pub enum PluginError {
 
     #[error("invalid plugin signature: {0}")]
     SignatureInvalid(String),
+
+    #[error("plugin '{0}' must declare signed wasm_sha256 in strict mode")]
+    PayloadDigestRequired(String),
+
+    #[error("invalid WASM payload SHA-256: {0}")]
+    PayloadDigestInvalid(String),
+
+    #[error("WASM payload digest mismatch (expected {expected}, got {actual})")]
+    PayloadDigestMismatch { expected: String, actual: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

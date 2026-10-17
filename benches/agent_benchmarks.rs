@@ -1,13 +1,4 @@
 //! Performance benchmarks for ZeroClaw hot paths.
-//!
-//! Benchmarks cover:
-//!   - Tool dispatch (XML parsing, native parsing)
-//!   - Memory store/recall cycles (SQLite backend)
-//!   - Agent turn cycle (full orchestration loop)
-//!
-//! Run: `cargo bench`
-//!
-//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 7)
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -19,8 +10,8 @@ use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::{Memory, MemoryCategory};
 use zeroclaw::observability::{NoopObserver, Observer};
-use zeroclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
-use zeroclaw::tools::{Tool, ToolResult};
+use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
+use zeroclaw::tools::{Tool, ToolOutput, ToolResult};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -29,11 +20,11 @@ use async_trait::async_trait;
 // Mock infrastructure (mirrors test mocks, kept local for benchmark isolation)
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct BenchProvider {
+struct BenchModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
 }
 
-impl BenchProvider {
+impl BenchModelProvider {
     fn text_only(text: &str) -> Self {
         Self {
             responses: Mutex::new(vec![ChatResponse {
@@ -70,8 +61,21 @@ impl BenchProvider {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for BenchModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "BenchModelProvider"
+    }
+}
+
 #[async_trait]
-impl Provider for BenchProvider {
+impl ModelProvider for BenchModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -103,6 +107,8 @@ impl Provider for BenchProvider {
 
 struct NoopTool;
 
+zeroclaw_api::mock_tool_attribution!(NoopTool);
+
 #[async_trait]
 impl Tool for NoopTool {
     fn name(&self) -> &str {
@@ -117,7 +123,7 @@ impl Tool for NoopTool {
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         Ok(ToolResult {
             success: true,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: None,
         })
     }
@@ -288,10 +294,14 @@ fn bench_agent_turn(c: &mut Criterion) {
     c.bench_function("agent_turn_text_only", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let provider = Box::new(BenchProvider::text_only("benchmark response"));
+                let model_provider = Box::new(BenchModelProvider::text_only("benchmark response"));
                 let mut agent = Agent::builder()
-                    .provider(provider)
-                    .tools(vec![Box::new(NoopTool) as Box<dyn Tool>])
+                    .model_provider(model_provider)
+                    .tools(
+                        zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                            Box::new(NoopTool) as Box<dyn Tool>,
+                        ]),
+                    )
                     .memory(make_memory())
                     .observer(make_observer())
                     .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -306,10 +316,14 @@ fn bench_agent_turn(c: &mut Criterion) {
     c.bench_function("agent_turn_with_tool_call", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let provider = Box::new(BenchProvider::with_tool_then_text());
+                let model_provider = Box::new(BenchModelProvider::with_tool_then_text());
                 let mut agent = Agent::builder()
-                    .provider(provider)
-                    .tools(vec![Box::new(NoopTool) as Box<dyn Tool>])
+                    .model_provider(model_provider)
+                    .tools(
+                        zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                            Box::new(NoopTool) as Box<dyn Tool>,
+                        ]),
+                    )
                     .memory(make_memory())
                     .observer(make_observer())
                     .tool_dispatcher(Box::new(NativeToolDispatcher))

@@ -82,10 +82,17 @@ impl Tool for SopStatusTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let engine = self
-            .engine
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {e}"))?;
+        let engine = self.engine.lock().map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "SOP engine lock poisoned"
+            );
+
+            anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
+        })?;
 
         // Query specific run
         if let Some(run_id) = run_id {
@@ -103,6 +110,13 @@ impl Tool for SopStatusTool {
                     if let Some(ref completed) = run.completed_at {
                         let _ = writeln!(output, "Completed: {completed}");
                     }
+                    if let Some(ref failure_reason) = run.failure_reason {
+                        let failure_line = crate::i18n::get_required_cli_string_with_args(
+                            "cli-sop-status-failure-reason",
+                            &[("reason", failure_reason)],
+                        );
+                        let _ = writeln!(output, "{failure_line}");
+                    }
                     if !run.step_results.is_empty() {
                         let _ = writeln!(output, "\nStep results:");
                         for step in &run.step_results {
@@ -116,13 +130,13 @@ impl Tool for SopStatusTool {
                     self.append_gate_status(&mut output, include_gate_status);
                     Ok(ToolResult {
                         success: true,
-                        output,
+                        output: output.into(),
                         error: None,
                     })
                 }
                 None => Ok(ToolResult {
                     success: true,
-                    output: format!("No run found with ID '{run_id}'."),
+                    output: format!("No run found with ID '{run_id}'.").into(),
                     error: None,
                 }),
             };
@@ -191,7 +205,7 @@ impl Tool for SopStatusTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -257,11 +271,16 @@ mod tests {
                 requires_confirmation: false,
                 kind: SopStepKind::default(),
                 schema: None,
+                ..SopStep::default()
             }],
             cooldown_secs: 0,
             max_concurrent: 2,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
         }
     }
 
@@ -320,6 +339,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_status_localizes_the_retained_reason() {
+        let engine = engine_with_sops(vec![test_sop("s1")]);
+        let run_id = {
+            let mut engine = engine.lock().unwrap();
+            let action = engine.start_run("s1", manual_event()).unwrap();
+            let run_id = match action {
+                crate::sop::SopRunAction::ExecuteStep { run_id, .. } => run_id,
+                other => panic!("expected an executable first step, got {other:?}"),
+            };
+            engine
+                .finish_run(
+                    &run_id,
+                    crate::sop::SopRunStatus::Failed,
+                    Some("disk quota exceeded".to_string()),
+                )
+                .unwrap();
+            run_id
+        };
+        let tool = SopStatusTool::new(engine);
+        let result = tool.execute(json!({"run_id": run_id})).await.unwrap();
+        let expected = crate::i18n::get_required_cli_string_with_args(
+            "cli-sop-status-failure-reason",
+            &[("reason", "disk quota exceeded")],
+        );
+        assert!(result.success);
+        assert!(result.output.lines().any(|line| line == expected));
+    }
+
+    #[tokio::test]
     async fn status_unknown_run() {
         let engine = engine_with_sops(vec![]);
         let tool = SopStatusTool::new(engine);
@@ -366,21 +414,30 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "s1".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
+            frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Completed,
             current_step: 1,
             total_steps: 1,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
+            failure_reason: None,
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Completed,
                 output: "done".into(),
                 started_at: "2026-02-19T12:00:00Z".into(),
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
+                tool_calls: Vec::new(),
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         collector.record_run_complete(&run);
 
@@ -402,21 +459,30 @@ mod tests {
         let run = SopRun {
             run_id: "r1".into(),
             sop_name: "s1".into(),
+            initiating_agent: None,
             trigger_event: manual_event(),
+            frame_marker_id: "marker-r1".into(),
             status: SopRunStatus::Failed,
             current_step: 1,
             total_steps: 2,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: Some("2026-02-19T12:05:00Z".into()),
+            failure_reason: None,
             step_results: vec![SopStepResult {
+                effective_agent: None,
                 step_number: 1,
                 status: SopStepStatus::Failed,
                 output: "fail".into(),
                 started_at: "2026-02-19T12:00:00Z".into(),
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
+                tool_calls: Vec::new(),
             }],
             waiting_since: None,
             llm_calls_saved: 0,
+            revision: 0,
+            revision_base: 0,
+            decided_mode: None,
+            decisions: std::collections::BTreeMap::new(),
         };
         collector.record_run_complete(&run);
 

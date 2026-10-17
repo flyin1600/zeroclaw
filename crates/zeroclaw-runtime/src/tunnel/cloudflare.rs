@@ -3,11 +3,6 @@ use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-/// Try to extract a real tunnel URL from a cloudflared log line.
-///
-/// Returns `Some(url)` when the line contains a genuine tunnel endpoint,
-/// skipping documentation and warning URLs (quic-go GitHub links,
-/// Cloudflare docs pages, etc.).
 fn extract_tunnel_url(line: &str) -> Option<String> {
     let idx = line.find("https://")?;
     let url_part = &line[idx..];
@@ -32,7 +27,6 @@ fn extract_tunnel_url(line: &str) -> Option<String> {
 }
 
 /// Cloudflare Tunnel — wraps the `cloudflared` binary.
-///
 /// Requires `cloudflared` installed and a tunnel token from the
 /// Cloudflare Zero Trust dashboard.
 pub struct CloudflareTunnel {
@@ -73,10 +67,18 @@ impl Tunnel for CloudflareTunnel {
             .spawn()?;
 
         // Read stderr to find the public URL (cloudflared prints it there)
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture cloudflared stderr"))?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"tunnel_provider": "cloudflare", "stream": "stderr"})
+                    ),
+                "tunnel process: failed to capture child stream"
+            );
+            anyhow::Error::msg("Failed to capture cloudflared stderr")
+        })?;
 
         let mut reader = tokio::io::BufReader::new(stderr).lines();
         let mut public_url = String::new();
@@ -89,7 +91,12 @@ impl Tunnel for CloudflareTunnel {
 
             match line {
                 Ok(Ok(Some(l))) => {
-                    tracing::debug!("cloudflared: {l}");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"l": l})),
+                        "cloudflared: "
+                    );
                     if let Some(url) = extract_tunnel_url(&l) {
                         public_url = url;
                         break;

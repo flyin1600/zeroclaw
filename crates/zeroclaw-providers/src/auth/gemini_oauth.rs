@@ -1,12 +1,6 @@
 //! Google/Gemini OAuth2 authentication flow.
-//!
-//! Supports:
-//! - Authorization code flow with PKCE (loopback redirect)
-//! - Device code flow for headless environments
-//!
-//! Uses the same client credentials as Gemini CLI for compatibility.
 
-use crate::auth::oauth_common::{parse_query_params, url_decode, url_encode};
+use crate::auth::oauth_common::{is_structured_callback_input, parse_query_params, url_encode};
 use crate::auth::profiles::TokenSet;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -21,33 +15,6 @@ use tokio::net::TcpListener;
 // Re-export for external use (used by main.rs)
 #[allow(unused_imports)]
 pub use crate::auth::oauth_common::{PkceState, generate_pkce_state};
-
-/// Get Gemini OAuth client ID from environment.
-/// Required: set GEMINI_OAUTH_CLIENT_ID environment variable.
-pub fn gemini_oauth_client_id() -> Option<String> {
-    std::env::var("GEMINI_OAUTH_CLIENT_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-/// Get Gemini OAuth client secret from environment.
-/// Required: set GEMINI_OAUTH_CLIENT_SECRET environment variable.
-pub fn gemini_oauth_client_secret() -> Option<String> {
-    std::env::var("GEMINI_OAUTH_CLIENT_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-/// Get required OAuth credentials or return error.
-fn get_oauth_credentials() -> Result<(String, String)> {
-    let client_id = gemini_oauth_client_id().ok_or_else(|| {
-        anyhow::anyhow!("GEMINI_OAUTH_CLIENT_ID environment variable is required")
-    })?;
-    let client_secret = gemini_oauth_client_secret().ok_or_else(|| {
-        anyhow::anyhow!("GEMINI_OAUTH_CLIENT_SECRET environment variable is required")
-    })?;
-    Ok((client_id, client_secret))
-}
 
 pub const GOOGLE_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -101,11 +68,10 @@ struct OAuthErrorResponse {
     error_description: Option<String>,
 }
 
-pub fn build_authorize_url(pkce: &PkceState) -> Result<String> {
-    let (client_id, _) = get_oauth_credentials()?;
+pub fn build_authorize_url(client_id: &str, pkce: &PkceState) -> Result<String> {
     let mut params = BTreeMap::new();
     params.insert("response_type", "code");
-    params.insert("client_id", client_id.as_str());
+    params.insert("client_id", client_id);
     params.insert("redirect_uri", GEMINI_OAUTH_REDIRECT_URI);
     params.insert("scope", GEMINI_OAUTH_SCOPES);
     params.insert("code_challenge", pkce.code_challenge.as_str());
@@ -128,16 +94,17 @@ pub fn build_authorize_url(pkce: &PkceState) -> Result<String> {
 
 pub async fn exchange_code_for_tokens(
     client: &Client,
+    client_id: &str,
+    client_secret: &str,
     code: &str,
     pkce: &PkceState,
 ) -> Result<TokenSet> {
-    let (client_id, client_secret) = get_oauth_credentials()?;
     let form = [
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", GEMINI_OAUTH_REDIRECT_URI),
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
         ("code_verifier", &pkce.code_verifier),
     ];
 
@@ -182,13 +149,17 @@ pub async fn exchange_code_for_tokens(
     })
 }
 
-pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Result<TokenSet> {
-    let (client_id, client_secret) = get_oauth_credentials()?;
+pub async fn refresh_access_token(
+    client: &Client,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<TokenSet> {
     let form = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
-        ("client_id", client_id.as_str()),
-        ("client_secret", client_secret.as_str()),
+        ("client_id", client_id),
+        ("client_secret", client_secret),
     ];
 
     let response = client
@@ -207,7 +178,7 @@ pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Resul
     if !status.is_success() {
         if let Ok(err) = serde_json::from_str::<OAuthErrorResponse>(&body) {
             anyhow::bail!(
-                "Google OAuth refresh error: {} - {}",
+                "Google OAuth refresh error ({status}): {} - {}",
                 err.error,
                 err.error_description.unwrap_or_default()
             );
@@ -232,12 +203,8 @@ pub async fn refresh_access_token(client: &Client, refresh_token: &str) -> Resul
     })
 }
 
-pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> {
-    let (client_id, _) = get_oauth_credentials()?;
-    let form = [
-        ("client_id", client_id.as_str()),
-        ("scope", GEMINI_OAUTH_SCOPES),
-    ];
+pub async fn start_device_code_flow(client: &Client, client_id: &str) -> Result<DeviceCodeStart> {
+    let form = [("client_id", client_id), ("scope", GEMINI_OAUTH_SCOPES)];
 
     let response = client
         .post(GOOGLE_OAUTH_DEVICE_CODE_URL)
@@ -271,7 +238,7 @@ pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> 
 
     Ok(DeviceCodeStart {
         device_code: device_response.device_code,
-        verification_uri_complete: Some(format!("{}?user_code={}", &verification_url, &user_code)),
+        verification_uri_complete: Some(format!("{verification_url}?user_code={user_code}")),
         user_code,
         verification_uri: verification_url,
         expires_in: device_response.expires_in.unwrap_or(1800),
@@ -281,9 +248,10 @@ pub async fn start_device_code_flow(client: &Client) -> Result<DeviceCodeStart> 
 
 pub async fn poll_device_code_tokens(
     client: &Client,
+    client_id: &str,
+    client_secret: &str,
     device: &DeviceCodeStart,
 ) -> Result<TokenSet> {
-    let (client_id, client_secret) = get_oauth_credentials()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(device.expires_in);
     let interval = Duration::from_secs(device.interval.max(5));
 
@@ -295,8 +263,8 @@ pub async fn poll_device_code_tokens(
         tokio::time::sleep(interval).await;
 
         let form = [
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
             ("device_code", device.device_code.as_str()),
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ];
@@ -354,10 +322,20 @@ pub async fn poll_device_code_tokens(
 }
 
 /// Receive OAuth code via loopback callback OR manual stdin input.
-///
 /// If the callback server can't receive the redirect (e.g., remote/headless environment),
 /// the user can paste the full callback URL or just the code.
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
+    ::zeroclaw_log::scope!(
+        model_provider_type: "gemini",
+        model_provider_alias: "oauth",
+        => async move {
+            receive_loopback_code_inner(expected_state, timeout).await
+        }
+    )
+    .await
+}
+
+async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) -> Result<String> {
     // Try to bind to the callback port
     let listener = match TcpListener::bind("127.0.0.1:1456").await {
         Ok(l) => l,
@@ -385,14 +363,15 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
                         .context("Failed to read from callback connection")?;
 
                     let request = String::from_utf8_lossy(&buffer[..n]);
-                    let (code, state) = parse_callback_request(&request)?;
-
-                    if state != expected_state {
+                    let code = match parse_callback_request(&request, expected_state) {
+                        Ok(code) => code,
+                        Err(error) => {
                         let response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n\
-                             <html><body><h1>State mismatch</h1><p>Please try again.</p></body></html>";
+                             <html><body><h1>Invalid callback</h1><p>Please try again.</p></body></html>";
                         let _ = stream.write_all(response.as_bytes()).await;
-                        anyhow::bail!("OAuth state mismatch");
-                    }
+                            return Err(error);
+                        }
+                    };
 
                     let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
                          <html><body><h1>Success!</h1><p>You can close this window and return to the terminal.</p></body></html>";
@@ -400,7 +379,20 @@ pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> R
 
                     Ok(code)
                 }
-                Ok(Err(e)) => Err(anyhow::anyhow!("Failed to accept connection: {e}")),
+                Ok(Err(e)) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "oauth_provider": "gemini",
+                                "phase": "callback_accept",
+                                "error": format!("{}", e),
+                            })),
+                        "gemini_oauth: failed to accept callback connection"
+                    );
+                    Err(anyhow::Error::msg(format!("Failed to accept connection: {e}")))
+                }
                 Err(_) => {
                     eprintln!("\nCallback timeout. Falling back to manual input.");
                     receive_code_from_stdin(expected_state).await
@@ -424,9 +416,16 @@ async fn receive_code_from_stdin(expected_state: &str) -> Result<String> {
         stdin.lock().read_line(&mut line).ok();
         let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
-            return Err(anyhow::anyhow!("No input received"));
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"oauth_provider": "gemini"})),
+                "gemini_oauth: empty stdin input for OAuth code"
+            );
+            return Err(anyhow::Error::msg("No input received"));
         }
-        parse_code_from_redirect(&trimmed, Some(&expected))
+        parse_manual_code_input(&trimmed, &expected)
     })
     .await
     .context("Failed to read from stdin")??;
@@ -434,69 +433,109 @@ async fn receive_code_from_stdin(expected_state: &str) -> Result<String> {
     Ok(input)
 }
 
-fn parse_callback_request(request: &str) -> Result<(String, String)> {
+fn parse_callback_request(request: &str, expected_state: &str) -> Result<String> {
     let first_line = request.lines().next().unwrap_or("");
-    let path = first_line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let path = first_line.split_whitespace().nth(1).unwrap_or("");
 
-    let query_start = path.find('?').map(|i| i + 1).unwrap_or(path.len());
-    let query = &path[query_start..];
-
-    let mut code = None;
-    let mut state = None;
-
-    for pair in query.split('&') {
-        if let Some((key, value)) = pair.split_once('=') {
-            match key {
-                "code" => code = Some(url_decode(value)),
-                "state" => state = Some(url_decode(value)),
-                _ => {}
-            }
-        }
-    }
-
-    let code = code.ok_or_else(|| anyhow::anyhow!("No 'code' parameter in callback"))?;
-    let state = state.ok_or_else(|| anyhow::anyhow!("No 'state' parameter in callback"))?;
-
-    Ok((code, state))
+    parse_callback_code(path, expected_state)
 }
 
-pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {
+fn parse_callback_code(input: &str, expected_state: &str) -> Result<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         anyhow::bail!("No OAuth code provided");
     }
 
-    // Extract query string
-    let query = if let Some((_, right)) = trimmed.split_once('?') {
-        right
-    } else {
-        trimmed
-    };
-
+    let query = trimmed.split_once('?').map_or(trimmed, |(_, query)| query);
     let params = parse_query_params(query);
 
-    // If we have code param, extract it
-    if let Some(code) = params.get("code") {
-        // Validate state if expected
-        if let Some(expected) = expected_state
-            && let Some(actual) = params.get("state")
-            && actual != expected
-        {
-            anyhow::bail!("OAuth state mismatch: expected {expected}, got {actual}");
-        }
-        return Ok(code.clone());
+    parse_callback_params(&params, expected_state)
+}
+
+fn parse_callback_params(
+    params: &std::collections::BTreeMap<String, String>,
+    expected_state: &str,
+) -> Result<String> {
+    let state = params.get("state").ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "oauth_provider": "gemini",
+                    "missing": "state",
+                })),
+            "gemini_oauth: callback missing state parameter"
+        );
+        anyhow::Error::msg("No 'state' parameter in callback")
+    })?;
+    if state != expected_state {
+        anyhow::bail!("OAuth state mismatch");
     }
 
-    // Otherwise, assume it's the raw code (if long enough and no spaces)
+    if let Some(error) = params.get("error") {
+        let description = params
+            .get("error_description")
+            .map_or("OAuth authorization failed", String::as_str);
+        anyhow::bail!("Google OAuth error: {error} - {description}");
+    }
+
+    let code = params
+        .get("code")
+        .filter(|code| !code.trim().is_empty())
+        .ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "oauth_provider": "gemini",
+                        "missing": "code",
+                    })),
+                "gemini_oauth: callback missing code parameter"
+            );
+            anyhow::Error::msg("No 'code' parameter in callback")
+        })?;
+
+    Ok(code.trim().to_string())
+}
+
+pub(super) fn parse_manual_code_input(input: &str, expected_state: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("No OAuth code provided");
+    }
+
+    let query = trimmed.split_once('?').map_or(trimmed, |(_, query)| query);
+    let params = parse_query_params(query);
+    if is_structured_callback_input(trimmed, "/auth/callback") {
+        return parse_callback_params(&params, expected_state);
+    }
+
     if trimmed.len() > 10 && !trimmed.contains(' ') && !trimmed.contains('&') {
         return Ok(trimmed.to_string());
     }
 
     anyhow::bail!("Could not parse OAuth code from input")
+}
+
+pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Result<String> {
+    match expected_state {
+        Some(state) => parse_callback_code(input, state),
+        None => {
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("No OAuth code provided");
+            }
+            if is_structured_callback_input(trimmed, "/auth/callback") {
+                anyhow::bail!("Expected OAuth state is required for callback input");
+            }
+            if trimmed.len() > 10 && !trimmed.contains(' ') && !trimmed.contains('&') {
+                return Ok(trimmed.to_string());
+            }
+            anyhow::bail!("Could not parse OAuth code from input")
+        }
+    }
 }
 
 /// Extract account email from Google ID token.
@@ -565,7 +604,8 @@ mod tests {
             EnvVarRestore::set("GEMINI_OAUTH_CLIENT_SECRET", "test-client-secret");
 
         let pkce = generate_pkce_state();
-        let url = build_authorize_url(&pkce).expect("Failed to build authorize URL");
+        let url =
+            build_authorize_url("test-client-id", &pkce).expect("Failed to build authorize URL");
         assert!(url.contains("accounts.google.com"));
         assert!(url.contains("client_id="));
         assert!(url.contains("redirect_uri="));
@@ -574,17 +614,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_code_from_url() {
+    fn callback_redirect_requires_matching_state() {
         let url = "http://localhost:1456/auth/callback?code=4/0test&state=xyz";
-        let code = parse_code_from_redirect(url, Some("xyz")).unwrap();
+        let code = parse_callback_code(url, "xyz").unwrap();
         assert_eq!(code, "4/0test");
+
+        assert!(parse_callback_code("/auth/callback?code=4/0test", "xyz").is_err());
+        assert!(parse_callback_code("4/0test", "xyz").is_err());
     }
 
     #[test]
-    fn parse_code_from_raw() {
+    fn manual_code_input_accepts_raw_code() {
         let raw = "4/0AcvDMrC1234567890abcdef";
-        let code = parse_code_from_redirect(raw, None).unwrap();
+        let code = parse_manual_code_input(raw, "xyz").unwrap();
         assert_eq!(code, raw);
+    }
+
+    #[test]
+    fn manual_callback_input_rejects_missing_or_mismatched_state() {
+        assert!(parse_manual_code_input("/auth/callback?code=4/0test", "xyz").is_err());
+        for input in [
+            "/auth/callback?code=4/0test&state=wrong",
+            "?code=4/0test&state=wrong",
+            "https://example.test/other?code=4/0test&state=wrong",
+        ] {
+            assert!(parse_manual_code_input(input, "xyz").is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn manual_callback_input_rejects_url_or_path_without_query() {
+        for input in ["http://localhost:1456/auth/callback", "/auth/callback"] {
+            assert!(parse_manual_code_input(input, "xyz").is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn compatibility_parser_accepts_raw_code_only_without_state_expectation() {
+        let raw = "4/0AcvDMrC1234567890abcdef";
+        assert_eq!(parse_code_from_redirect(raw, None).unwrap(), raw);
+        assert!(parse_code_from_redirect(raw, Some("xyz")).is_err());
     }
 
     #[test]

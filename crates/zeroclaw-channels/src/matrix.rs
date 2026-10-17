@@ -1,20 +1,4 @@
 //! Matrix channel using matrix-rust-sdk 0.16.
-//!
-//! Organisation (single file, internal `mod` blocks):
-//! - `markers`: parse `[image:...] [voice:...]` etc. from outbound text
-//! - `mention`: detect `m.mentions.user_ids` + body fallback
-//! - `allowlist`: filter inbound by sender + room
-//! - `approval`: 8-char token gen + reply parser
-//! - `context`: thread-root preamble fetcher + delivered-set
-//! - `streaming`: Partial + MultiMessage state machines
-//! - `session`: `session.json` blob persistence next to the SQLite store
-//! - `client`: SDK build, login/restore, recovery, cross-signing bootstrap, alias resolve
-//! - `inbound`: event handlers + sync loop
-//! - `outbound`: Channel::send + reactions + redact + media upload
-//!
-//! All protocol details (E2EE, sync token, encrypted upload, edits, threads, recovery)
-//! are delegated to the SDK. We only own user-facing config logic and small bits of
-//! cross-cutting state.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -26,19 +10,30 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
 
 use matrix_sdk::{
-    Client,
-    ruma::{OwnedEventId, OwnedRoomId},
+    Client, RoomMemberships,
+    ruma::{
+        OwnedEventId, OwnedRoomId, OwnedUserId,
+        api::client::{
+            membership::invite_user::v3::{
+                InvitationRecipient, InviteUserId, Request as InviteUserRequest,
+            },
+            room::{Visibility as MatrixVisibility, create_room::v3::Request as CreateRoomRequest},
+        },
+        events::{InitialStateEvent, room::encryption::RoomEncryptionEventContent},
+    },
 };
 
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
+    DraftProgressKind, RoomCreationOptions, RoomVisibility, SendMessage,
 };
-use zeroclaw_config::schema::{MatrixConfig, StreamMode, TranscriptionConfig};
+use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
+use zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER;
 
 // ─── markers ───────────────────────────────────────────────────────────────
 mod markers {
@@ -178,24 +173,59 @@ mod mention {
         }
         false
     }
+
+    /// Group `mention_only` admits either an explicit mention or a direct reply
+    /// to a bot message (Telegram parity: replies are unambiguous intent).
+    pub(super) fn admit_group_message(is_mentioned: bool, is_reply_to_bot: bool) -> bool {
+        is_mentioned || is_reply_to_bot
+    }
+
+    /// True when a Matrix event JSON `sender` equals `user_id`.
+    /// Production admission uses `TimelineEvent::sender()`; this helper remains
+    /// for focused unit coverage of the JSON sender comparison.
+    #[cfg(test)]
+    pub(super) fn sender_is_user(raw_json: &str, user_id: &UserId) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+            return false;
+        };
+        v.get("sender").and_then(|s| s.as_str()) == Some(user_id.as_str())
+    }
 }
 
 // ─── allowlist ─────────────────────────────────────────────────────────────
 mod allowlist {
-    /// Matrix user IDs are spec-lowercase for the localpart, but some
-    /// homeservers accept capitalised forms in the auth layer. An operator
-    /// who configured `allowed_users = ["@Bot:Example.org"]` would silently
-    /// see no messages on a strict byte match — the channel filters to
-    /// `@bot:example.org`. ASCII case-insensitive match is the conservative
-    /// reading.
     pub(super) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
-        if allowed_users.is_empty() {
-            return false;
+        crate::allowlist::is_user_allowed(
+            allowed_users,
+            sender,
+            crate::allowlist::Match::CaseInsensitive,
+        )
+    }
+
+    /// Matches a voice-peer entry against a joined member's user ID the same
+    /// way the runtime matches an inbound sender: a leading `@` is optional on
+    /// either side and the comparison ignores ASCII case. Without this, a group
+    /// written as `alice:server` would voice ordinary replies (which the
+    /// runtime resolves) but silently fail to voice proactive sends (which have
+    /// to consult room membership), and a half-working config is exactly the
+    /// failure this gate exists to remove.
+    pub(super) fn voice_peer_matches(entry: &str, user_id: &str) -> bool {
+        entry
+            .trim_start_matches('@')
+            .eq_ignore_ascii_case(user_id.trim_start_matches('@'))
+    }
+
+    /// Voice verdict that needs no member list: an empty voice-peer set voices
+    /// nobody, and a `["*"]` set voices every room. `None` means the room's
+    /// membership decides, which costs a homeserver round-trip.
+    pub(super) fn voice_peers_verdict(voice_peers: &[String]) -> Option<bool> {
+        if voice_peers.is_empty() {
+            return Some(false);
         }
-        if allowed_users.iter().any(|u| u == "*") {
-            return true;
+        if voice_peers.iter().any(|peer| peer == "*") {
+            return Some(true);
         }
-        allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
+        None
     }
 
     pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
@@ -211,7 +241,7 @@ mod allowlist {
 // ─── approval ──────────────────────────────────────────────────────────────
 mod approval {
     use rand::{Rng, RngExt};
-    use zeroclaw_api::channel::ChannelApprovalResponse;
+    use zeroclaw_api::channel::{ChannelApprovalResponse, SendMessage};
 
     pub(super) const TOKEN_LEN: usize = 8;
     const TOKEN_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -225,6 +255,14 @@ mod approval {
     pub(super) fn generate_token_default() -> String {
         let mut rng = rand::rng();
         generate_token(&mut rng)
+    }
+
+    /// Build the outbound `SendMessage` for an approval prompt: the rendered
+    /// prompt text to the requesting recipient, with voice synthesis
+    /// suppressed. Kept as a small, pure helper so tests can assert its shape
+    /// (recipient, voice suppression) without standing up a live client.
+    pub(super) fn build_prompt_message(prompt: String, recipient: &str) -> SendMessage {
+        SendMessage::new(prompt, recipient).suppress_voice()
     }
 
     /// Try to parse an approval reply. Returns `Some((token, response))` if the
@@ -244,12 +282,69 @@ mod approval {
             return None;
         }
         let response = match verb.as_str() {
-            "approve" | "yes" | "y" => ChannelApprovalResponse::Approve,
-            "deny" | "no" | "n" => ChannelApprovalResponse::Deny,
-            "always" => ChannelApprovalResponse::AlwaysApprove,
+            crate::util::APPROVAL_REPLY_APPROVE
+            | crate::util::APPROVAL_REPLY_YES
+            | crate::util::APPROVAL_REPLY_YES_SHORT => ChannelApprovalResponse::Approve,
+            crate::util::APPROVAL_REPLY_DENY
+            | crate::util::APPROVAL_REPLY_NO
+            | crate::util::APPROVAL_REPLY_NO_SHORT => ChannelApprovalResponse::Deny,
+            crate::util::APPROVAL_REPLY_ALWAYS => ChannelApprovalResponse::AlwaysApprove,
             _ => return None,
         };
         Some((token.to_uppercase(), response))
+    }
+}
+
+// ─── room management ──────────────────────────────────────────────────────
+mod room_management {
+    use super::*;
+
+    pub(super) fn build_create_room_request(
+        options: &RoomCreationOptions,
+    ) -> Result<CreateRoomRequest> {
+        let mut request = CreateRoomRequest::new();
+        request.name = options.name.clone();
+        request.topic = options.topic.clone();
+        request.invite = options
+            .invites
+            .iter()
+            .map(|user_id| {
+                user_id
+                    .parse::<OwnedUserId>()
+                    .with_context(|| format!("matrix: invalid invite user id '{user_id}'"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(visibility) = options.visibility {
+            request.visibility = match visibility {
+                RoomVisibility::Private => MatrixVisibility::Private,
+                RoomVisibility::Public => MatrixVisibility::Public,
+            };
+        }
+        if options.encryption.unwrap_or(false) {
+            request.initial_state.push(
+                InitialStateEvent::with_empty_state_key(
+                    RoomEncryptionEventContent::with_recommended_defaults(),
+                )
+                .to_raw_any(),
+            );
+        }
+        Ok(request)
+    }
+
+    pub(super) fn build_invite_user_request(
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<InviteUserRequest> {
+        let room_id = room_id
+            .parse::<OwnedRoomId>()
+            .with_context(|| format!("matrix: invalid room id '{room_id}'"))?;
+        let user_id = user_id
+            .parse::<OwnedUserId>()
+            .with_context(|| format!("matrix: invalid user id '{user_id}'"))?;
+        Ok(InviteUserRequest::new(
+            room_id,
+            InvitationRecipient::from(InviteUserId::new(user_id)),
+        ))
     }
 }
 
@@ -310,15 +405,43 @@ mod context {
 // ─── streaming ─────────────────────────────────────────────────────────────
 mod streaming {
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         time::{Duration, Instant},
     };
 
+    use anyhow::{Result, bail};
     use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
+    use zeroclaw_runtime::agent::loop_::{
+        DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, is_thinking_status_text, thinking_status_round,
+    };
 
-    use super::markers;
+    use super::{DraftProgress, DraftProgressKind, MatrixStreamMode, markers};
 
-    pub(super) type DraftKey = OwnedRoomId;
+    const MULTI_MESSAGE_SYNTHETIC_PREFIX: &str = "multi_message_synthetic:";
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub(super) struct DraftKey {
+        room_id: OwnedRoomId,
+        draft_id: String,
+    }
+
+    pub(super) fn draft_key(room_id: OwnedRoomId, draft_id: &str) -> Result<DraftKey> {
+        let draft_id = draft_id.trim();
+        if draft_id.is_empty() {
+            bail!("matrix: draft message id is empty");
+        }
+        Ok(DraftKey {
+            room_id,
+            draft_id: draft_id.to_string(),
+        })
+    }
+
+    pub(super) fn new_multi_message_draft_id() -> String {
+        format!(
+            "{MULTI_MESSAGE_SYNTHETIC_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        )
+    }
 
     #[derive(Debug, Clone)]
     pub(super) struct PartialDraft {
@@ -335,21 +458,191 @@ mod streaming {
         EmptyError,
     }
 
+    /// Matrix-only progress draft for `stream_mode = "single_message"`.
+    /// It owns only live Matrix event state; the canonical config values stay
+    /// on `MatrixConfig`. Lines are stored as a deque so enforcing
+    /// `stream_draft_lines` is an O(1) pop from the front instead of repeatedly
+    /// re-splitting the rendered draft.
+    #[derive(Debug, Clone)]
+    pub(super) struct SingleDraft {
+        pub event_id: OwnedEventId,
+        pub thread_anchor: Option<OwnedEventId>,
+        /// Source of truth for the current visible progress window.
+        pub lines: VecDeque<DraftProgress>,
+        /// Last body confirmed by a successful Matrix edit, used to decide
+        /// whether retained drafts need a final flush.
+        pub last_text: String,
+        /// Last edit attempt timestamp, used only for Matrix edit throttling.
+        pub last_edit: Instant,
+    }
+
     /// MultiMessage streaming state. The runtime calls `update_draft` repeatedly
     /// with the accumulated agent output; we send each `\n\n`-bounded paragraph
     /// as its own room message, threaded under `thread_anchor` when present.
-    /// `sent_so_far` is a byte counter into the accumulated text — everything
-    /// before that index has already been emitted.
+    /// `confirmed_prefix` holds the exact frame prefix already emitted — the
+    /// confirmed byte offset is `confirmed_prefix.len()`. Keeping the bytes
+    /// (not just a count) lets `multi_update` detect and remap the offset when
+    /// a later sanitizer pass rewrites the frame before it (see
+    /// [`crate::orchestrator::remap_confirmed_offset`]).
     #[derive(Debug, Clone)]
     pub(super) struct MultiDraft {
         pub thread_anchor: Option<OwnedEventId>,
-        pub sent_so_far: usize,
+        pub confirmed_prefix: String,
     }
 
+    /// Live draft storage for the Matrix stream mode selected at channel
+    /// construction. A channel handle has an immutable `MatrixConfig`, so
+    /// keeping only the active draft map prevents impossible cross-mode state
+    /// while preserving concurrent draft isolation within that mode.
     #[derive(Default, Debug)]
-    pub(super) struct State {
-        pub partial: HashMap<DraftKey, PartialDraft>,
-        pub multi: HashMap<DraftKey, MultiDraft>,
+    pub(super) enum State {
+        #[default]
+        Off,
+        Partial(HashMap<DraftKey, PartialDraft>),
+        Single(HashMap<DraftKey, SingleDraft>),
+        Multi(HashMap<DraftKey, MultiDraft>),
+    }
+
+    impl State {
+        /// Create the draft store matching the immutable Matrix stream mode.
+        pub(super) fn for_stream_mode(mode: MatrixStreamMode) -> Self {
+            match mode {
+                MatrixStreamMode::Off => Self::Off,
+                MatrixStreamMode::Partial => Self::Partial(HashMap::new()),
+                MatrixStreamMode::SingleMessage => Self::Single(HashMap::new()),
+                MatrixStreamMode::MultiMessage => Self::Multi(HashMap::new()),
+            }
+        }
+    }
+
+    pub(super) fn insert_partial(
+        state: &mut State,
+        key: DraftKey,
+        draft: PartialDraft,
+    ) -> Result<()> {
+        let State::Partial(drafts) = state else {
+            bail!("matrix: partial draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
+    }
+
+    pub(super) fn partial_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut PartialDraft> {
+        match state {
+            State::Partial(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
+    }
+
+    pub(super) fn take_partial(state: &mut State, key: &DraftKey) -> Option<PartialDraft> {
+        match state {
+            State::Partial(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn partial_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Partial(drafts) if drafts.contains_key(key))
+    }
+
+    #[cfg(test)]
+    pub(super) fn partial_len(state: &State) -> usize {
+        match state {
+            State::Partial(drafts) => drafts.len(),
+            _ => 0,
+        }
+    }
+
+    pub(super) fn insert_single(
+        state: &mut State,
+        key: DraftKey,
+        draft: SingleDraft,
+    ) -> Result<()> {
+        let State::Single(drafts) = state else {
+            bail!("matrix: single-message draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
+    }
+
+    /// Return the editable `single_message` draft for this room+draft id, if it
+    /// is still active.
+    pub(super) fn single_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut SingleDraft> {
+        match state {
+            State::Single(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
+    }
+
+    /// Remove the `single_message` draft from live state at finalize/cancel so
+    /// a late progress update cannot keep editing a completed response.
+    pub(super) fn take_single(state: &mut State, key: &DraftKey) -> Option<SingleDraft> {
+        match state {
+            State::Single(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn single_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Single(drafts) if drafts.contains_key(key))
+    }
+
+    pub(super) fn insert_multi(state: &mut State, key: DraftKey, draft: MultiDraft) -> Result<()> {
+        let State::Multi(drafts) = state else {
+            bail!("matrix: multi-message draft state unavailable");
+        };
+        drafts.insert(key, draft);
+        Ok(())
+    }
+
+    pub(super) fn multi_for_update<'a>(
+        state: &'a mut State,
+        key: &DraftKey,
+    ) -> Option<&'a mut MultiDraft> {
+        match state {
+            State::Multi(drafts) => drafts.get_mut(key),
+            _ => None,
+        }
+    }
+
+    pub(super) fn take_multi(state: &mut State, key: &DraftKey) -> Option<MultiDraft> {
+        match state {
+            State::Multi(drafts) => drafts.remove(key),
+            _ => None,
+        }
+    }
+
+    /// Read-only confirmed-delivery offset for a live MultiMessage draft.
+    pub(super) fn multi_sent_so_far(state: &State, key: &DraftKey) -> Option<usize> {
+        match state {
+            State::Multi(drafts) => drafts.get(key).map(|d| d.confirmed_prefix.len()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn multi_contains(state: &State, key: &DraftKey) -> bool {
+        matches!(state, State::Multi(drafts) if drafts.contains_key(key))
+    }
+
+    /// Thread anchor of the live draft for `key`, without consuming it. The
+    /// finalize path needs it to place a voice note in the same thread as the
+    /// text reply it accompanies.
+    pub(super) fn peek_thread_anchor(state: &State, key: &DraftKey) -> Option<OwnedEventId> {
+        match state {
+            State::Off => None,
+            State::Partial(m) => m.get(key).and_then(|d| d.thread_anchor.clone()),
+            State::Single(m) => m.get(key).and_then(|d| d.thread_anchor.clone()),
+            State::Multi(m) => m.get(key).and_then(|d| d.thread_anchor.clone()),
+        }
     }
 
     pub(super) fn partial_should_edit(
@@ -372,6 +665,471 @@ mod streaming {
         } else {
             Some(cleaned.to_string())
         }
+    }
+
+    /// Append one progress update to a single-message draft, dropping the
+    /// oldest entries once the configured window is full. A zero limit
+    /// intentionally means "unlimited".
+    pub(super) fn push_single_progress_line(draft: &mut SingleDraft, text: &str, max_lines: usize) {
+        push_single_progress(draft, legacy_single_progress(text), max_lines);
+    }
+
+    /// Classify callers of the legacy text-only API using the historical
+    /// display convention. Typed callers bypass this heuristic.
+    pub(super) fn legacy_single_progress(text: &str) -> DraftProgress {
+        let kind = if text.starts_with(REASONING_FULL_PREFIX) && !is_thinking_status_text(text) {
+            DraftProgressKind::Reasoning
+        } else {
+            DraftProgressKind::Status
+        };
+        DraftProgress {
+            kind,
+            text: text.to_string(),
+        }
+    }
+
+    /// Append progress while retaining the source kind supplied by the
+    /// orchestrator, including when reasoning renders like generated status.
+    pub(super) fn push_single_progress(
+        draft: &mut SingleDraft,
+        progress: DraftProgress,
+        max_lines: usize,
+    ) {
+        let progress = normalize_matrix_progress(progress);
+        if progress.text.is_empty() {
+            return;
+        }
+        if merge_single_progress_line(draft, &progress) {
+            trim_single_visible_lines(draft, max_lines);
+            return;
+        }
+        draft.lines.push_back(progress);
+        trim_single_visible_lines(draft, max_lines);
+    }
+
+    /// Reasoning arrives as provider stream fragments. Keep it as one Matrix
+    /// transcript entry and let `draft_update_interval_ms` decide how often
+    /// that growing text is edited into the room.
+    fn merge_single_progress_line(draft: &mut SingleDraft, progress: &DraftProgress) -> bool {
+        if let Some(incoming_round) = single_thinking_status_round(progress)
+            && let Some(existing) = draft.lines.back_mut()
+            && is_single_thinking_status(existing)
+        {
+            if incoming_round >= single_thinking_status_round(existing).unwrap_or(0) {
+                *existing = progress.clone();
+            }
+            return true;
+        }
+
+        if let Some(fragment) = progress.text.strip_prefix(REASONING_FULL_PREFIX)
+            && let Some(existing) = draft.lines.back_mut()
+            && is_single_reasoning_progress(existing)
+        {
+            existing.text.push_str(fragment);
+            return true;
+        }
+
+        false
+    }
+
+    fn single_thinking_status_round(progress: &DraftProgress) -> Option<usize> {
+        matches!(progress.kind, DraftProgressKind::Status)
+            .then(|| thinking_status_round(&progress.text))
+            .flatten()
+    }
+
+    fn is_single_thinking_status(progress: &DraftProgress) -> bool {
+        single_thinking_status_round(progress).is_some()
+    }
+
+    fn is_single_reasoning_progress(progress: &DraftProgress) -> bool {
+        matches!(progress.kind, DraftProgressKind::Reasoning)
+            && progress.text.starts_with(REASONING_FULL_PREFIX)
+    }
+
+    fn visible_line_count(progress: &DraftProgress) -> usize {
+        single_render_line(progress).split('\n').count().max(1)
+    }
+
+    fn trim_visible_lines_from_front(
+        progress: &DraftProgress,
+        remove_lines: usize,
+    ) -> DraftProgress {
+        if remove_lines == 0 {
+            return progress.clone();
+        }
+
+        let rendered = single_render_line(progress);
+        let total = visible_line_count(progress);
+        if remove_lines >= total {
+            let mut empty = progress.clone();
+            empty.text.clear();
+            return empty;
+        }
+
+        let retained = rendered
+            .split('\n')
+            .skip(remove_lines)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = if is_single_reasoning_progress(progress)
+            && !retained.starts_with(REASONING_FULL_PREFIX)
+        {
+            format!("{REASONING_FULL_PREFIX}{retained}")
+        } else {
+            retained
+        };
+        DraftProgress {
+            kind: progress.kind,
+            text,
+        }
+    }
+
+    fn trim_single_visible_lines(draft: &mut SingleDraft, max_lines: usize) {
+        if max_lines == 0 {
+            return;
+        }
+        let mut total_lines = draft.lines.iter().map(visible_line_count).sum::<usize>();
+        while total_lines > max_lines {
+            let remove_lines = total_lines - max_lines;
+            let Some(front) = draft.lines.front_mut() else {
+                break;
+            };
+            let front_lines = visible_line_count(front);
+            if remove_lines >= front_lines {
+                draft.lines.pop_front();
+                total_lines = total_lines.saturating_sub(front_lines);
+            } else {
+                *front = trim_visible_lines_from_front(front, remove_lines);
+                break;
+            }
+        }
+    }
+
+    /// Keep multiline reasoning readable while preventing progress content from
+    /// becoming Matrix Markdown or HTML formatting. This is deliberately an
+    /// output transport encoder: it is applied once at insertion, never while
+    /// re-rendering a retained draft.
+    /// Tool/status progress remains one logical line; only raw reasoning gets
+    /// real newlines.
+    #[cfg(test)]
+    pub(super) fn normalize_matrix_progress_line(text: &str) -> String {
+        let kind = if text.starts_with(REASONING_FULL_PREFIX) && !is_thinking_status_text(text) {
+            DraftProgressKind::Reasoning
+        } else {
+            DraftProgressKind::Status
+        };
+        normalize_matrix_progress(DraftProgress {
+            kind,
+            text: text.to_string(),
+        })
+        .text
+    }
+
+    fn normalize_matrix_progress(mut progress: DraftProgress) -> DraftProgress {
+        if is_single_thinking_status(&progress) {
+            return progress;
+        }
+
+        let preserve_newlines = is_single_reasoning_progress(&progress);
+        let text = progress.text;
+        let mut normalized = String::with_capacity(text.len().saturating_mul(2));
+        let mut chars = text.trim_end_matches(&['\r', '\n'][..]).chars().peekable();
+        let mut line_start = true;
+        let mut leading_spaces = 0usize;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\n' if preserve_newlines => {
+                    normalized.push('\n');
+                    line_start = true;
+                    leading_spaces = 0;
+                }
+                '\n' => normalized.push('␊'),
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    if preserve_newlines {
+                        normalized.push('\n');
+                        line_start = true;
+                        leading_spaces = 0;
+                    } else {
+                        normalized.push('␊');
+                    }
+                }
+                '\t' => normalized.push('␉'),
+                '\u{000b}' => normalized.push('␋'),
+                '\u{000c}' => normalized.push('␌'),
+                '\u{001b}' => normalized.push('␛'),
+                '\u{007f}' => normalized.push('␡'),
+                c if c.is_control() => normalized.push('�'),
+                ' ' if line_start => {
+                    leading_spaces += 1;
+                    if leading_spaces == 4 {
+                        // A non-breaking first indentation space keeps literal
+                        // progress out of CommonMark's indented-code mode.
+                        let start = normalized.len().saturating_sub(3);
+                        normalized.replace_range(start..start + 1, "\u{00a0}");
+                        normalized.push(' ');
+                    } else {
+                        normalized.push(' ');
+                    }
+                }
+                c if c.is_ascii_punctuation() => {
+                    normalized.push('\\');
+                    normalized.push(c);
+                }
+                c => normalized.push(c),
+            }
+            if !matches!(ch, ' ' | '\n' | '\r') {
+                line_start = false;
+            }
+        }
+        progress.text = normalized;
+        progress
+    }
+
+    fn single_render_line(progress: &DraftProgress) -> &str {
+        if is_single_thinking_status(progress) {
+            progress.text.trim_end_matches('\n')
+        } else {
+            &progress.text
+        }
+    }
+
+    #[derive(Clone)]
+    struct VisibleProgressUnit {
+        text: String,
+        reasoning: bool,
+    }
+
+    fn visible_progress_units(draft: &SingleDraft) -> Vec<VisibleProgressUnit> {
+        draft
+            .lines
+            .iter()
+            .flat_map(|progress| {
+                if let Some(reasoning) = progress.text.strip_prefix(REASONING_FULL_PREFIX)
+                    && is_single_reasoning_progress(progress)
+                {
+                    reasoning
+                        .split('\n')
+                        .map(|text| VisibleProgressUnit {
+                            text: text.to_string(),
+                            reasoning: true,
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![VisibleProgressUnit {
+                        text: single_render_line(progress).to_string(),
+                        reasoning: false,
+                    }]
+                }
+            })
+            .collect()
+    }
+
+    fn render_visible_progress_units(units: &[VisibleProgressUnit]) -> String {
+        let mut text = String::new();
+        let mut previous_reasoning = false;
+        for unit in units {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            if unit.reasoning && !previous_reasoning {
+                text.push_str(REASONING_FULL_PREFIX);
+            }
+            text.push_str(&unit.text);
+            previous_reasoning = unit.reasoning;
+        }
+        text
+    }
+
+    fn oversized_progress_alert(unit: &VisibleProgressUnit) -> String {
+        let alert = zeroclaw_runtime::i18n::get_required_cli_string(
+            "channel-runtime-matrix-progress-item-too-large",
+        );
+        if unit.reasoning {
+            return format!("{REASONING_FULL_PREFIX}{alert}");
+        }
+        let text = unit.text.trim_end();
+        if let Some((marker, subject)) = text.split_once(' ')
+            && matches!(marker, "⏳" | "✅" | "❌")
+        {
+            let subject = subject
+                .split_once("\\:")
+                .map_or(subject, |(tool, _)| tool)
+                .trim();
+            return format!("{marker} {subject}: {alert}");
+        }
+        format!("⚠️ {alert}")
+    }
+
+    fn single_visible_text_with_fit<F>(draft: &SingleDraft, fits: F) -> String
+    where
+        F: Fn(&str) -> bool,
+    {
+        let units = visible_progress_units(draft);
+        let mut start = units.len();
+        while start > 0 {
+            let candidate = render_visible_progress_units(&units[start - 1..]);
+            if !fits(&candidate) {
+                break;
+            }
+            start -= 1;
+        }
+        if start == units.len() {
+            return units
+                .last()
+                .map(oversized_progress_alert)
+                .filter(|alert| fits(alert))
+                .unwrap_or_default();
+        }
+        render_visible_progress_units(&units[start..])
+    }
+
+    /// Render the newest complete physical reasoning lines and atomic progress
+    /// entries that fit within a byte budget. A separately supplied exact
+    /// Matrix-event fitter is used in production; this source-byte version is
+    /// retained for local state tests.
+    #[cfg(test)]
+    pub(super) fn single_visible_text_with_budget(draft: &SingleDraft, max_bytes: usize) -> String {
+        if max_bytes == 0 {
+            return String::new();
+        }
+        single_visible_text_with_fit(draft, |text| text.len() <= max_bytes)
+    }
+
+    pub(super) fn single_visible_text_with_edit_budget(
+        draft: &SingleDraft,
+        max_bytes: usize,
+    ) -> String {
+        single_visible_text_with_fit(draft, |text| {
+            super::outbound::serialized_edit_content_len(text, &draft.event_id)
+                .is_some_and(|actual| actual <= max_bytes)
+        })
+    }
+
+    /// Check the Matrix edit-attempt interval before rendering the draft body.
+    /// Progress lines are still recorded first, so retained drafts can flush
+    /// the latest transcript during finalization without paying render cost on
+    /// every debounced tick.
+    pub(super) fn single_edit_interval_elapsed(
+        existing: &SingleDraft,
+        now: Instant,
+        min_interval: Duration,
+    ) -> bool {
+        now.saturating_duration_since(existing.last_edit) >= min_interval
+    }
+
+    /// Avoid duplicate Matrix edits after rendering confirms that the visible
+    /// transcript is unchanged.
+    pub(super) fn single_render_changed(existing: &SingleDraft, new_text: &str) -> bool {
+        existing.last_text != new_text
+    }
+
+    /// Mark a rendered single-message draft body as Matrix-visible only after
+    /// the edit request succeeds. Keeping `last_text` as a delivery checkpoint
+    /// lets retained drafts flush again during finalization after a failed edit.
+    pub(super) fn mark_single_edit_delivered(
+        existing: &mut SingleDraft,
+        event_id: &OwnedEventId,
+        visible_text: String,
+        delivered_at: Instant,
+    ) -> bool {
+        if existing.event_id.as_str() != event_id.as_str() {
+            return false;
+        }
+        existing.last_text = visible_text;
+        existing.last_edit = delivered_at;
+        true
+    }
+
+    /// Finalization sequence for Matrix `single_message` mode. Encoding the
+    /// delete/send ordering here keeps the user-visible timeline rule testable
+    /// without mocking Matrix network calls.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum SingleFinalizePlan {
+        DeleteDraftThenSendFinal,
+        KeepDraftThenSendFinal,
+        SendFinalOnly,
+        Noop,
+    }
+
+    /// Cleanup needed for a retained single-message draft before the final
+    /// answer can be posted. Retention applies to durable progress transcripts,
+    /// not to the initial placeholder.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum SingleRetainedDraftAction {
+        DeletePlaceholder,
+        Flush(String),
+        KeepCurrent,
+    }
+
+    impl SingleFinalizePlan {
+        pub(super) fn deletes_draft_first(self) -> bool {
+            matches!(self, Self::DeleteDraftThenSendFinal)
+        }
+
+        pub(super) fn keeps_draft(self) -> bool {
+            matches!(self, Self::KeepDraftThenSendFinal)
+        }
+
+        pub(super) fn sends_final(self) -> bool {
+            !matches!(self, Self::Noop)
+        }
+    }
+
+    /// Choose the single-message finalization sequence from durable state and
+    /// operator config. A missing draft only suppresses empty final text; when a
+    /// draft existed, final delivery is attempted even if the text is empty so
+    /// the normal Matrix send path reports any invalid final body.
+    pub(super) fn single_finalize_plan(
+        has_draft: bool,
+        delete_draft: bool,
+        final_has_text: bool,
+    ) -> SingleFinalizePlan {
+        match (has_draft, delete_draft, final_has_text) {
+            (true, true, _) => SingleFinalizePlan::DeleteDraftThenSendFinal,
+            (true, false, _) => SingleFinalizePlan::KeepDraftThenSendFinal,
+            (false, _, true) => SingleFinalizePlan::SendFinalOnly,
+            (false, _, false) => SingleFinalizePlan::Noop,
+        }
+    }
+
+    /// Decide how to make a retained draft coherent before the final answer is
+    /// sent. This bypasses edit debounce at finalize time so a kept progress
+    /// transcript cannot lag behind the in-memory sliding buffer.
+    pub(super) fn single_retained_draft_action(
+        draft: &SingleDraft,
+        max_bytes: usize,
+    ) -> SingleRetainedDraftAction {
+        if draft.lines.is_empty() {
+            return SingleRetainedDraftAction::DeletePlaceholder;
+        }
+        let visible_text = single_visible_text_with_edit_budget(draft, max_bytes);
+        if visible_text.is_empty() {
+            return if draft.last_text == DRAFT_PLACEHOLDER {
+                // The buffered lines are not Matrix-visible until an edit
+                // succeeds. Retention must not leave a placeholder behind
+                // when no visible progress body can be established.
+                SingleRetainedDraftAction::DeletePlaceholder
+            } else {
+                SingleRetainedDraftAction::KeepCurrent
+            };
+        }
+        if visible_text == draft.last_text {
+            SingleRetainedDraftAction::KeepCurrent
+        } else {
+            SingleRetainedDraftAction::Flush(visible_text)
+        }
+    }
+
+    /// Cancel removes drafts when the operator requested deletion or when
+    /// Matrix still only shows the initial placeholder. The line buffer may
+    /// contain undelivered progress after a failed edit, so the delivery
+    /// checkpoint is the correct source for the user-visible state.
+    pub(super) fn single_cancel_deletes_draft(draft: &SingleDraft, delete_draft: bool) -> bool {
+        delete_draft || draft.last_text == DRAFT_PLACEHOLDER
     }
 
     pub(super) fn decide_partial_finalize_action(
@@ -438,29 +1196,35 @@ mod session {
         state_dir.join(SESSION_FILE)
     }
 
-    /// Load the saved login blob. Returns `Ok(None)` when:
-    /// - the file doesn't exist (fresh install, expected first-run state), or
-    /// - the file exists but is corrupt JSON (manual edit gone wrong, partial
-    ///   write from a prior interrupted save). The corrupt case used to
-    ///   propagate an error and stall startup; treating it as a missing
-    ///   session lets the build flow's auto-recovery path fall through to
-    ///   fresh login when credentials are available.
-    ///
-    /// Read errors (permission denied, I/O failure on the underlying file)
-    /// still propagate — those are real problems the operator should see.
     pub(super) fn load(state_dir: &Path) -> anyhow::Result<Option<SessionBlob>> {
         let p = path(state_dir);
         if !p.exists() {
             return Ok(None);
         }
-        let bytes = std::fs::read(&p)
-            .map_err(|e| anyhow::anyhow!("read matrix session blob {}: {e}", p.display()))?;
+        let bytes = std::fs::read(&p).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": p.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to read session blob"
+            );
+            anyhow::Error::msg(format!("read matrix session blob {}: {e}", p.display()))
+        })?;
         match serde_json::from_slice::<SessionBlob>(&bytes) {
             Ok(blob) => Ok(Some(blob)),
             Err(e) => {
-                tracing::warn!(
-                    "matrix: session blob {} is corrupt JSON ({e}); treating as missing so auto-recovery can re-login",
-                    p.display()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "matrix: session blob {} is corrupt JSON ({e}); treating as missing so auto-recovery can re-login",
+                        p.display()
+                    )
                 );
                 Ok(None)
             }
@@ -468,12 +1232,37 @@ mod session {
     }
 
     pub(super) fn save(state_dir: &Path, blob: &SessionBlob) -> anyhow::Result<()> {
-        std::fs::create_dir_all(state_dir)
-            .map_err(|e| anyhow::anyhow!("create matrix state dir {}: {e}", state_dir.display()))?;
+        std::fs::create_dir_all(state_dir).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": state_dir.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to create state dir"
+            );
+            anyhow::Error::msg(format!(
+                "create matrix state dir {}: {e}",
+                state_dir.display()
+            ))
+        })?;
         let p = path(state_dir);
         let json = serde_json::to_vec_pretty(blob)?;
-        write_with_owner_only(&p, &json)
-            .map_err(|e| anyhow::anyhow!("write matrix session blob {}: {e}", p.display()))?;
+        write_with_owner_only(&p, &json).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": p.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to write session blob"
+            );
+            anyhow::Error::msg(format!("write matrix session blob {}: {e}", p.display()))
+        })?;
         Ok(())
     }
 
@@ -508,20 +1297,22 @@ mod client {
         time::Duration,
     };
 
-    use anyhow::{Context as _, Result, anyhow, bail};
+    use anyhow::{Context as _, Result, bail};
     use matrix_sdk::{
         Client, SessionMeta, SessionTokens,
         authentication::matrix::MatrixSession,
+        config::RequestConfig,
         ruma::{OwnedRoomId, RoomAliasId},
     };
     use serde::Deserialize;
     use tokio::sync::RwLock;
-    use tracing::{debug, info, warn};
 
     use super::session;
     use zeroclaw_config::schema::MatrixConfig;
 
     const WHOAMI_ENDPOINT: &str = "_matrix/client/v3/account/whoami";
+
+    pub(super) const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
     const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
     const WHOAMI_ERROR_BODY_PREVIEW_BYTES: usize = 4096;
     const WHOAMI_ERROR_BODY_DISPLAY_CHARS: usize = 256;
@@ -551,26 +1342,6 @@ mod client {
         state_dir.join("store")
     }
 
-    /// Build the SDK client, handling all three of:
-    /// - normal restore from a consistent session.json + store/
-    /// - first-run fresh login
-    /// - corruption recovery (with password)
-    ///
-    /// Corruption signals (per matrix-sdk encryption.md and SDK source —
-    /// `IdentityManager::update_or_create_device` rejects updates with
-    /// `SigningKeyChanged`, and `Encryption::send_outgoing_request` records
-    /// the durable `OneTimeKeyAlreadyUploaded` state-store flag): the SDK
-    /// rejects a device key update when the store and server disagree, and
-    /// offers no public API to selectively forget a device record. The
-    /// official remediation is "Clear storage to create a new device". We
-    /// do that automatically when password + user_id are configured;
-    /// otherwise we surface a clear error so the operator can either
-    /// provide a password or wipe state manually.
-    ///
-    /// Wrong-recovery-key failures are *not* a corruption signal — they're
-    /// an operator-config issue. We log them clearly and continue with
-    /// `bootstrap_cross_signing_if_needed`, which sets up fresh cross-signing
-    /// when no identity could be imported.
     pub(super) async fn build(config: &MatrixConfig, state_dir: &Path) -> Result<Client> {
         build_attempt(config, state_dir, 0).await
     }
@@ -580,19 +1351,41 @@ mod client {
         if session.exists()
             && let Err(e) = std::fs::remove_file(&session)
         {
-            return Err(anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": session.display().to_string(),
+                        "phase": "corruption_recovery",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to remove session blob during corruption recovery"
+            );
+            return Err(anyhow::Error::msg(format!(
                 "matrix: failed to remove {} during corruption recovery: {e}. Fix permissions or wipe the directory manually.",
                 session.display()
-            ));
+            )));
         }
         let store = store_dir(state_dir);
         if store.exists()
             && let Err(e) = std::fs::remove_dir_all(&store)
         {
-            return Err(anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": store.display().to_string(),
+                        "phase": "corruption_recovery",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to remove store dir during corruption recovery"
+            );
+            return Err(anyhow::Error::msg(format!(
                 "matrix: failed to remove {} during corruption recovery: {e}. Fix permissions or wipe the directory manually.",
                 store.display()
-            ));
+            )));
         }
         Ok(())
     }
@@ -619,6 +1412,19 @@ mod client {
         has_password && has_user_id
     }
 
+    pub(super) fn saved_session_is_foreign(
+        config: &MatrixConfig,
+        blob: &session::SessionBlob,
+    ) -> bool {
+        let Some(want) = config.user_id.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        if !want.contains(':') {
+            return false;
+        }
+        want != blob.user_id.as_str()
+    }
+
     async fn build_attempt(
         config: &MatrixConfig,
         state_dir: &Path,
@@ -634,31 +1440,45 @@ mod client {
 
         let saved = session::load(state_dir)?;
 
-        // The saved device_id is canonical — it's what the server actually
-        // assigned at login. config.device_id is only a hint for first-ever
-        // login. If they drift (e.g. after auto-recovery generates a fresh
-        // device, or the operator edits config), warn but honor the saved
-        // value. Wiping on drift would create a recovery loop.
+        // A saved session that belongs to a different account would run this
+        // channel block as the wrong Matrix identity. Wipe and re-login fresh
+        // under the configured account instead of impersonating.
+        if let Some(blob) = saved.as_ref()
+            && saved_session_is_foreign(config, blob)
+        {
+            return recover_or_bail(
+                config,
+                state_dir,
+                recovery_attempts,
+                &format!(
+                    "saved session user_id ({}) does not match configured channels.matrix user_id ({}); store belongs to a different account.",
+                    blob.user_id,
+                    config.user_id.as_deref().unwrap_or_default()
+                ),
+            )
+            .await;
+        }
+
         if let (Some(blob), Some(want)) = (
             saved.as_ref(),
             config.device_id.as_deref().filter(|s| !s.is_empty()),
         ) && want != blob.device_id
         {
-            warn!(
-                "matrix: configured channels.matrix.device-id ({want}) differs from the saved session ({}). \
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: configured channels.matrix.device-id ({want}) differs from the saved session ({}). \
                  Honoring the saved device_id (canonical, assigned by the homeserver). \
                  Update channels.matrix.device-id to match (or clear it) to silence this warning, \
                  or wipe {} entirely to register a different device.",
-                blob.device_id,
-                state_dir.display(),
+                    blob.device_id,
+                    state_dir.display()
+                )
             );
         }
 
-        // Detect orphan crypto state — store data without a session blob.
-        // This typically happens after a manual `rm session.json` or when a
-        // prior install crashed mid-write. Restoring is impossible; logging
-        // in fresh on top of the orphan store reproduces the same
-        // SigningKeyChanged / Duplicate-OTK loop the user just hit.
         if saved.is_none() && store_has_orphan_data(state_dir) {
             return recover_or_bail(
                 config,
@@ -674,8 +1494,12 @@ mod client {
             .with_context(|| format!("create matrix store dir {}", store.display()))?;
 
         let client = Client::builder()
-            .homeserver_url(&config.homeserver)
+            .server_name_or_homeserver_url(&config.homeserver)
             .sqlite_store(&store, None)
+            // Widen the per-request timeout past the sync long-poll window so
+            // an idle `/sync` never trips the SDK's default 30s request
+            // deadline before the homeserver's own long-poll returns.
+            .request_config(RequestConfig::new().timeout(CLIENT_REQUEST_TIMEOUT))
             .build()
             .await
             .context("build matrix client")?;
@@ -698,7 +1522,11 @@ mod client {
                 .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
                 .await
             {
-                Ok(()) => info!("matrix: restored session from session.json"),
+                Ok(()) => ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "matrix: restored session from session.json"
+                ),
                 Err(e) => {
                     // restore_session failed despite a matching device_id —
                     // the access token is probably revoked, or the saved
@@ -717,15 +1545,6 @@ mod client {
                 }
             }
 
-            // Durable corruption signal: when the matrix-sdk encounters a
-            // duplicate-OTK upload (the server says it already has the
-            // one-time-keys we're trying to upload),
-            // `Encryption::send_outgoing_request` records the
-            // `StateStoreDataKey::OneTimeKeyAlreadyUploaded` flag in the
-            // state store. Per the SDK's own comment, this means "we
-            // forgot about some of our one-time keys. This will lead to
-            // UTDs." The flag survives restarts. The only remediation is
-            // to wipe and re-login.
             let otk_corruption_flagged = client
                 .state_store()
                 .get_kv_data(matrix_sdk::store::StateStoreDataKey::OneTimeKeyAlreadyUploaded)
@@ -748,32 +1567,21 @@ mod client {
             if let Some(blob) = session_blob_from(&client)
                 && let Err(e) = session::save(state_dir, &blob)
             {
-                warn!("matrix: failed to persist session.json: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "matrix: failed to persist session.json"
+                );
             }
         }
 
-        // Step 2: import existing cross-signing + room keys from the
-        // homeserver's encrypted backup. Failure here (wrong recovery_key,
-        // missing backup, secret-storage rotated) is non-fatal — bootstrap
-        // below fills in fresh cross-signing instead. The operator should
-        // see the warning and either fix the recovery key or accept fresh
-        // bootstrap as the new baseline.
         if let Some(key) = config.recovery_key.as_deref()
             && !key.is_empty()
         {
             run_recovery(&client, key).await;
         }
-
-        // Cross-signing is handled by Step 2's `recover()` — when
-        // `recovery_key` matches what the homeserver has sealed in secret
-        // storage, the SDK imports the existing master / self-signing /
-        // user-signing keys and the new device is signed by them
-        // automatically. No bootstrap, no UIA, no key rotation.
-        //
-        // If `recover()` fails (wrong recovery_key, missing default key,
-        // passphrase / base58 mismatch) the diagnostics emitted there name
-        // exactly what's wrong; the operator fixes the recovery key in
-        // Element + config and the next start succeeds.
 
         Ok(client)
     }
@@ -787,9 +1595,14 @@ mod client {
         reason: &str,
     ) -> Result<Client> {
         if can_password_relogin(config) {
-            warn!(
-                "matrix: {reason} Auto-recovering: wiping {} and re-authenticating with password.",
-                state_dir.display()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: {reason} Auto-recovering: wiping {} and re-authenticating with password.",
+                    state_dir.display()
+                )
             );
             wipe_state(state_dir)?;
             return Box::pin(build_attempt(config, state_dir, recovery_attempts + 1)).await;
@@ -811,7 +1624,11 @@ mod client {
         if let Some(pw) = config.password.as_deref().filter(|s| !s.is_empty()) {
             return password_login(client, config, pw).await;
         }
-        if !config.access_token.is_empty() {
+        if config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
             return access_token_login(client, config).await;
         }
         bail!("matrix login requires either access_token or user_id+password")
@@ -822,7 +1639,15 @@ mod client {
             .user_id
             .clone()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("matrix.user_id is required for password login"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "matrix.user_id is required for password login"
+                );
+                anyhow::Error::msg("matrix.user_id is required for password login")
+            })?;
         let mut login = client
             .matrix_auth()
             .login_username(&user_id, password)
@@ -833,23 +1658,41 @@ mod client {
             login = login.device_id(d);
         }
         login.send().await.context("password login failed")?;
-        info!("matrix: logged in via password");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: logged in via password"
+        );
         Ok(())
     }
 
     async fn access_token_login(client: &Client, config: &MatrixConfig) -> Result<()> {
-        let identity = resolve_access_token_identity(config).await?;
+        let identity = resolve_access_token_identity(config, &client.homeserver()).await?;
         let user_id = identity.user_id.parse().context("parse matrix.user_id")?;
-        let device_id = identity
-            .device_id
-            .ok_or_else(|| anyhow!("matrix: access-token login requires a Matrix device_id"))?;
+        let device_id = identity.device_id.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "matrix: access-token login requires a Matrix device_id"
+            );
+            anyhow::Error::msg("matrix: access-token login requires a Matrix device_id")
+        })?;
         let session = MatrixSession {
             meta: SessionMeta {
                 user_id,
                 device_id: device_id.into(),
             },
             tokens: SessionTokens {
-                access_token: config.access_token.clone(),
+                access_token: config.access_token.clone().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        "matrix.access_token is required for token login"
+                    );
+                    anyhow::Error::msg("matrix.access_token is required for token login")
+                })?,
                 refresh_token: None,
             },
         };
@@ -858,7 +1701,11 @@ mod client {
             .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
             .await
             .context("attach matrix session via access_token")?;
-        info!("matrix: logged in via access_token");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: logged in via access_token"
+        );
         Ok(())
     }
 
@@ -871,6 +1718,7 @@ mod client {
 
     pub(super) async fn resolve_access_token_identity(
         config: &MatrixConfig,
+        homeserver: &reqwest::Url,
     ) -> Result<AccessTokenIdentity> {
         let configured_user_id = non_empty_config_value(config.user_id.as_deref());
         let configured_device_id = non_empty_config_value(config.device_id.as_deref());
@@ -884,7 +1732,7 @@ mod client {
             });
         }
 
-        let whoami = fetch_access_token_whoami(config).await?;
+        let whoami = fetch_access_token_whoami(config, homeserver).await?;
 
         if let Some(ref configured) = configured_user_id
             && configured != &whoami.user_id
@@ -915,17 +1763,26 @@ mod client {
         })
     }
 
-    async fn fetch_access_token_whoami(config: &MatrixConfig) -> Result<WhoamiResponse> {
-        let url = matrix_client_api_url(&config.homeserver, WHOAMI_ENDPOINT)?;
-        let response = reqwest::Client::builder()
-            .timeout(WHOAMI_TIMEOUT)
-            .build()
-            .context("matrix: build whoami HTTP client")?
-            .get(url)
-            .bearer_auth(&config.access_token)
-            .send()
-            .await
-            .context("matrix: whoami request failed")?;
+    async fn fetch_access_token_whoami(
+        config: &MatrixConfig,
+        homeserver: &reqwest::Url,
+    ) -> Result<WhoamiResponse> {
+        let access_token = config
+            .access_token
+            .as_deref()
+            .context("matrix: whoami requires access_token")?;
+        let url = matrix_client_api_url(homeserver, WHOAMI_ENDPOINT);
+        let response = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            reqwest::Client::builder().timeout(WHOAMI_TIMEOUT),
+            "channel.matrix",
+        )
+        .build()
+        .context("matrix: build whoami HTTP client")?
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("matrix: whoami request failed")?;
         let status = response.status();
 
         if !status.is_success() {
@@ -1018,8 +1875,8 @@ mod client {
         truncated
     }
 
-    fn matrix_client_api_url(homeserver: &str, endpoint_path: &str) -> Result<reqwest::Url> {
-        let mut url = reqwest::Url::parse(homeserver).context("parse matrix homeserver URL")?;
+    fn matrix_client_api_url(homeserver: &reqwest::Url, endpoint_path: &str) -> reqwest::Url {
+        let mut url = homeserver.clone();
         let base_path = url.path().trim_end_matches('/');
         let endpoint_path = endpoint_path.trim_start_matches('/');
         let full_path = if base_path.is_empty() || base_path == "/" {
@@ -1030,7 +1887,7 @@ mod client {
         url.set_path(&full_path);
         url.set_query(None);
         url.set_fragment(None);
-        Ok(url)
+        url
     }
 
     fn session_blob_from(client: &Client) -> Option<session::SessionBlob> {
@@ -1043,35 +1900,34 @@ mod client {
         })
     }
 
-    /// Try to import cross-signing keys + room keys from the homeserver's
-    /// encrypted backup using the operator's recovery key. Logs detailed
-    /// diagnostics on failure so a MAC mismatch can be debugged without
-    /// guessing — server-side default-key id, whether the key event has
-    /// passphrase info (changes which SDK decode path runs first), input
-    /// length (whitespace-stripped, not the value), and the full error
-    /// debug chain (the SDK's `Display` masks fallback errors).
     async fn run_recovery(client: &Client, key: &str) {
+        use matrix_sdk::encryption::recovery::RecoveryState;
+
         let recovery = client.encryption().recovery();
-        if matches!(
-            recovery.state(),
-            matrix_sdk::encryption::recovery::RecoveryState::Enabled
-        ) {
-            debug!("matrix: recovery already enabled, skipping recover()");
+        if matches!(recovery.state(), RecoveryState::Enabled) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "matrix: recovery already enabled, skipping recover()"
+            );
             return;
         }
 
         let stripped_len = key.chars().filter(|c| !c.is_whitespace()).count();
         diagnose_secret_storage(client, stripped_len).await;
 
-        match recovery.recover(key).await {
-            Ok(()) => {
-                info!("matrix: E2EE recovery completed (cross-signing + room keys imported)")
-            }
-            Err(e) => warn!(
-                "matrix: E2EE recovery failed: {e}; full error chain = {e:?}. \
-                 If the input length above is unexpected (base58 keys are typically \
-                 ~58 chars, passphrases vary), the wrong value may be in \
-                 channels.matrix.recovery-key."
+        match recovery.recover_and_fix_backup(key).await {
+            Ok(()) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "matrix: E2EE recovery completed (cross-signing + room keys imported; key backup repaired if inconsistent)"
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "matrix: E2EE recovery failed: ; full error chain = . If the input length above is unexpected (base58 keys are typically ~58 chars, passphrases vary), the wrong value may be in channels.matrix.recovery-key."
             ),
         }
     }
@@ -1090,18 +1946,34 @@ mod client {
             Ok(Some(raw)) => match raw.deserialize() {
                 Ok(content) => Some(content),
                 Err(e) => {
-                    warn!("matrix: cannot deserialize default secret-storage key event: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "matrix: cannot deserialize default secret-storage key event"
+                    );
                     None
                 }
             },
             Ok(None) => {
-                warn!(
-                    "matrix: server has no m.secret_storage.default_key set; recovery cannot proceed (input_len={input_len}). Set up Secure Backup in Element first."
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"input_len": input_len})),
+                    "matrix: server has no m.secret_storage.default_key set; recovery cannot proceed (input_len=). Set up Secure Backup in Element first."
                 );
                 return;
             }
             Err(e) => {
-                warn!("matrix: failed to fetch default secret-storage key event: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "matrix: failed to fetch default secret-storage key event"
+                );
                 return;
             }
         };
@@ -1119,34 +1991,45 @@ mod client {
                 let json = raw.json().get();
                 let has_passphrase =
                     json.contains("\"passphrase\"") && json.contains("\"iterations\"");
-                info!(
-                    "matrix: secret-storage diagnostics: default_key_id={key_id}, \
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!(
+                        "matrix: secret-storage diagnostics: default_key_id={key_id}, \
                      has_passphrase_info={has_passphrase}, input_len={input_len}. \
                      {}",
-                    if has_passphrase {
-                        "SDK will try passphrase derivation first; if your input is a base58 key the passphrase MAC will fail and the error you see may be the passphrase error rather than the base58 fallback's error."
-                    } else {
-                        "SDK will use base58 decoding directly."
-                    }
+                        if has_passphrase {
+                            "SDK will try passphrase derivation first; if your input is a base58 key the passphrase MAC will fail and the error you see may be the passphrase error rather than the base58 fallback's error."
+                        } else {
+                            "SDK will use base58 decoding directly."
+                        }
+                    )
                 );
                 let _ = SecretStorageKeyEventContent::TYPE; // keep import live
             }
             Ok(None) => {
-                warn!(
-                    "matrix: default key id {key_id} has no corresponding key event on the account — secret storage is in an inconsistent state. Re-running Secure Backup setup in Element will repair this."
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"key_id": key_id})),
+                    "matrix: default key id has no corresponding key event on the account — secret storage is in an inconsistent state. Re-running Secure Backup setup in Element will repair this."
                 );
             }
             Err(e) => {
-                warn!("matrix: failed to fetch key event for {key_id}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "key_id": key_id})
+                        ),
+                    "matrix: failed to fetch key event for"
+                );
             }
         }
     }
 
-    /// Be lenient with `<anything>||<room-id-or-alias>` recipients (some
-    /// operators write cron `delivery.to` that way). Extracts the last
-    /// segment that looks like a Matrix room id (`!…`) or alias (`#…`).
-    /// Returns `(chosen, was_normalized)` so the caller can log a warning
-    /// when normalization actually triggered.
     pub(super) fn normalize_recipient(id_or_alias: &str) -> (&str, bool) {
         if !id_or_alias.contains("||") {
             return (id_or_alias, false);
@@ -1167,8 +2050,12 @@ mod client {
     ) -> Result<OwnedRoomId> {
         let (id_or_alias, normalized) = normalize_recipient(id_or_alias);
         if normalized {
-            warn!(
-                "matrix: recipient contains `||`; using {id_or_alias:?} as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"id_or_alias": id_or_alias})),
+                "matrix: recipient contains `||`; using as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
             );
         }
         if id_or_alias.starts_with('!') {
@@ -1205,7 +2092,7 @@ mod inbound {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
-        time::SystemTime,
+        time::{Duration, SystemTime},
     };
 
     use matrix_sdk::{
@@ -1227,25 +2114,27 @@ mod inbound {
         },
     };
     use serde_json::Value as JsonValue;
-    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
-    use tracing::{debug, error, info, warn};
+    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
 
     use super::{allowlist, approval, context as ctx_mod, mention};
-    use crate::transcription::TranscriptionManager;
-    use zeroclaw_api::{
-        channel::{ChannelApprovalResponse, ChannelMessage},
-        media::MediaAttachment,
-    };
-    use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
+    use zeroclaw_api::{channel::ChannelMessage, media::MediaAttachment};
+    use zeroclaw_config::schema::MatrixConfig;
+
+    pub(super) const SYNC_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(30);
 
     #[derive(Clone)]
     pub(super) struct HandlerCtx {
         pub config: Arc<MatrixConfig>,
-        pub transcription: Option<Arc<TranscriptionConfig>>,
+        /// ZeroClaw alias for `[channels.matrix.<alias>]` so session_key
+        /// construction can scope by bot instance.
+        pub alias: String,
+        /// Resolves inbound external peers from canonical state at message-time.
+        /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+        pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        pub transcription: Option<super::TranscriptionResolver>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
-        pub pending_approvals:
-            Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+        pub pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
         pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
@@ -1256,42 +2145,93 @@ mod inbound {
         pub undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
     }
 
-    pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
+    /// Register the inbound event handlers on `client`. The returned guards
+    /// keep the handlers alive; drop them to deregister.
+    pub(super) fn register_event_handlers(
+        client: &Client,
+        ctx: &HandlerCtx,
+    ) -> (
+        matrix_sdk::event_handler::EventHandlerDropGuard,
+        matrix_sdk::event_handler::EventHandlerDropGuard,
+    ) {
         let handler_ctx = ctx.clone();
-        client.add_event_handler(
+        let message_handler = client.add_event_handler(
             move |ev: OriginalSyncRoomMessageEvent, room: Room, raw: RawEvent| {
                 let ctx = handler_ctx.clone();
                 async move {
                     if let Err(e) = handle_message(ctx, ev, room, raw).await {
-                        warn!("matrix: handle_message failed: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "matrix: handle_message failed"
+                        );
                     }
                 }
             },
         );
+        let message_guard = client.event_handler_drop_guard(message_handler);
 
         // Surface inbound events the SDK couldn't decrypt by reacting ❓ on
         // the encrypted event so the operator notices a key gap in chat
         // instead of silent dropping. Best-effort: prophylactic in normally-
         // healthy rooms where decryption succeeds.
         let encrypted_ctx = ctx.clone();
-        client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
-            let ctx = encrypted_ctx.clone();
-            async move {
-                handle_undecryptable(ctx, ev, room).await;
-            }
-        });
+        let encrypted_handler =
+            client.add_event_handler(move |ev: OriginalSyncRoomEncryptedEvent, room: Room| {
+                let ctx = encrypted_ctx.clone();
+                async move {
+                    handle_undecryptable(ctx, ev, room).await;
+                }
+            });
+        let encrypted_guard = client.event_handler_drop_guard(encrypted_handler);
 
-        info!("matrix: starting sync loop");
-        // Run an initial sync once so the sync token + state are populated,
-        // then flip the health flag and enter the long-running sync loop.
-        if let Err(e) = client.sync_once(SyncSettings::default()).await {
-            return Err(anyhow::anyhow!("matrix initial sync failed: {e}"));
+        (message_guard, encrypted_guard)
+    }
+
+    pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
+        let (_message_handler_guard, _encrypted_handler_guard) =
+            register_event_handlers(&client, &ctx);
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: starting sync loop"
+        );
+        let sync_settings = SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT);
+        if let Err(e) = client.sync_once(sync_settings.clone()).await {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "initial_sync",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: initial sync failed"
+            );
+            return Err(anyhow::Error::msg(format!(
+                "matrix initial sync failed: {e}"
+            )));
         }
         ctx.initial_sync_done.store(true, Ordering::SeqCst);
-        client
-            .sync(SyncSettings::default())
-            .await
-            .map_err(|e| anyhow::anyhow!("matrix sync loop failed: {e}"))
+        client.sync(sync_settings).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "phase": "sync_loop",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: sync loop failed"
+            );
+            anyhow::Error::msg(format!("matrix sync loop failed: {e}"))
+        })
     }
 
     /// React ❓ on any inbound event the SDK delivered as still-encrypted
@@ -1313,14 +2253,26 @@ mod inbound {
         if already {
             return;
         }
-        debug!(
-            "matrix: reacting ❓ to undecryptable event {} from {}",
-            event_id, ev.sender
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "matrix: reacting ❓ to undecryptable event {} from {}",
+                event_id, ev.sender
+            )
         );
         let content =
             ReactionEventContent::new(Annotation::new(event_id.clone(), "❓".to_string()));
         if let Err(e) = room.send(content).await {
-            warn!("matrix: failed to react ❓ on undecryptable event {event_id}: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"error": format!("{}", e), "event_id": event_id})
+                    ),
+                "matrix: failed to react ❓ on undecryptable event"
+            );
         }
     }
 
@@ -1340,36 +2292,97 @@ mod inbound {
         let body = ctx_mod::body_for(&ev.content.msgtype);
         let sender = ev.sender.as_str();
         let room_id = room.room_id().as_str();
+        let allowed_peers = (ctx.peer_resolver)();
+        let sender_allowed = allowlist::user_allowed(&allowed_peers, sender);
+        let room_allowed = allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id);
 
-        // Approval reply has highest priority — operator answer must work even
-        // if the room/user filters would otherwise drop the message.
-        if let Some((token, response)) = approval::parse_reply(&body) {
-            let waiter = ctx.pending_approvals.lock().await.remove(&token);
-            if let Some(tx) = waiter {
-                let _ = tx.send(response);
-                return Ok(());
-            }
-        }
-
-        if !allowlist::user_allowed(&ctx.config.allowed_users, sender) {
-            debug!("matrix: drop message from non-allowed sender {sender}");
+        if let Some((token, response)) = approval::parse_reply(&body)
+            && crate::util::resolve_pending_approval(
+                &ctx.pending_approvals,
+                &token,
+                response,
+                sender_allowed && room_allowed,
+                room_id,
+            )
+            .await
+            .suppresses_message()
+        {
             return Ok(());
         }
-        if !allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id) {
-            debug!("matrix: drop message from non-allowed room {room_id}");
+
+        if !sender_allowed {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": sender})),
+                "matrix: drop message from non-allowed sender"
+            );
             return Ok(());
         }
+        if !room_allowed {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"room_id": room_id})),
+                "matrix: drop message from non-allowed room"
+            );
+            return Ok(());
+        }
+
+        // Fetch the reply parent at most once for the mention_only gate and
+        // the parent-media path below (Room::event always hits the homeserver).
+        let reply_target = extract_in_reply_to(&raw);
+        let mut cached_reply_parent = None;
 
         if ctx.config.mention_only && is_group_room(&room).await {
             let display_name = ctx.bot_display_name.read().await.clone();
             let mention_user_ids = extract_mentions_user_ids(&raw);
-            if !mention::is_mentioned(
+            let mentioned = mention::is_mentioned(
                 &ctx.bot_user_id,
                 display_name.as_deref(),
                 mention_user_ids.as_deref(),
                 &body,
-            ) {
-                debug!("matrix: drop unmentioned message from {sender}");
+            );
+            // Reply-to-bot bypasses the mention gate (Telegram parity). Fetch the
+            // parent only when the body/mention list alone would drop the turn.
+            let reply_to_bot = if mentioned {
+                false
+            } else if let Some(reply_id) = reply_target.as_ref() {
+                match room.event(reply_id, None).await {
+                    Ok(timeline_event) => {
+                        let is_bot = timeline_event
+                            .sender()
+                            .as_ref()
+                            .is_some_and(|sender| sender == &ctx.bot_user_id);
+                        cached_reply_parent = Some(timeline_event);
+                        is_bot
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                                "reply_id": reply_id,
+                            })),
+                            "matrix: failed to fetch reply parent for mention_only gate"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !mention::admit_group_message(mentioned, reply_to_bot) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": sender})),
+                    "matrix: drop unmentioned message from"
+                );
                 return Ok(());
             }
         }
@@ -1391,16 +2404,16 @@ mod inbound {
                         );
                     }
                 }
-                Err(e) => warn!("matrix: failed to fetch thread root {tid}: {e}"),
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e), "tid": tid})),
+                    "matrix: failed to fetch thread root"
+                ),
             }
         }
 
-        // Process inbound media: download, persist to {workspace}/matrix_files/,
-        // and emit a content marker the runtime's vision/document pipeline reads.
-        // The runtime ignores `ChannelMessage.attachments` for vision — markers
-        // in `content` are how Telegram and the multimodal pipeline communicate
-        // (see telegram.rs `format_attachment_content`). We always leave
-        // `attachments` empty.
         let media_kind = match &ev.content.msgtype {
             MessageType::Image(m) => Some(MediaInfo::new(
                 m.source.clone(),
@@ -1426,15 +2439,22 @@ mod inbound {
                 } else {
                     MediaCategory::Audio
                 };
-                Some(MediaInfo::new(
-                    m.source.clone(),
-                    m.body.clone(),
-                    m.info.as_ref().and_then(|i| i.mimetype.clone()),
-                    kind,
-                ))
+                let mime = m.info.as_ref().and_then(|i| i.mimetype.clone());
+                let file_name = m
+                    .filename
+                    .as_deref()
+                    .filter(|f| !f.is_empty())
+                    .unwrap_or(&m.body)
+                    .to_string();
+                Some(MediaInfo::new(m.source.clone(), file_name, mime, kind))
             }
             _ => None,
         };
+        // Read off this event alone: a reply whose parent is a voice note
+        // stays text-origin.
+        let voice_origin = media_kind
+            .as_ref()
+            .is_some_and(|info| matches!(info.kind, MediaCategory::Voice));
 
         if let Some(info) = media_kind {
             content = attach_media(
@@ -1443,35 +2463,48 @@ mod inbound {
                 ctx.workspace_dir.as_deref(),
                 &body,
                 content,
-                ctx.transcription.as_deref(),
+                ctx.transcription.as_ref(),
             )
             .await;
-        } else if let Some(reply_target) = extract_in_reply_to(&raw) {
-            // The current event has no media of its own but is a reply (often
-            // mention-only text replying to a previously-ignored media event).
-            // Fetch the parent event and pull in any media it carries so the
-            // agent can answer questions like "can you see the image?". The
-            // parent's MediaCategory (set by parent_media_info) is the
-            // authoritative kind here — `raw` is the text reply, not the
-            // parent voice/image, so we never look at `raw` for kind data.
-            match room.event(&reply_target, None).await {
+        } else if let Some(reply_id) = reply_target.as_ref() {
+            let parent = if let Some(cached) = cached_reply_parent.take() {
+                Ok(cached)
+            } else {
+                room.event(reply_id, None).await
+            };
+            match parent {
                 Ok(timeline_event) => {
-                    if let Some(info) = parent_media_info(timeline_event.into_raw()) {
+                    if let Some(info) = parent_media_info(timeline_event.raw().clone()) {
                         content = attach_media(
                             &room,
                             &info,
                             ctx.workspace_dir.as_deref(),
                             "",
                             content,
-                            ctx.transcription.as_deref(),
+                            ctx.transcription.as_ref(),
                         )
                         .await;
                     }
                 }
-                Err(e) => debug!("matrix: could not fetch in_reply_to parent {reply_target}: {e}"),
+                Err(e) => {
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "reply_target": reply_id})), "matrix: could not fetch in_reply_to parent")
+                }
             }
         }
         let attachments: Vec<MediaAttachment> = Vec::new();
+
+        let outbound_anchor =
+            resolve_outbound_anchor(thread_id.as_ref(), &ev.event_id, ctx.config.reply_in_thread);
+        // When the bot is the one starting the thread, mark its root seen
+        // so the next inbound that lands inside it does not re-fetch and
+        // re-inject a root preamble (the agent already saw the root in this
+        // same turn).
+        if thread_id.is_none() && ctx.config.reply_in_thread {
+            ctx_mod::mark_seen(&ctx.threads_seen, ev.event_id.clone()).await;
+        }
+
+        let interruption_scope =
+            interruption_scope_from_anchor(outbound_anchor.as_deref(), &ev.event_id);
 
         let msg = ChannelMessage {
             id: ev.event_id.to_string(),
@@ -1479,30 +2512,39 @@ mod inbound {
             reply_target: room.room_id().to_string(),
             content,
             channel: "matrix".to_string(),
+            channel_alias: Some(ctx.alias.clone()),
             timestamp: SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // Reply anchor: use the existing thread root when present,
-            // otherwise (when reply_in_thread is on) anchor a brand-new thread
-            // on this very event so the bot's reply opens a thread.
-            thread_ts: thread_id.as_ref().map(|t| t.to_string()).or_else(|| {
-                if ctx.config.reply_in_thread {
-                    Some(ev.event_id.to_string())
-                } else {
-                    None
-                }
-            }),
-            // Interruption scope is for cancellation grouping — only set when
-            // the inbound is genuinely *inside* a reply thread.
-            interruption_scope_id: thread_id.as_ref().map(|t| t.to_string()),
+            thread_ts: outbound_anchor.clone(),
+            interruption_scope_id: interruption_scope,
             attachments,
+            subject: None,
+            voice_origin,
+            ..Default::default()
         };
 
         if let Err(e) = ctx.tx.send(msg).await {
-            error!("matrix: failed to forward inbound message: {e}");
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "matrix: failed to forward inbound message"
+            );
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn handle_message_for_test(
+        ctx: HandlerCtx,
+        ev: OriginalSyncRoomMessageEvent,
+        room: Room,
+        raw: RawEvent,
+    ) -> anyhow::Result<()> {
+        handle_message(ctx, ev, room, raw).await
     }
 
     async fn is_group_room(room: &Room) -> bool {
@@ -1520,6 +2562,30 @@ mod inbound {
         )
     }
 
+    pub(super) fn resolve_outbound_anchor(
+        thread_id: Option<&OwnedEventId>,
+        event_id: &OwnedEventId,
+        reply_in_thread: bool,
+    ) -> Option<String> {
+        thread_id.map(ToString::to_string).or_else(|| {
+            if reply_in_thread {
+                Some(event_id.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(super) fn interruption_scope_from_anchor(
+        outbound_anchor: Option<&str>,
+        event_id: &OwnedEventId,
+    ) -> Option<String> {
+        match outbound_anchor {
+            Some(anchor) if anchor == event_id.as_str() => None,
+            other => other.map(ToString::to_string),
+        }
+    }
+
     pub(super) fn extract_thread_id(raw: &RawEvent) -> Option<OwnedEventId> {
         let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
         let relates = v.get("content")?.get("m.relates_to")?;
@@ -1531,13 +2597,6 @@ mod inbound {
         root.parse().ok()
     }
 
-    /// Pull the `m.in_reply_to.event_id` from a raw event. This is Matrix's
-    /// inline-reply mechanism (separate from threads): when a user replies to
-    /// a previous message — for instance a media-only event the bot ignored
-    /// because of mention-only filtering — the reply event embeds a pointer
-    /// to that previous event under `content.m.relates_to.m.in_reply_to`.
-    /// The pointer can also live inside an `m.thread` relation when the
-    /// client is using the modern threaded-reply spec, so we accept both.
     pub(super) fn extract_in_reply_to(raw: &RawEvent) -> Option<OwnedEventId> {
         let v: JsonValue = serde_json::from_str(raw.get()).ok()?;
         let relates = v.get("content")?.get("m.relates_to")?;
@@ -1576,36 +2635,20 @@ mod inbound {
         File,
     }
 
-    /// Decide whether transcription should run on a media attachment given
-    /// its category and the channel's transcription config. The previous
-    /// gate also required `is_voice_message(raw)` to be true, but `raw`
-    /// is the *current* event — for parent media pulled via `m.in_reply_to`,
-    /// the current event is the user's text reply (no MSC3245 flag), so
-    /// the gate would short-circuit and skip transcription on reply-to-voice
-    /// flows. `parent_media_info` already classifies by reading the parent
-    /// event's flag, so trust `info.kind` directly.
-    pub(super) fn should_transcribe(
-        kind: &MediaCategory,
-        transcription: Option<&TranscriptionConfig>,
-    ) -> bool {
-        matches!(kind, MediaCategory::Voice) && matches!(transcription, Some(t) if t.enabled)
+    /// Voice notes (MSC3245) are the only inbound media ZeroClaw transcribes.
+    /// Whether transcription is enabled at all is owned by the channel's
+    /// transcription resolver, which reads it from live config.
+    pub(super) fn should_transcribe(kind: &MediaCategory) -> bool {
+        matches!(kind, MediaCategory::Voice)
     }
 
-    /// Common path for both "this event carries media" and "this event is a
-    /// reply to one that did" — downloads, persists to workspace, appends a
-    /// `[IMAGE:path]` / `[Document:...] path` marker to `content`, and runs
-    /// voice transcription when the media is an MSC3245 voice note.
-    ///
-    /// `body_hint` is the originating event's body (used to decide whether
-    /// to overwrite the placeholder body with the marker or append to it);
-    /// pass `""` when the media came from a parent reply target.
     async fn attach_media(
         room: &Room,
         info: &MediaInfo,
         workspace_dir: Option<&std::path::PathBuf>,
         body_hint: &str,
         content: String,
-        transcription: Option<&TranscriptionConfig>,
+        transcription: Option<&super::TranscriptionResolver>,
     ) -> String {
         let mut content = content;
         match save_media_to_workspace(room, info, workspace_dir).await {
@@ -1624,19 +2667,37 @@ mod inbound {
                     format!("{content}\n\n{marker}")
                 };
 
-                if should_transcribe(&info.kind, transcription) {
-                    let t = transcription.expect("should_transcribe guarantees Some");
-                    match transcribe_from_disk(t, &path, &info.file_name).await {
-                        Ok(text) if !text.trim().is_empty() => {
+                if should_transcribe(&info.kind)
+                    && let Some(resolver) = transcription
+                {
+                    let transcribe_name =
+                        transcription_safe_filename(&info.file_name, info.mime.as_deref());
+                    match transcribe_from_disk(resolver, &path, &transcribe_name).await {
+                        Ok(Some(text)) if !text.trim().is_empty() => {
                             content = format!("[voice transcript]: {text}\n\n{content}");
                         }
                         Ok(_) => {}
-                        Err(e) => warn!("matrix: voice transcription failed: {e}"),
+                        Err(e) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "matrix: voice transcription failed"
+                        ),
                     }
                 }
             }
             Ok(None) => {}
-            Err(e) => warn!("matrix: media handling failed: {e}"),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "matrix: media handling failed"
+            ),
         }
         content
     }
@@ -1658,27 +2719,30 @@ mod inbound {
             "m.file" => MediaCategory::File,
             _ => return None,
         };
-        let file_name = content
+        let body_str = content
             .get("body")
             .and_then(|b| b.as_str())
-            .unwrap_or("attachment")
-            .to_string();
+            .unwrap_or("attachment");
+        let filename_field = content.get("filename").and_then(|f| f.as_str());
         let mime = content
             .get("info")
             .and_then(|i| i.get("mimetype"))
-            .and_then(|m| m.as_str())
-            .map(String::from);
+            .and_then(|m| m.as_str());
+        let file_name = filename_field
+            .filter(|f| !f.is_empty())
+            .unwrap_or(body_str)
+            .to_string();
+        let mime = mime.map(String::from);
         let source = if let Some(file) = content.get("file") {
             // Encrypted media: rebuild MediaSource::Encrypted from JSON.
             let encrypted: matrix_sdk::ruma::events::room::EncryptedFile =
                 serde_json::from_value(file.clone()).ok()?;
             matrix_sdk::ruma::events::room::MediaSource::Encrypted(Box::new(encrypted))
-        } else if let Some(url) = content.get("url").and_then(|u| u.as_str()) {
+        } else {
+            let url = content.get("url").and_then(|u| u.as_str())?;
             matrix_sdk::ruma::events::room::MediaSource::Plain(matrix_sdk::ruma::OwnedMxcUri::from(
                 url,
             ))
-        } else {
-            return None;
         };
         Some(MediaInfo::new(source, file_name, mime, kind))
     }
@@ -1715,15 +2779,32 @@ mod inbound {
         workspace: Option<&std::path::PathBuf>,
     ) -> anyhow::Result<Option<std::path::PathBuf>> {
         let Some(workspace) = workspace else {
-            warn!(
-                "matrix: cannot persist {} — channels.matrix workspace_dir not configured. Set ZEROCLAW_DIR or run via the orchestrator.",
-                info.file_name
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: cannot persist {} — channels.matrix workspace_dir not configured. Set ZEROCLAW_DIR or run via the orchestrator.",
+                    info.file_name
+                )
             );
             return Ok(None);
         };
         let dir = workspace.join("matrix_files");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": dir.display().to_string(),
+                        "phase": "media_dir_create",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to create media dir"
+            );
+            anyhow::Error::msg(format!("create {}: {e}", dir.display()))
+        })?;
         let request = matrix_sdk::media::MediaRequestParameters {
             source: info.source.clone(),
             format: matrix_sdk::media::MediaFormat::File,
@@ -1737,19 +2818,44 @@ mod inbound {
             .media()
             .get_media_content(&request, true)
             .await
-            .map_err(|e| anyhow::anyhow!("get_media_content ({source_kind}): {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "get_media_content ()"
+                );
+                anyhow::Error::msg(format!("get_media_content ({source_kind}): {e}"))
+            })?;
 
         let safe_name = sanitize_filename(&info.file_name, &info.kind, info.mime.as_deref());
         // Disambiguate by uuid prefix to avoid collisions across messages.
         let unique = format!("{}_{safe_name}", uuid::Uuid::new_v4().simple());
         let path = dir.join(unique);
-        std::fs::write(&path, &bytes)
-            .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
-        info!(
-            "matrix: saved {} bytes ({}) to {}",
-            bytes.len(),
-            source_kind,
-            path.display()
+        std::fs::write(&path, &bytes).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "phase": "media_write",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to write media file"
+            );
+            anyhow::Error::msg(format!("write {}: {e}", path.display()))
+        })?;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "matrix: saved {} bytes ({}) to {}",
+                bytes.len(),
+                source_kind,
+                path.display()
+            )
         );
         Ok(Some(path))
     }
@@ -1777,15 +2883,17 @@ mod inbound {
 
     fn default_extension(kind: &MediaCategory, mime: Option<&str>) -> &'static str {
         if let Some(m) = mime {
-            match m {
+            // Audio MIMEs resolve through the canonical transcription-side
+            // mapping; non-audio types are display/on-disk naming only.
+            if let Some(ext) = crate::transcription::extension_for_audio_mime(m) {
+                return ext;
+            }
+            match m.split(';').next().unwrap_or(m).trim() {
                 "image/png" => return "png",
                 "image/jpeg" | "image/jpg" => return "jpg",
                 "image/gif" => return "gif",
                 "image/webp" => return "webp",
                 "video/mp4" => return "mp4",
-                "audio/ogg" => return "ogg",
-                "audio/mpeg" | "audio/mp3" => return "mp3",
-                "audio/wav" => return "wav",
                 "application/pdf" => return "pdf",
                 _ => {}
             }
@@ -1795,6 +2903,24 @@ mod inbound {
             MediaCategory::Video => "mp4",
             MediaCategory::Audio | MediaCategory::Voice => "ogg",
             MediaCategory::File => "bin",
+        }
+    }
+
+    /// Internal name for `transcribe()` only — never stored or shown.
+    /// Preserves a name whose extension the resolver accepts; substitutes a
+    /// MIME-derived stand-in only when the MIME maps to an accepted format;
+    /// otherwise passes the unsupported name through so the resolver rejects
+    /// it locally before any request is sent.
+    pub(super) fn transcription_safe_filename(file_name: &str, mime: Option<&str>) -> String {
+        let ext_accepted = file_name
+            .rsplit_once('.')
+            .is_some_and(|(_, ext)| crate::transcription::mime_for_audio(ext).is_some());
+        if ext_accepted {
+            return file_name.to_string();
+        }
+        match mime.and_then(crate::transcription::extension_for_audio_mime) {
+            Some(ext) => format!("attachment.{ext}"),
+            None => file_name.to_string(),
         }
     }
 
@@ -1815,49 +2941,123 @@ mod inbound {
         }
     }
 
+    /// Resolves the manager from live config before touching the filesystem.
+    /// `Ok(None)` means transcription is currently disabled.
     async fn transcribe_from_disk(
-        config: &TranscriptionConfig,
+        resolver: &super::TranscriptionResolver,
         path: &std::path::Path,
         file_name: &str,
-    ) -> anyhow::Result<String> {
-        let bytes =
-            std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
-        let manager = TranscriptionManager::new(config)?;
-        manager.transcribe(&bytes, file_name).await
+    ) -> anyhow::Result<Option<String>> {
+        let Some(manager) = resolver() else {
+            return Ok(None);
+        };
+        let manager = manager?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path.display().to_string(),
+                        "phase": "transcription_read",
+                        "error": format!("{}", e),
+                    })),
+                "matrix: failed to read media file for transcription"
+            );
+            anyhow::Error::msg(format!("read {}: {e}", path.display()))
+        })?;
+        manager.transcribe(&bytes, file_name).await.map(Some)
     }
+}
+
+/// Registers every configured provider — legacy `[transcription]` and typed
+/// `[providers.transcription.<type>.<alias>]` alike — and binds
+/// `agent_provider`.
+///
+/// When the owning agent states no preference, a lone registered provider is
+/// bound so single-provider deployments keep working without an explicit
+/// `transcription_provider`.
+pub(crate) fn build_transcription_manager(
+    config: &zeroclaw_config::schema::Config,
+    agent_provider: &str,
+) -> anyhow::Result<crate::transcription::TranscriptionManager> {
+    crate::transcription::build_channel_transcription_manager(config, agent_provider)
+}
+
+/// Resolves transcription state from live config at message time. `None` means
+/// transcription is currently disabled; the inner `Result` carries provider
+/// registration failures.
+///
+/// Held as a closure rather than a config snapshot so reloadable provider
+/// policy is never copied into this long-lived channel handle
+/// (see AGENTS.md "Single Source Of Truth").
+/// Resolves the TTS manager from live config at send time. `None` means TTS is
+/// disabled or the owning agent has no `tts_provider`; the inner `Result`
+/// carries provider registration failures.
+///
+/// A closure rather than a snapshot, so reloadable provider policy is never
+/// copied into this long-lived channel handle
+/// (see AGENTS.md "Single Source Of Truth").
+pub(crate) type TtsResolver =
+    Arc<dyn Fn() -> Option<anyhow::Result<crate::tts::TtsManager>> + Send + Sync>;
+
+pub(crate) type TranscriptionResolver = Arc<
+    dyn Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>> + Send + Sync,
+>;
+
+/// Resolver over a legacy `[transcription]` section alone. Typed
+/// `[providers.transcription.<type>.<alias>]` entries are unreachable this way,
+/// so production always goes through the channel runtime's live-config
+/// resolver; this exists to drive the inbound tests from a bare section.
+#[cfg(test)]
+pub(crate) fn legacy_transcription_resolver(
+    transcription: zeroclaw_config::schema::TranscriptionConfig,
+) -> TranscriptionResolver {
+    let config = Arc::new(zeroclaw_config::schema::Config {
+        transcription,
+        ..Default::default()
+    });
+    Arc::new(move || {
+        if !config.transcription.enabled {
+            return None;
+        }
+        Some(build_transcription_manager(&config, ""))
+    })
 }
 
 // ─── outbound ──────────────────────────────────────────────────────────────
 mod outbound {
     use std::{collections::HashMap, sync::Arc};
 
-    use anyhow::{Context as _, Result, anyhow, bail};
+    use anyhow::{Context as _, Result, bail};
     use futures_util::StreamExt;
     use matrix_sdk::{
         Client, Room, RoomState,
-        attachment::AttachmentConfig,
+        attachment::{
+            AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+            BaseVideoInfo,
+        },
         room::{
             edit::EditedContent,
             reply::{EnforceThread, Reply},
         },
         ruma::{
-            OwnedEventId, OwnedRoomId,
+            OwnedEventId, OwnedRoomId, UInt,
             events::{
                 reaction::ReactionEventContent,
                 relation::Annotation,
                 room::message::{
-                    MessageType, ReplyWithinThread, RoomMessageEventContent,
-                    RoomMessageEventContentWithoutRelation, TextMessageEventContent,
+                    AddMentions, MessageType, ReplacementMetadata, ReplyWithinThread,
+                    RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+                    TextMessageEventContent,
                 },
             },
         },
     };
-    use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
     use std::time::Duration;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
-    use tracing::warn;
 
     use super::{client, context as ctx_mod, markers};
     use zeroclaw_api::{channel::SendMessage, media::MediaAttachment};
@@ -1870,12 +3070,10 @@ mod outbound {
         pub threads_seen: &'a Arc<TokioRwLock<std::collections::HashSet<OwnedEventId>>>,
         pub reaction_log: &'a Arc<TokioMutex<HashMap<ReactionKey, OwnedEventId>>>,
         pub reply_in_thread: bool,
-        /// Workspace root that bounds local marker targets. Outbound marker
-        /// `[file:...]`/`[image:...]` paths must live inside this directory
-        /// after canonicalisation; any path that escapes is refused. None
-        /// means the channel was constructed without `with_workspace_dir`,
-        /// in which case all local markers are refused.
         pub workspace_dir: Option<&'a Path>,
+        /// Resolved from the canonical Matrix channel config for this send.
+        /// Only single-message mode needs a final-response body budget.
+        pub message_max_bytes: Option<usize>,
     }
 
     /// What `outbound::send` should do once all attachment uploads are done
@@ -1893,6 +3091,87 @@ mod outbound {
         /// Text is empty AND no attachment landed. Caller surfaces an error
         /// to the runtime so it can decide what to do.
         EmptyError,
+    }
+
+    fn prefix_utf8_bytes(text: &str, max_bytes: usize) -> &str {
+        if text.len() <= max_bytes {
+            return text;
+        }
+        let mut end = max_bytes.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+
+    fn next_prefix_after_oversize(text: &str, actual: usize, max: usize) -> &str {
+        let first_scalar_len = text.chars().next().map_or(0, char::len_utf8);
+        let proportional = text.len().saturating_mul(max) / actual.max(1);
+        let target = proportional.clamp(first_scalar_len, text.len().saturating_sub(1));
+        prefix_utf8_bytes(text, target)
+    }
+
+    fn bounded_rendered_body<F>(text: &str, message_max_bytes: Option<usize>, render: F) -> String
+    where
+        F: Fn(&str) -> usize,
+    {
+        let Some(max_bytes) = message_max_bytes else {
+            return text.to_string();
+        };
+        let mut candidate = text;
+        loop {
+            let actual = render(candidate);
+            if actual <= max_bytes {
+                return candidate.to_string();
+            }
+            let next = next_prefix_after_oversize(candidate, actual, max_bytes);
+            // `MATRIX_MIN_MESSAGE_MAX_BYTES` guarantees a one-scalar Matrix
+            // event fits. This guard also prevents an accidental infinite loop
+            // if a future renderer violates that contract.
+            if next.len() == candidate.len() {
+                return candidate.to_string();
+            }
+            candidate = next;
+        }
+    }
+
+    /// Apply an explicitly selected Matrix response budget after markers and
+    /// attachments have been processed. The limit is checked against the
+    /// serialized Markdown event, not merely the Markdown source; a large
+    /// `formatted_body` must not escape the configured budget.
+    pub(super) fn bounded_body(text: &str, message_max_bytes: Option<usize>) -> String {
+        bounded_rendered_body(text, message_max_bytes, |candidate| {
+            serde_json::to_vec(&RoomMessageEventContent::text_markdown(candidate))
+                .map_or(usize::MAX, |serialized| serialized.len())
+        })
+    }
+
+    /// Apply the same serialized-content budget to Matrix edits. Replacement
+    /// events duplicate the rendered new content and add `m.relates_to`, so
+    /// their ceiling is checked independently from a plain send.
+    #[cfg(test)]
+    pub(super) fn bounded_edit_body(
+        text: &str,
+        event_id: &OwnedEventId,
+        message_max_bytes: Option<usize>,
+    ) -> String {
+        bounded_rendered_body(text, message_max_bytes, |candidate| {
+            serialized_edit_content_len(candidate, event_id).unwrap_or(usize::MAX)
+        })
+    }
+
+    pub(super) fn serialized_edit_content_len(
+        text: &str,
+        event_id: &OwnedEventId,
+    ) -> Option<usize> {
+        let new_content = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+            TextMessageEventContent::markdown(text),
+        ));
+        serde_json::to_vec(
+            &new_content.make_replacement(ReplacementMetadata::new(event_id.clone(), None)),
+        )
+        .ok()
+        .map(|serialized| serialized.len())
     }
 
     /// Decide what `outbound::send` should do given the post-marker-strip
@@ -1966,12 +3245,6 @@ mod outbound {
         Http(reqwest::Url),
     }
 
-    /// Why `validate_marker_target` rejected a target. The distinction drives
-    /// the user-facing emoji reaction: `Refused` (the bot declined a target
-    /// it could have fetched) becomes 🚫, `NotFound` (the file simply isn't
-    /// there) becomes ⚠️ alongside other delivery failures. Without this
-    /// split, an agent emitting `[file:/missing.pdf]` would surface as a
-    /// safety refusal even though no policy fired.
     #[derive(Debug)]
     pub(super) enum ValidateError {
         /// Trust-boundary refusal: disallowed scheme, no workspace
@@ -2001,20 +3274,6 @@ mod outbound {
         }
     }
 
-    /// Validate an outbound marker target against the trust boundary policy:
-    ///
-    /// * `http`/`https` URLs are accepted (their fetch is then bounded by
-    ///   `MAX_MARKER_BYTES` and `MARKER_HTTP_TIMEOUT` in `fetch_http`).
-    /// * Schemes other than `http`/`https` (`file:`, `data:`, anything with
-    ///   `://`) are refused outright.
-    /// * Local paths are canonicalised and must live inside `workspace_dir`.
-    ///   `..` traversal that escapes the workspace, or absolute paths outside
-    ///   it, are refused.
-    /// * Local paths require `workspace_dir` to be configured. Without it,
-    ///   the channel cannot make a safe path decision.
-    ///
-    /// Pure(ish) helper: does FS canonicalisation but no network I/O.
-    /// Unit-tested directly without a live SDK or HTTP server.
     pub(super) fn validate_marker_target(
         target: &str,
         workspace_dir: Option<&Path>,
@@ -2023,24 +3282,71 @@ mod outbound {
             let url = reqwest::Url::parse(target)
                 .with_context(|| format!("parse marker URL {target}"))
                 .map_err(ValidateError::Refused)?;
+            let host_str = url.host_str().unwrap_or("");
+            if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(host_str) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "target": target,
+                            "host": host_str,
+                            "reason": "ssrf_private_host",
+                        })),
+                    "matrix: marker target points to a private/local host"
+                );
+                return Err(ValidateError::Refused(anyhow::Error::msg(format!(
+                    "matrix: marker target {target} resolves to a private or local host ({host_str}); refusing for SSRF safety. \
+                     Use a public URL or attach the file from workspace_dir directly."
+                ))));
+            }
             return Ok(MarkerTarget::Http(url));
         }
         if target.contains("://") {
             let scheme = target.split("://").next().unwrap_or("?");
-            return Err(ValidateError::Refused(anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "scheme": scheme,
+                        "target": target,
+                    })),
+                "matrix: marker target uses disallowed scheme"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(format!(
                 "matrix: marker target uses disallowed scheme {scheme:?}; only http/https and workspace-relative paths are accepted"
-            )));
+            ))));
         }
         if target.starts_with("data:") || target.starts_with("file:") {
-            return Err(ValidateError::Refused(anyhow!(
-                "matrix: marker target uses disallowed scheme; only http/https and workspace-relative paths are accepted"
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                    })),
+                "matrix: marker target uses disallowed data: or file: scheme"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(
+                "matrix: marker target uses disallowed scheme; only http/https and workspace-relative paths are accepted",
             )));
         }
 
         let workspace = workspace_dir.ok_or_else(|| {
-            ValidateError::Refused(anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                        "reason": "no_workspace_dir",
+                    })),
+                "matrix: marker target is local path but channel has no workspace_dir"
+            );
+            ValidateError::Refused(anyhow::Error::msg(format!(
                 "matrix: marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
-            ))
+            )))
         })?;
         let workspace_canon = std::fs::canonicalize(workspace)
             .with_context(|| format!("canonicalize workspace {}", workspace.display()))
@@ -2055,9 +3361,19 @@ mod outbound {
         let target_canon = match std::fs::canonicalize(&absolute) {
             Ok(p) => p,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ValidateError::NotFound(anyhow!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "target": target,
+                            "reason": "not_found",
+                        })),
+                    "matrix: marker target not found on disk"
+                );
+                return Err(ValidateError::NotFound(anyhow::Error::msg(format!(
                     "matrix: marker target {target} not found on disk"
-                )));
+                ))));
             }
             Err(e) => {
                 return Err(ValidateError::Refused(
@@ -2067,28 +3383,83 @@ mod outbound {
         };
 
         if !target_canon.starts_with(&workspace_canon) {
-            return Err(ValidateError::Refused(anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "target": target,
+                        "target_canon": target_canon.display().to_string(),
+                        "workspace_canon": workspace_canon.display().to_string(),
+                        "reason": "outside_workspace",
+                    })),
+                "matrix: marker target escapes workspace_dir"
+            );
+            return Err(ValidateError::Refused(anyhow::Error::msg(format!(
                 "matrix: marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
                 target_canon.display(),
                 workspace_canon.display(),
-            )));
+            ))));
         }
         Ok(MarkerTarget::Local(target_canon))
     }
 
+    /// Maximum number of redirects to follow on a marker HTTP fetch. The
+    /// `Policy::custom` closure below rejects any redirect target whose host
+    /// is private/local, so the cap mainly bounds the worst-case public-→-public
+    /// chain an attacker can construct.
+    const MAX_MARKER_REDIRECTS: usize = 10;
+
     fn marker_http_client() -> &'static reqwest::Client {
         static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
         CLIENT.get_or_init(|| {
-            reqwest::Client::builder()
-                .timeout(MARKER_HTTP_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::limited(5))
-                .user_agent("zeroclaw-matrix/1.0")
-                .build()
-                .expect("default reqwest client config never fails to build")
+            let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= MAX_MARKER_REDIRECTS {
+                    return attempt.error(std::io::Error::other(format!(
+                        "Too many marker redirects (max {MAX_MARKER_REDIRECTS})"
+                    )));
+                }
+                // `attempt.url()` borrows the attempt, so we copy out the
+                // bits we need into owned Strings before `attempt.error(...)`,
+                // which moves the attempt, can run.
+                let target_str = attempt.url().as_str().to_string();
+                let host = attempt.url().host_str().unwrap_or("").to_string();
+                if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(&host) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "target": target_str,
+                                "host": host,
+                                "reason": "ssrf_redirect_to_private_host",
+                            })),
+                        "matrix: marker redirect targets a private/local host"
+                    );
+                    return attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Blocked marker redirect to private or local host ({host}); \
+                             refusing for SSRF safety. Use a public URL or attach the file \
+                             from workspace_dir directly."
+                        ),
+                    ));
+                }
+                attempt.follow()
+            });
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                reqwest::Client::builder()
+                    .timeout(MARKER_HTTP_TIMEOUT)
+                    .redirect(redirect_policy)
+                    .user_agent("zeroclaw-matrix/1.0"),
+                "channel.matrix",
+            )
+            .build()
+            .expect("default reqwest client config never fails to build")
         })
     }
 
-    async fn fetch_http(url: reqwest::Url) -> Result<Vec<u8>> {
+    pub(super) async fn fetch_http(url: reqwest::Url) -> Result<Vec<u8>> {
         let client = marker_http_client();
         let resp = client
             .get(url.clone())
@@ -2134,17 +3505,6 @@ mod outbound {
         attachments: &[MediaAttachment],
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<AttachmentDelivery> {
-        // Outbound attachments. SendMessage.attachments comes from the runtime's
-        // structured attachment list; missing/empty data is fatal there because
-        // the bytes were already in memory. Marker-driven uploads are best-
-        // effort: if a marker target can't be read or uploaded, log it and fall
-        // back to a textual note so the operator sees what the agent intended
-        // rather than a silently-dropped reply.
-        //
-        // Track the last successful attachment event_id so a marker-only send
-        // (text empty after stripping markers) can return Ok with that id
-        // instead of an Err — otherwise the runtime would see a failure even
-        // though the attachment actually landed in the room.
         let mut last_attachment_id: Option<OwnedEventId> = None;
         for att in attachments {
             let id = upload_attachment(room, att, AttachmentKind::Auto, thread_anchor).await?;
@@ -2172,9 +3532,14 @@ mod outbound {
                         MarkerFailure::Refused => "trust boundary",
                         MarkerFailure::Failed => "not found",
                     };
-                    warn!(
-                        "matrix: skipping outbound marker for {} ({label}): {e}",
-                        marker.target
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "matrix: skipping outbound marker for {} ({label}): {e}",
+                            marker.target
+                        )
                     );
                     failed_markers.push((marker.target.clone(), kind));
                     continue;
@@ -2184,9 +3549,17 @@ mod outbound {
                 MarkerTarget::Local(path) => match tokio::fs::read(&path).await {
                     Ok(b) => b,
                     Err(e) => {
-                        warn!(
-                            "matrix: skipping outbound marker for {} (read failed): {e}",
-                            marker.target
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "matrix: skipping outbound marker for {} (read failed): {e}",
+                                marker.target
+                            )
                         );
                         failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                         continue;
@@ -2195,9 +3568,17 @@ mod outbound {
                 MarkerTarget::Http(url) => match fetch_http(url).await {
                     Ok(b) => b,
                     Err(e) => {
-                        warn!(
-                            "matrix: skipping outbound marker for {} (http failed): {e}",
-                            marker.target
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "matrix: skipping outbound marker for {} (http failed): {e}",
+                                marker.target
+                            )
                         );
                         failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                         continue;
@@ -2210,13 +3591,19 @@ mod outbound {
                 file_name,
                 data: bytes,
                 mime_type: Some(mime),
+                marker: None,
             };
             match upload_attachment(room, &att, kind, thread_anchor).await {
                 Ok(id) => last_attachment_id = Some(id),
                 Err(e) => {
-                    warn!(
-                        "matrix: skipping outbound marker for {} (upload failed): {e}",
-                        marker.target
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "matrix: skipping outbound marker for {} (upload failed): {e}",
+                            marker.target
+                        )
                     );
                     failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                 }
@@ -2286,21 +3673,35 @@ mod outbound {
                 return Ok(attachment_id);
             }
             SendOutcome::EmptyError => {
-                return Err(anyhow!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"phase": "send"})),
                     "matrix: empty message body and no successful attachment"
+                );
+                return Err(anyhow::Error::msg(
+                    "matrix: empty message body and no successful attachment",
                 ));
             }
         }
-
-        let content = RoomMessageEventContent::text_markdown(&delivery.text);
 
         let event_id = if let (true, Some(anchor)) = (
             outbox.reply_in_thread,
             message.thread_ts.as_deref().filter(|s| !s.is_empty()),
         ) {
-            send_threaded_reply(&room, content, anchor, outbox.threads_seen).await?
+            send_threaded_reply(
+                &room,
+                &delivery.text,
+                outbox.message_max_bytes,
+                anchor,
+                outbox.threads_seen,
+            )
+            .await?
         } else {
-            room.send(content).await?.event_id
+            let text = bounded_body(&delivery.text, outbox.message_max_bytes);
+            let content = RoomMessageEventContent::text_markdown(&text);
+            room.send(content).await?.response.event_id
         };
 
         let kinds = delivery.failure_kinds();
@@ -2322,34 +3723,73 @@ mod outbound {
             let content =
                 ReactionEventContent::new(Annotation::new(event_id.clone(), emoji.to_string()));
             if let Err(e) = room.send(content).await {
-                warn!("matrix: failed to send {emoji} reaction on outgoing message: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "emoji": emoji})
+                        ),
+                    "matrix: failed to send reaction on outgoing message"
+                );
             }
         }
     }
 
     async fn send_threaded_reply(
         room: &Room,
-        content: RoomMessageEventContent,
+        text: &str,
+        message_max_bytes: Option<usize>,
         anchor_id: &str,
         threads_seen: &Arc<TokioRwLock<std::collections::HashSet<OwnedEventId>>>,
     ) -> Result<OwnedEventId> {
         let anchor: OwnedEventId = anchor_id
             .parse()
             .with_context(|| format!("parse thread anchor {anchor_id}"))?;
-        let without_relation = RoomMessageEventContentWithoutRelation::new(content.msgtype.clone());
-        let reply_event = room
-            .make_reply_event(
-                without_relation,
-                Reply {
-                    event_id: anchor.clone(),
-                    enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
-                },
-            )
-            .await
-            .map_err(|e| anyhow!("make_reply_event failed: {e}"))?;
+        let mut candidate = bounded_body(text, message_max_bytes);
+        let reply_event = loop {
+            let without_relation = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+                TextMessageEventContent::markdown(candidate.as_str()),
+            ));
+            let event = room
+                .make_reply_event(
+                    without_relation,
+                    Reply {
+                        event_id: anchor.clone(),
+                        enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                        add_mentions: AddMentions::No,
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "make_reply_event failed"
+                    );
+                    anyhow::Error::msg(format!("make_reply_event failed: {e}"))
+                })?;
+            let Some(max_bytes) = message_max_bytes else {
+                break event;
+            };
+            let actual =
+                serde_json::to_vec(&event).map_or(usize::MAX, |serialized| serialized.len());
+            if actual <= max_bytes {
+                break event;
+            }
+            let next = next_prefix_after_oversize(&candidate, actual, max_bytes);
+            if next.len() == candidate.len() {
+                anyhow::bail!(
+                    "matrix: configured message_max_bytes cannot contain a threaded reply event"
+                );
+            }
+            candidate = next.to_string();
+        };
         ctx_mod::mark_seen(threads_seen, anchor).await;
         let resp = room.send(reply_event).await?;
-        Ok(resp.event_id)
+        Ok(resp.response.event_id)
     }
 
     pub(super) async fn edit(
@@ -2357,19 +3797,51 @@ mod outbound {
         room_id: &str,
         event_id: &OwnedEventId,
         text: &str,
-    ) -> Result<()> {
+        message_max_bytes: Option<usize>,
+    ) -> Result<String> {
         let room = client
             .get_room(&room_id.parse::<OwnedRoomId>()?)
-            .ok_or_else(|| anyhow!("matrix: room not joined: {room_id}"))?;
-        let new_content = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
-            TextMessageEventContent::markdown(text),
-        ));
-        let edit_event = room
-            .make_edit_event(event_id, EditedContent::RoomMessage(new_content))
-            .await
-            .map_err(|e| anyhow!("make_edit_event failed: {e}"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"room_id": room_id})),
+                    "matrix: room not joined"
+                );
+                anyhow::Error::msg(format!("matrix: room not joined: {room_id}"))
+            })?;
+        let candidate = text.to_string();
+        let edit_event = {
+            let new_content = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+                TextMessageEventContent::markdown(candidate.as_str()),
+            ));
+            let event = room
+                .make_edit_event(event_id, EditedContent::RoomMessage(new_content))
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "make_edit_event failed"
+                    );
+                    anyhow::Error::msg(format!("make_edit_event failed: {e}"))
+                })?;
+            if let Some(max_bytes) = message_max_bytes {
+                let actual =
+                    serde_json::to_vec(&event).map_or(usize::MAX, |serialized| serialized.len());
+                if actual > max_bytes {
+                    anyhow::bail!(
+                        "matrix: selected single-message progress edit exceeds configured message_max_bytes"
+                    );
+                }
+            }
+            event
+        };
         room.send(edit_event).await?;
-        Ok(())
+        Ok(candidate)
     }
 
     pub(super) async fn redact(
@@ -2380,7 +3852,16 @@ mod outbound {
     ) -> Result<()> {
         let room = client
             .get_room(&room_id.parse::<OwnedRoomId>()?)
-            .ok_or_else(|| anyhow!("matrix: room not joined: {room_id}"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"room_id": room_id})),
+                    "matrix: room not joined"
+                );
+                anyhow::Error::msg(format!("matrix: room not joined: {room_id}"))
+            })?;
         room.redact(event_id, reason.as_deref(), None).await?;
         Ok(())
     }
@@ -2401,7 +3882,7 @@ mod outbound {
                 event_id.clone(),
                 emoji.to_string(),
             ),
-            resp.event_id,
+            resp.response.event_id,
         );
         Ok(())
     }
@@ -2431,16 +3912,24 @@ mod outbound {
         recipient: &str,
     ) -> Result<Room> {
         let id = client::resolve_room(client, cache, recipient).await?;
-        let room = client
-            .get_room(&id)
-            .ok_or_else(|| anyhow!("matrix: bot is not in room {recipient}"))?;
+        let room = client.get_room(&id).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"recipient": recipient})),
+                "matrix: bot is not in room"
+            );
+            anyhow::Error::msg(format!("matrix: bot is not in room {recipient}"))
+        })?;
         if room.state() != RoomState::Joined {
             bail!("matrix: room {recipient} is not in joined state");
         }
         Ok(room)
     }
 
-    enum AttachmentKind {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AttachmentKind {
         Auto,
         Image,
         Audio,
@@ -2449,82 +3938,337 @@ mod outbound {
         Voice,
     }
 
-    async fn upload_attachment(
+    pub(super) async fn upload_attachment(
         room: &Room,
         att: &MediaAttachment,
         kind: AttachmentKind,
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<OwnedEventId> {
-        let mime: mime_guess::Mime = match att.mime_type.as_deref() {
+        let mime = attachment_mime(att);
+        let config = attachment_config_for(att, kind, &mime, thread_anchor);
+        let resp = room
+            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
+            .await
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "send_attachment failed"
+                );
+                anyhow::Error::msg(format!("send_attachment failed: {e}"))
+            })?;
+        Ok(resp.event_id)
+    }
+
+    pub(super) fn attachment_config_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> AttachmentConfig {
+        let mut config = AttachmentConfig::new().info(attachment_info_for(att, kind, mime));
+        if let Some(anchor) = thread_anchor {
+            config = config.reply(Some(Reply {
+                event_id: anchor.clone(),
+                enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
+                add_mentions: AddMentions::No,
+            }));
+        }
+        config
+    }
+
+    pub(super) fn attachment_mime(att: &MediaAttachment) -> mime_guess::Mime {
+        match att.mime_type.as_deref() {
             Some(m) => m
                 .parse()
                 .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
             None => mime_guess::from_path(&att.file_name)
                 .first()
                 .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
-        };
-        if matches!(kind, AttachmentKind::Voice) {
-            return upload_voice(room, att, &mime, thread_anchor).await;
         }
-        let mut config = AttachmentConfig::new();
-        if let Some(anchor) = thread_anchor {
-            config = config.reply(Some(Reply {
-                event_id: anchor.clone(),
-                enforce_thread: EnforceThread::Threaded(ReplyWithinThread::No),
-            }));
-        }
-        let resp = room
-            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
-            .await
-            .map_err(|e| anyhow!("send_attachment failed: {e}"))?;
-        Ok(resp.event_id)
     }
 
-    /// Voice messages need the `org.matrix.msc3245.voice` flag, which the
-    /// stable matrix-sdk types don't carry. Send via raw JSON, attaching the
-    /// thread relation manually when the bot is replying inside one.
-    async fn upload_voice(
-        room: &Room,
+    fn attachment_info_for(
         att: &MediaAttachment,
+        kind: AttachmentKind,
         mime: &mime_guess::Mime,
+    ) -> AttachmentInfo {
+        let size = UInt::try_from(att.data.len()).ok();
+        match attachment_info_kind(kind, mime) {
+            AttachmentKind::Image => AttachmentInfo::Image(BaseImageInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Audio => AttachmentInfo::Audio(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Video => AttachmentInfo::Video(BaseVideoInfo {
+                size,
+                ..Default::default()
+            }),
+            // `duration` and `waveform` must both be `Some` for the SDK to emit
+            // an `org.matrix.msc1767.audio` block at all, and without a
+            // duration clients render a voice bubble stuck at `00:00` with no
+            // seek bar. The length is read straight out of the Ogg container by
+            // `opus_duration` -- no decoding, and no length asserted when the
+            // bytes cannot be read with certainty, in which case the previous
+            // zero is still sent. The waveform stays empty: it is optional in
+            // MSC1767 and would need decoded PCM.
+            AttachmentKind::Voice => AttachmentInfo::Voice(BaseAudioInfo {
+                duration: Some(opus_duration(&att.data).unwrap_or(Duration::ZERO)),
+                size,
+                waveform: Some(Vec::new()),
+            }),
+            AttachmentKind::File | AttachmentKind::Auto => {
+                AttachmentInfo::File(BaseFileInfo { size })
+            }
+        }
+    }
+
+    fn attachment_info_kind(kind: AttachmentKind, mime: &mime_guess::Mime) -> AttachmentKind {
+        if kind == AttachmentKind::Voice {
+            return AttachmentKind::Voice;
+        }
+        match mime.type_() {
+            mime_guess::mime::IMAGE => AttachmentKind::Image,
+            mime_guess::mime::AUDIO => AttachmentKind::Audio,
+            mime_guess::mime::VIDEO => AttachmentKind::Video,
+            _ => AttachmentKind::File,
+        }
+    }
+
+    /// Playback length of an Ogg-Opus stream, read from the container alone.
+    ///
+    /// Opus always ticks at 48 kHz, so the length is the span the granule
+    /// positions cover, less the priming samples `OpusHead` asks the decoder to
+    /// discard:
+    ///
+    /// ```text
+    /// samples = final_granule - start_granule - pre_skip
+    /// ```
+    ///
+    /// `start_granule` is derived rather than stored. RFC 7845 section 4.5 lets
+    /// the first audio page carry a granule larger than the samples completing
+    /// on it, which is how a clip keeps the timeline of the recording it was cut
+    /// from; taking that page's granule as the origin would report the offset as
+    /// playback time. The origin is the granule minus the samples of the packets
+    /// completing on the page, counted from Opus table-of-contents metadata
+    /// (RFC 6716 section 3.1) without decoding audio.
+    ///
+    /// That page may instead carry a granule *below* those samples, but only
+    /// when it also ends the stream: the tail is trimmed to finish somewhere
+    /// other than a frame boundary, and the timeline starts at zero. The same
+    /// granule on a page that does not end the stream is invalid.
+    ///
+    /// Only a single logical stream is measured. A page whose serial differs
+    /// from the opening stream's, or a second beginning-of-stream page, belongs
+    /// to a chained or multiplexed file, whose length one number cannot honestly
+    /// describe.
+    ///
+    /// Returns `None` -- never a guess -- when the stream cannot be read end to
+    /// end: a bad capture pattern, a first page that is not a lone `OpusHead`
+    /// marked beginning-of-stream, a segment table or page body running past the
+    /// end, an audio page opening mid-packet, a table-of-contents byte that will
+    /// not parse, no page carrying a known granule, or a span shorter than
+    /// `pre_skip`.
+    pub(super) fn opus_duration(bytes: &[u8]) -> Option<Duration> {
+        /// `OggS`, version, header type, granule, serial, sequence, checksum,
+        /// segment count -- the fixed part of a page header.
+        const PAGE_HEADER_LEN: usize = 27;
+        /// `OpusHead`, version, channel count, `pre_skip`.
+        const OPUS_HEAD_LEN: usize = 12;
+        /// Opus granule positions always tick at 48 kHz, whatever the input
+        /// sample rate was.
+        const GRANULE_HZ: u64 = 48_000;
+        /// Header-type bit for a page opening with the tail of a packet carried
+        /// over from the page before it.
+        const CONTINUED: u8 = 0x01;
+        /// Header-type bit for a page that begins a logical stream.
+        const BOS: u8 = 0x02;
+        /// Header-type bit for a page that ends a logical stream.
+        const EOS: u8 = 0x04;
+        /// `OpusHead` then `OpusTags` precede the audio; the latter may span
+        /// pages, so audio begins once both have completed.
+        const HEADER_PACKETS: u32 = 2;
+
+        let mut cursor = 0usize;
+        let mut serial: Option<u32> = None;
+        let mut pre_skip: Option<u64> = None;
+        let mut header_packets = 0u32;
+        let mut start_granule: Option<u64> = None;
+        let mut last_granule: Option<u64> = None;
+
+        while bytes.len() - cursor >= PAGE_HEADER_LEN {
+            let header = bytes.get(cursor..cursor + PAGE_HEADER_LEN)?;
+            if &header[..4] != b"OggS" {
+                return None;
+            }
+            let header_type = header[5];
+            let granule = u64::from_le_bytes(header[6..14].try_into().ok()?);
+            let page_serial = u32::from_le_bytes(header[14..18].try_into().ok()?);
+            let segments = usize::from(header[26]);
+            // The segment table follows the fixed header; its bytes sum to the
+            // page body length.
+            let table_start = cursor.checked_add(PAGE_HEADER_LEN)?;
+            let body_start = table_start.checked_add(segments)?;
+            let table = bytes.get(table_start..body_start)?;
+            let body_len = table.iter().map(|&n| usize::from(n)).sum::<usize>();
+            let body_end = body_start.checked_add(body_len)?;
+            let body = bytes.get(body_start..body_end)?;
+
+            match serial {
+                None => {
+                    // The identification header opens the stream and holds its
+                    // page alone.
+                    if header[4] != 0
+                        || header_type & BOS == 0
+                        || body.len() < OPUS_HEAD_LEN
+                        || &body[..8] != b"OpusHead"
+                        || completed_packets(table) != 1
+                    {
+                        return None;
+                    }
+                    serial = Some(page_serial);
+                    pre_skip = Some(u64::from(u16::from_le_bytes([body[10], body[11]])));
+                }
+                // Another logical stream, concatenated after this one or
+                // interleaved with it. A reused serial still starts a new
+                // stream when the page is marked beginning-of-stream.
+                Some(open) if open != page_serial || header_type & BOS != 0 => return None,
+                Some(_) => {}
+            }
+
+            if header_packets < HEADER_PACKETS {
+                header_packets = header_packets.saturating_add(completed_packets(table));
+                if header_packets > HEADER_PACKETS {
+                    // Audio riding on the page that finishes `OpusTags`. The
+                    // first audio packet opens a page of its own, so there is
+                    // no page whose granule the origin can be derived from.
+                    return None;
+                }
+            } else if start_granule.is_none() {
+                // The first audio page fixes the origin the rest is measured
+                // from, so it has to be whole and timed.
+                if header_type & CONTINUED != 0 || granule == u64::MAX {
+                    return None;
+                }
+                let samples = completed_packet_samples(table, body)?;
+                start_granule = Some(match granule.checked_sub(samples) {
+                    Some(origin) => origin,
+                    // A granule below the samples completing on the page trims
+                    // the tail, which only a page ending the stream may do. The
+                    // timeline then starts at zero rather than being derivable
+                    // by working backwards.
+                    None if header_type & EOS != 0 => 0,
+                    None => return None,
+                });
+            }
+
+            // `u64::MAX` is the "granule not known for this page" marker.
+            if granule != u64::MAX {
+                last_granule = Some(granule);
+            }
+            // Always forward progress: `body_end` is at least one header past
+            // `cursor`, even for a page with no segments.
+            cursor = body_end;
+        }
+        if cursor != bytes.len() {
+            // Trailing bytes that are not a page: the buffer is truncated or
+            // is not what it claims to be.
+            return None;
+        }
+
+        let samples = last_granule?
+            .checked_sub(start_granule?)?
+            .checked_sub(pre_skip?)?;
+        Some(Duration::new(
+            samples / GRANULE_HZ,
+            // Exact, and cannot overflow: the remainder is below 48_000.
+            ((samples % GRANULE_HZ) * 1_000_000_000 / GRANULE_HZ) as u32,
+        ))
+    }
+
+    /// How many packets finish on a page, from its segment table.
+    ///
+    /// A lacing value below 255 ends a packet; a run of 255s carries one onto
+    /// the following page.
+    fn completed_packets(table: &[u8]) -> u32 {
+        u32::try_from(table.iter().filter(|&&lacing| lacing < 255).count()).unwrap_or(u32::MAX)
+    }
+
+    /// Samples carried by the packets that finish on one page.
+    ///
+    /// A trailing run of 255s belongs to a packet continuing onto the next page
+    /// and contributes nothing here, which is what makes this a count of the
+    /// audio the page's granule position accounts for.
+    fn completed_packet_samples(table: &[u8], body: &[u8]) -> Option<u64> {
+        let mut total = 0u64;
+        let mut offset = 0usize;
+        let mut packet_len = 0usize;
+        for &lacing in table {
+            packet_len = packet_len.checked_add(usize::from(lacing))?;
+            if lacing < 255 {
+                let end = offset.checked_add(packet_len)?;
+                total = total.checked_add(opus_packet_samples(body.get(offset..end)?)?)?;
+                offset = end;
+                packet_len = 0;
+            }
+        }
+        Some(total)
+    }
+
+    /// Samples in one Opus packet, on the 48 kHz granule clock.
+    ///
+    /// The first byte is the table of contents (RFC 6716 section 3.1): its top
+    /// five bits select the frame length and its bottom two how many frames the
+    /// packet holds. Length needs nothing further -- the encoded audio itself is
+    /// never touched.
+    fn opus_packet_samples(packet: &[u8]) -> Option<u64> {
+        /// Frame length per table-of-contents configuration, in samples at
+        /// 48 kHz: SILK narrow, medium and wideband run 10/20/40/60 ms, hybrid
+        /// super-wideband and fullband 10/20 ms, and CELT 2.5/5/10/20 ms per
+        /// band. Expressed in samples so the 2.5 ms case stays a whole number.
+        const FRAME_SAMPLES: [u64; 32] = [
+            480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 1920, 2880, 480, 960, 480, 960,
+            120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960, 120, 240, 480, 960,
+        ];
+        /// A packet holds at most 120 ms of audio.
+        const MAX_PACKET_SAMPLES: u64 = 5_760;
+
+        let toc = *packet.first()?;
+        let frame = *FRAME_SAMPLES.get(usize::from(toc >> 3))?;
+        let frames = match toc & 0x03 {
+            0 => 1,
+            1 | 2 => 2,
+            // An arbitrary frame count, in the six low bits of the next byte.
+            _ => u64::from(*packet.get(1)? & 0x3F),
+        };
+        let samples = frame.checked_mul(frames)?;
+        (samples > 0 && samples <= MAX_PACKET_SAMPLES).then_some(samples)
+    }
+
+    /// Ogg/Opus is what `TtsManager::synthesize_opus` produces and what Matrix
+    /// clients expect for a voice note.
+    pub(super) const VOICE_NOTE_MIME: &str = "audio/ogg";
+    pub(super) const VOICE_NOTE_FILE_NAME: &str = "voice.ogg";
+
+    /// Deliver synthesized speech as an MSC3245 voice note, in the same
+    /// thread as the text reply it accompanies.
+    pub(super) async fn send_voice_note(
+        room: &Room,
+        audio: Vec<u8>,
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<OwnedEventId> {
-        let mxc = room
-            .client()
-            .media()
-            .upload(mime, att.data.clone(), None)
-            .await
-            .map_err(|e| anyhow!("media upload failed: {e}"))?;
-        let mut event = json!({
-            "msgtype": "m.audio",
-            "body": att.file_name,
-            "filename": att.file_name,
-            "url": mxc.content_uri.to_string(),
-            "info": {
-                "mimetype": mime.essence_str(),
-                "size": att.data.len(),
-            },
-            "org.matrix.msc3245.voice": {},
-            "org.matrix.msc1767.audio": {
-                "duration": 0u32,
-                "waveform": Vec::<u32>::new(),
-            },
-        });
-        if let Some(anchor) = thread_anchor
-            && let Some(obj) = event.as_object_mut()
-        {
-            obj.insert(
-                "m.relates_to".to_string(),
-                json!({
-                    "rel_type": "m.thread",
-                    "event_id": anchor.as_str(),
-                    "is_falling_back": true,
-                    "m.in_reply_to": { "event_id": anchor.as_str() },
-                }),
-            );
-        }
-        let resp = room.send_raw("m.room.message", event).await?;
-        Ok(resp.event_id)
+        let att = MediaAttachment {
+            file_name: VOICE_NOTE_FILE_NAME.to_string(),
+            data: audio,
+            mime_type: Some(VOICE_NOTE_MIME.to_string()),
+            marker: None,
+        };
+        upload_attachment(room, &att, AttachmentKind::Voice, thread_anchor).await
     }
 
     fn derive_file_name(target: &str) -> String {
@@ -2552,11 +4296,21 @@ mod outbound {
 /// Matrix channel.
 pub struct MatrixChannel {
     config: Arc<MatrixConfig>,
+    /// The alias key under `[channels.matrix.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     state_dir: PathBuf,
     workspace_dir: Option<Arc<PathBuf>>,
-    transcription: Option<Arc<TranscriptionConfig>>,
+    transcription: Option<TranscriptionResolver>,
+    tts: Option<TtsResolver>,
+    /// Recipients the operator placed in a voice-modality peer group.
+    /// Resolved from live config on every send, never cached.
+    voice_peers: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     client: tokio::sync::OnceCell<Client>,
-    pending_approvals: Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
     threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
     alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
@@ -2564,37 +4318,102 @@ pub struct MatrixChannel {
     bot_display_name: Arc<TokioRwLock<Option<String>>>,
     initial_sync_done: Arc<AtomicBool>,
     undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+    /// Resolved `ack_reactions` for this Matrix instance — the
+    /// per-channel `MatrixConfig.ack_reactions` override falls back to
+    /// `[channels].ack_reactions` here at construction time, so the
+    /// read site doesn't need to re-resolve on every reaction.
+    ack_reactions: bool,
 }
 
 impl MatrixChannel {
     /// Validate config and prepare the channel. The SDK Client is built lazily
     /// on first `listen()` or `send()` call.
-    pub fn new(config: MatrixConfig, state_dir: PathBuf) -> Result<Self> {
+    pub fn new(
+        config: MatrixConfig,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        state_dir: PathBuf,
+    ) -> Result<Self> {
         if config.homeserver.trim().is_empty() {
             bail!("matrix: `homeserver` is required");
         }
-        if config.access_token.trim().is_empty() && config.password.is_none() {
+        let has_token = config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let has_password = config
+            .password
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        if !has_token && !has_password {
             bail!("matrix: configure either `access_token` or `password`");
         }
+        let ack_reactions = config.ack_reactions.unwrap_or(true);
+        let streaming_state = streaming::State::for_stream_mode(config.stream_mode);
         Ok(Self {
             config: Arc::new(config),
+            alias: alias.into(),
+            peer_resolver,
             state_dir,
             workspace_dir: None,
             transcription: None,
+            tts: None,
+            voice_peers: Arc::new(Vec::new),
             client: tokio::sync::OnceCell::new(),
             pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
-            streaming_state: Arc::new(TokioRwLock::new(streaming::State::default())),
+            streaming_state: Arc::new(TokioRwLock::new(streaming_state)),
             threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
             alias_cache: Arc::new(TokioRwLock::new(HashMap::new())),
             reaction_log: Arc::new(TokioMutex::new(HashMap::new())),
             bot_display_name: Arc::new(TokioRwLock::new(None)),
             initial_sync_done: Arc::new(AtomicBool::new(false)),
             undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            ack_reactions,
         })
     }
 
-    pub fn with_transcription(mut self, transcription: TranscriptionConfig) -> Self {
-        self.transcription = Some(Arc::new(transcription));
+    /// Return the alias under `[channels.matrix.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    #[must_use]
+    pub fn with_ack_reactions(mut self, ack_reactions: bool) -> Self {
+        self.ack_reactions = ack_reactions;
+        self
+    }
+
+    /// Replace the compatibility resolver with the channel runtime's
+    /// live-config resolver, so typed provider entries and the owning agent's
+    /// `transcription_provider` are honoured.
+    pub(crate) fn with_transcription_manager_factory(
+        mut self,
+        factory: impl Fn() -> Option<anyhow::Result<crate::transcription::TranscriptionManager>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.transcription = Some(Arc::new(factory));
+        self
+    }
+
+    /// Install the channel runtime's live-config TTS resolver, so the owning
+    /// agent's `tts_provider` and reloaded provider policy are honoured.
+    pub(crate) fn with_tts_manager_factory(
+        mut self,
+        factory: impl Fn() -> Option<anyhow::Result<crate::tts::TtsManager>> + Send + Sync + 'static,
+    ) -> Self {
+        self.tts = Some(Arc::new(factory));
+        self
+    }
+
+    /// Install the resolver for recipients in a voice-modality peer group.
+    pub(crate) fn with_voice_peer_resolver(
+        mut self,
+        voice_peers: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.voice_peers = voice_peers;
         self
     }
 
@@ -2607,13 +4426,17 @@ impl MatrixChannel {
     }
 
     async fn ensure_client(&self) -> Result<&Client> {
+        use ::zeroclaw_log::__private::tracing::Instrument;
         self.client
-            .get_or_try_init(|| async {
-                let c = client::build(&self.config, &self.state_dir).await?;
-                if let Ok(Some(name)) = c.account().get_display_name().await {
-                    *self.bot_display_name.write().await = Some(name);
+            .get_or_try_init(|| {
+                async {
+                    let c = client::build(&self.config, &self.state_dir).await?;
+                    if let Ok(Some(name)) = c.account().get_display_name().await {
+                        *self.bot_display_name.write().await = Some(name);
+                    }
+                    Ok::<_, anyhow::Error>(c)
                 }
-                Ok::<_, anyhow::Error>(c)
+                .instrument(::zeroclaw_log::attribution_span!(self))
             })
             .await
     }
@@ -2626,19 +4449,144 @@ impl MatrixChannel {
             reaction_log: &self.reaction_log,
             reply_in_thread: self.config.reply_in_thread,
             workspace_dir: self.workspace_dir.as_deref().map(|p| p.as_path()),
+            message_max_bytes: None,
+        }
+    }
+
+    fn final_outbox<'a>(&'a self, client: &'a Client) -> outbound::Outbox<'a> {
+        let mut outbox = self.outbox(client);
+        outbox.message_max_bytes = (self.config.stream_mode == MatrixStreamMode::SingleMessage)
+            .then_some(self.config.effective_message_max_bytes());
+        outbox
+    }
+
+    /// The half of the voice decision that needs no homeserver: `suppress_voice`
+    /// always wins, no TTS resolver means never, and an explicit `force_voice`
+    /// always does. `None` means the answer depends on the target room.
+    fn voice_intent(&self, message: &SendMessage) -> Option<bool> {
+        if self.tts.is_none() || message.suppress_voice {
+            return Some(false);
+        }
+        if message.force_voice {
+            return Some(true);
+        }
+        None
+    }
+
+    /// Whether `recipient` is a room holding a member of a voice-modality peer
+    /// group. Resolved from live config on every call.
+    ///
+    /// Peer groups name Matrix peers by user ID (`@user:server`), while an
+    /// outbound recipient is always a room (`!room:server`), so the two are
+    /// never comparable directly. For replies the runtime resolves the sender's
+    /// group and reports it as `force_voice`; this path exists for sends with
+    /// no inbound sender to consult — cron announcements and other proactive
+    /// delivery — where the room is the only identity available.
+    async fn room_has_voice_peer(&self, client: &Client, recipient: &str) -> bool {
+        let voice_peers = (self.voice_peers)();
+        if let Some(verdict) = allowlist::voice_peers_verdict(&voice_peers) {
+            return verdict;
+        }
+        let Ok(room) = outbound::resolve_joined_room(client, &self.alias_cache, recipient).await
+        else {
+            return false;
+        };
+        let Ok(members) = room.members(RoomMemberships::JOIN).await else {
+            return false;
+        };
+        members.iter().any(|m| {
+            crate::allowlist::is_user_allowed_by(
+                &voice_peers,
+                m.user_id().as_str(),
+                allowlist::voice_peer_matches,
+            )
+        })
+    }
+
+    /// Voice delivery is decided by configuration and the runtime's per-message
+    /// intent, never by inspecting the reply text.
+    async fn should_voice(&self, client: &Client, message: &SendMessage) -> bool {
+        match self.voice_intent(message) {
+            Some(verdict) => verdict,
+            None => self.room_has_voice_peer(client, &message.recipient).await,
+        }
+    }
+
+    /// Thread anchor for a voice note accompanying a plain send.
+    fn voice_thread_anchor(&self, message: &SendMessage) -> Option<OwnedEventId> {
+        if !self.config.reply_in_thread {
+            return None;
+        }
+        message
+            .thread_ts
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Thread anchor of a live draft, so a finalized reply's voice note lands
+    /// beside its text rather than in the main timeline.
+    async fn draft_thread_anchor(&self, recipient: &str, message_id: &str) -> Option<OwnedEventId> {
+        let key = streaming_key(recipient, message_id).ok()?;
+        let state = self.streaming_state.read().await;
+        streaming::peek_thread_anchor(&state, &key)
+    }
+
+    /// Synthesize `text` and post it as a voice note beside the text reply.
+    ///
+    /// Never propagates. The text reply has already landed by this point, so a
+    /// synthesis or upload failure must not make the runtime treat the whole
+    /// send as failed and retry it.
+    async fn deliver_voice_note(
+        &self,
+        client: &Client,
+        recipient: &str,
+        text: &str,
+        thread_anchor: Option<OwnedEventId>,
+    ) {
+        let Some(resolver) = self.tts.as_ref() else {
+            return;
+        };
+        let delivered: Result<Option<OwnedEventId>> = async {
+            let Some(manager) = resolver() else {
+                return Ok(None);
+            };
+            let manager = manager?;
+            // Speak the reply the reader sees: file markers are rendered as
+            // attachments, not read aloud.
+            let spoken = markers::parse(text).0;
+            if spoken.trim().is_empty() {
+                return Ok(None);
+            }
+            let audio = manager.synthesize_opus(&spoken).await?;
+            let room = outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
+            outbound::send_voice_note(&room, audio, thread_anchor.as_ref())
+                .await
+                .map(Some)
+        }
+        .await;
+
+        if let Err(e) = delivered {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "matrix: voice reply failed; the text reply was already delivered"
+            );
         }
     }
 
     /// Edit-in-place draft update. Rate-limited per the configured interval.
-    async fn partial_update(&self, recipient: &str, text: &str) -> Result<()> {
+    async fn partial_update(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         let Some(visible_text) = streaming::partial_visible_text(text) else {
             return Ok(());
         };
         let event_id = {
             let mut state = self.streaming_state.write().await;
-            let Some(draft) = state.partial.get_mut(&key) else {
+            let Some(draft) = streaming::partial_for_update(&mut state, &key) else {
                 return Ok(());
             };
             let now = Instant::now();
@@ -2651,51 +4599,220 @@ impl MatrixChannel {
             draft.last_edit = now;
             event_id
         };
-        outbound::edit(client, recipient, &event_id, &visible_text).await
+        outbound::edit(client, recipient, &event_id, &visible_text, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Update the sliding progress transcript for `single_message` mode.
+    /// Unlike Partial mode, assistant answer text is intentionally ignored
+    /// elsewhere; this draft is only for durable status/progress entries.
+    async fn single_update_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<()> {
+        let key = streaming_key(recipient, message_id)?;
+        let max_body_bytes = self.config.effective_message_max_bytes();
+        let update = {
+            let mut state = self.streaming_state.write().await;
+            let Some(draft) = streaming::single_for_update(&mut state, &key) else {
+                return Ok(());
+            };
+            streaming::push_single_progress_line(draft, text, self.config.stream_draft_lines);
+
+            let now = Instant::now();
+            let interval = Duration::from_millis(self.config.draft_update_interval_ms.max(50));
+            if !streaming::single_edit_interval_elapsed(draft, now, interval) {
+                return Ok(());
+            }
+
+            let visible_text =
+                streaming::single_visible_text_with_edit_budget(draft, max_body_bytes);
+            if visible_text.is_empty() || !streaming::single_render_changed(draft, &visible_text) {
+                return Ok(());
+            }
+            draft.last_edit = now;
+            (draft.event_id.clone(), visible_text)
+        };
+        let client = self.ensure_client().await?;
+        let delivered = outbound::edit(
+            client,
+            recipient,
+            &update.0,
+            &update.1,
+            Some(max_body_bytes),
+        )
+        .await?;
+        {
+            let mut state = self.streaming_state.write().await;
+            if let Some(draft) = streaming::single_for_update(&mut state, &key) {
+                streaming::mark_single_edit_delivered(draft, &update.0, delivered, Instant::now());
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a burst of single-message progress entries and publish the
+    /// coalesced transcript with one Matrix edit. The caller owns pacing.
+    async fn single_update_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> Result<()> {
+        let progress = texts
+            .iter()
+            .map(|text| streaming::legacy_single_progress(text))
+            .collect::<Vec<_>>();
+        self.single_update_typed_progress_batch(recipient, message_id, &progress)
+            .await
+    }
+
+    /// Publish a coalesced Matrix progress batch while retaining each entry's
+    /// semantic source through the channel-local draft buffer.
+    async fn single_update_typed_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> Result<()> {
+        if progress.is_empty() {
+            return Ok(());
+        }
+        let key = streaming_key(recipient, message_id)?;
+        let max_body_bytes = self.config.effective_message_max_bytes();
+        let update = {
+            let mut state = self.streaming_state.write().await;
+            let Some(draft) = streaming::single_for_update(&mut state, &key) else {
+                return Ok(());
+            };
+            for entry in progress {
+                streaming::push_single_progress(
+                    draft,
+                    entry.clone(),
+                    self.config.stream_draft_lines,
+                );
+            }
+
+            let visible_text =
+                streaming::single_visible_text_with_edit_budget(draft, max_body_bytes);
+            if visible_text.is_empty() || !streaming::single_render_changed(draft, &visible_text) {
+                return Ok(());
+            }
+            draft.last_edit = Instant::now();
+            (draft.event_id.clone(), visible_text)
+        };
+        let client = self.ensure_client().await?;
+        let delivered = outbound::edit(
+            client,
+            recipient,
+            &update.0,
+            &update.1,
+            Some(max_body_bytes),
+        )
+        .await?;
+        {
+            let mut state = self.streaming_state.write().await;
+            if let Some(draft) = streaming::single_for_update(&mut state, &key) {
+                streaming::mark_single_edit_delivered(draft, &update.0, delivered, Instant::now());
+            }
+        }
+        Ok(())
     }
 
     /// MultiMessage paragraph emitter. Loops emitting one paragraph per
     /// `\n\n` boundary until the unsent buffer no longer contains a break,
     /// then returns to wait for more accumulated text. Each paragraph posts
     /// as an independent room message threaded under the captured anchor.
-    async fn multi_update(&self, recipient: &str, text: &str) -> Result<()> {
+    async fn multi_update(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         let delay = Duration::from_millis(self.config.multi_message_delay_ms);
         loop {
-            let (paragraph, thread_anchor) = {
+            let (paragraph, new_confirmed, thread_anchor) = {
                 let mut state = self.streaming_state.write().await;
-                let Some(multi) = state.multi.get_mut(&key) else {
+                let Some(multi) = streaming::multi_for_update(&mut state, &key) else {
                     return Ok(());
                 };
-                // Detect a buffer reset (e.g. DraftEvent::Clear) and re-anchor
-                // to the new shorter text.
-                if text.len() < multi.sent_so_far {
-                    multi.sent_so_far = 0;
+                if !text
+                    .as_bytes()
+                    .starts_with(multi.confirmed_prefix.as_bytes())
+                {
+                    // The frame no longer starts with the confirmed bytes:
+                    // either a later sanitizer pass (e.g. a redaction span
+                    // completing on this delta) rewrote text before the
+                    // confirmed offset, or a DraftEvent::Clear restarted the
+                    // accumulation. Remap the offset onto the new frame before
+                    // slicing anything with it; a restart remaps to 0.
+                    let remapped =
+                        crate::orchestrator::remap_confirmed_offset(&multi.confirmed_prefix, text);
+                    multi.confirmed_prefix = text[..remapped].to_string();
+                }
+                let sent_so_far = multi.confirmed_prefix.len();
+                if text.len() == sent_so_far {
                     return Ok(());
                 }
-                if text.len() == multi.sent_so_far {
-                    return Ok(());
-                }
-                let unsent = &text[multi.sent_so_far..];
+                // `sent_so_far` is a byte-verified prefix of `text` (or a
+                // remap result on a `\n\n` boundary), so this slice cannot
+                // split a UTF-8 character.
+                let unsent = &text[sent_so_far..];
                 let Some(break_at) = streaming::next_paragraph_break(unsent) else {
                     return Ok(());
                 };
                 let paragraph = unsent[..break_at].trim().to_string();
-                multi.sent_so_far += break_at + 2; // +2 for the consumed "\n\n"
-                (paragraph, multi.thread_anchor.clone())
+                (
+                    paragraph,
+                    sent_so_far + break_at + 2,
+                    multi.thread_anchor.clone(),
+                )
             };
             if !paragraph.is_empty() {
                 let mut msg = SendMessage::new(paragraph, recipient);
                 msg.thread_ts = thread_anchor.as_ref().map(|e| e.to_string());
-                if let Err(e) = outbound::send(&self.outbox(client), &msg).await {
-                    tracing::warn!("matrix: multi-message paragraph send failed: {e}");
-                }
+                outbound::send(&self.outbox(client), &msg).await?;
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
             }
+            // The confirmed prefix is a confirmed-delivery coordinate, not an
+            // attempted-send coordinate. Empty paragraphs have no transport
+            // content, so their delimiter can advance immediately; a failed
+            // non-empty send returns above and remains eligible for finalization.
+            let mut state = self.streaming_state.write().await;
+            if let Some(multi) = streaming::multi_for_update(&mut state, &key) {
+                multi.confirmed_prefix = text[..new_confirmed].to_string();
+            }
         }
+    }
+
+    async fn redact_single_draft_before_final(
+        client: &Client,
+        recipient: &str,
+        event_id: &OwnedEventId,
+        reason: &str,
+    ) {
+        if let Err(err) =
+            outbound::redact(client, recipient, event_id, Some(reason.to_string())).await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                "matrix: single-message draft cleanup failed before final send; sending final response anyway"
+            );
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for MatrixChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Matrix)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -2705,9 +4822,35 @@ impl Channel for MatrixChannel {
         "matrix"
     }
 
+    fn self_handle(&self) -> Option<String> {
+        self.client
+            .get()
+            .and_then(|c| c.user_id().map(|u| u.to_string()))
+    }
+
+    fn self_addressed_mention(&self) -> Option<String> {
+        self.self_handle()
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let client = self.ensure_client().await?;
         let _ = outbound::send(&self.outbox(client), message).await?;
+        if self.should_voice(client, message).await {
+            let anchor = self.voice_thread_anchor(message);
+            self.deliver_voice_note(client, &message.recipient, &message.content, anchor)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn send_final(&self, message: &SendMessage) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let _ = outbound::send(&self.final_outbox(client), message).await?;
+        if self.should_voice(client, message).await {
+            let anchor = self.voice_thread_anchor(message);
+            self.deliver_voice_note(client, &message.recipient, &message.content, anchor)
+                .await;
+        }
         Ok(())
     }
 
@@ -2715,10 +4858,20 @@ impl Channel for MatrixChannel {
         let client = self.ensure_client().await?.clone();
         let user_id = client
             .user_id()
-            .ok_or_else(|| anyhow!("matrix: client has no user_id after login"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "matrix: client has no user_id after login"
+                );
+                anyhow::Error::msg("matrix: client has no user_id after login")
+            })?
             .to_owned();
         let ctx = inbound::HandlerCtx {
             config: self.config.clone(),
+            alias: self.alias.clone(),
+            peer_resolver: self.peer_resolver.clone(),
             transcription: self.transcription.clone(),
             workspace_dir: self.workspace_dir.clone(),
             tx,
@@ -2759,33 +4912,46 @@ impl Channel for MatrixChannel {
 
     fn supports_draft_updates(&self) -> bool {
         // The orchestrator's streaming pipeline is gated on this returning
-        // true. Both Partial and MultiMessage need it on so update_draft is
-        // driven with accumulated text; the channel decides internally
-        // whether to edit a single message or emit paragraphs.
-        !matches!(self.config.stream_mode, StreamMode::Off)
+        // true. Partial, SingleMessage, and MultiMessage all need streaming
+        // setup; the channel decides internally whether to edit answer text,
+        // edit progress only, or emit paragraphs.
+        !matches!(self.config.stream_mode, MatrixStreamMode::Off)
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
-        matches!(self.config.stream_mode, StreamMode::MultiMessage)
+        matches!(self.config.stream_mode, MatrixStreamMode::MultiMessage)
     }
 
     fn multi_message_delay_ms(&self) -> u64 {
         self.config.multi_message_delay_ms
     }
 
+    async fn multi_message_confirmed_offset(&self, recipient: &str, message_id: &str) -> usize {
+        if !matches!(self.config.stream_mode, MatrixStreamMode::MultiMessage) {
+            return 0;
+        }
+        let Ok(key) = streaming_key(recipient, message_id) else {
+            return 0;
+        };
+        let state = self.streaming_state.read().await;
+        streaming::multi_sent_so_far(&state, &key).unwrap_or(0)
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(&message.recipient)?;
+        let room_id = streaming_room(&message.recipient)?;
         match self.config.stream_mode {
-            StreamMode::Off => Ok(None),
-            StreamMode::Partial => {
+            MatrixStreamMode::Off => Ok(None),
+            MatrixStreamMode::Partial => {
                 // Send the placeholder draft now so subsequent update_draft
                 // calls have an event to edit.
                 let event_id = outbound::send(&self.outbox(client), message).await?;
                 let thread_anchor =
                     outbound::thread_anchor_from_message(&self.outbox(client), message);
+                let key = streaming::draft_key(room_id, event_id.as_ref())?;
                 let mut state = self.streaming_state.write().await;
-                state.partial.insert(
+                streaming::insert_partial(
+                    &mut state,
                     key,
                     streaming::PartialDraft {
                         event_id: event_id.clone(),
@@ -2793,10 +4959,33 @@ impl Channel for MatrixChannel {
                         last_text: message.content.clone(),
                         last_edit: Instant::now(),
                     },
-                );
+                )?;
                 Ok(Some(event_id.to_string()))
             }
-            StreamMode::MultiMessage => {
+            MatrixStreamMode::SingleMessage => {
+                // Single-message mode starts with one editable progress draft.
+                // Final answer text is never copied here; finalize_draft sends
+                // the answer as a separate Matrix message.
+                let event_id = outbound::send(&self.outbox(client), message).await?;
+                let thread_anchor =
+                    outbound::thread_anchor_from_message(&self.outbox(client), message);
+                let key = streaming::draft_key(room_id, event_id.as_ref())?;
+                let first_edit_ready = Instant::now();
+                let mut state = self.streaming_state.write().await;
+                streaming::insert_single(
+                    &mut state,
+                    key,
+                    streaming::SingleDraft {
+                        event_id: event_id.clone(),
+                        thread_anchor,
+                        lines: Default::default(),
+                        last_text: message.content.clone(),
+                        last_edit: first_edit_ready,
+                    },
+                )?;
+                Ok(Some(event_id.to_string()))
+            }
+            MatrixStreamMode::MultiMessage => {
                 // No initial message — paragraphs are emitted by update_draft
                 // as they appear. Capture the thread anchor up front so each
                 // paragraph lands in the same thread as the user's message.
@@ -2805,24 +4994,28 @@ impl Channel for MatrixChannel {
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .and_then(|s| s.parse::<OwnedEventId>().ok());
+                let draft_id = streaming::new_multi_message_draft_id();
+                let key = streaming::draft_key(room_id, &draft_id)?;
                 let mut state = self.streaming_state.write().await;
-                state.multi.insert(
+                streaming::insert_multi(
+                    &mut state,
                     key,
                     streaming::MultiDraft {
                         thread_anchor,
-                        sent_so_far: 0,
+                        confirmed_prefix: String::new(),
                     },
-                );
-                Ok(Some("multi_message_synthetic".to_string()))
+                )?;
+                Ok(Some(draft_id))
             }
         }
     }
 
-    async fn update_draft(&self, recipient: &str, _message_id: &str, text: &str) -> Result<()> {
+    async fn update_draft(&self, recipient: &str, message_id: &str, text: &str) -> Result<()> {
         match self.config.stream_mode {
-            StreamMode::Off => Ok(()),
-            StreamMode::Partial => self.partial_update(recipient, text).await,
-            StreamMode::MultiMessage => self.multi_update(recipient, text).await,
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => self.partial_update(recipient, message_id, text).await,
+            MatrixStreamMode::SingleMessage => Ok(()),
+            MatrixStreamMode::MultiMessage => self.multi_update(recipient, message_id, text).await,
         }
     }
 
@@ -2832,21 +5025,81 @@ impl Channel for MatrixChannel {
         message_id: &str,
         text: &str,
     ) -> Result<()> {
-        // Tool-status updates only show in Partial (edit-in-place) mode.
-        // MultiMessage doesn't have an in-flight draft to update.
-        if matches!(self.config.stream_mode, StreamMode::Partial) {
-            return self.update_draft(recipient, message_id, text).await;
+        match self.config.stream_mode {
+            MatrixStreamMode::Partial => self.update_draft(recipient, message_id, text).await,
+            MatrixStreamMode::SingleMessage => {
+                self.single_update_progress(recipient, message_id, text)
+                    .await
+            }
+            // MultiMessage doesn't have an in-flight draft to update, and Off
+            // means the orchestrator should not have created one.
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
         }
-        Ok(())
     }
 
-    async fn finalize_draft(&self, recipient: &str, _message_id: &str, text: &str) -> Result<()> {
-        let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+    async fn update_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> Result<()> {
         match self.config.stream_mode {
-            StreamMode::Off => Ok(()),
-            StreamMode::Partial => {
-                let draft = self.streaming_state.write().await.partial.remove(&key);
+            MatrixStreamMode::SingleMessage => {
+                self.single_update_progress_batch(recipient, message_id, texts)
+                    .await
+            }
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
+            MatrixStreamMode::Partial => {
+                for text in texts {
+                    self.update_draft_progress(recipient, message_id, text)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn update_typed_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        progress: &[DraftProgress],
+    ) -> Result<()> {
+        match self.config.stream_mode {
+            MatrixStreamMode::SingleMessage => {
+                self.single_update_typed_progress_batch(recipient, message_id, progress)
+                    .await
+            }
+            MatrixStreamMode::Off | MatrixStreamMode::MultiMessage => Ok(()),
+            MatrixStreamMode::Partial => {
+                for entry in progress {
+                    self.update_draft_progress(recipient, message_id, &entry.text)
+                        .await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        suppress_voice: bool,
+    ) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let key = streaming_key(recipient, message_id)?;
+        // Read before the draft is consumed below, so the voice note can be
+        // threaded with the text it accompanies.
+        let voice_anchor = self.draft_thread_anchor(recipient, message_id).await;
+        let finalized = match self.config.stream_mode {
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_partial(&mut state, &key)
+                };
                 if let Some(draft) = draft {
                     let room =
                         outbound::resolve_joined_room(client, &self.alias_cache, recipient).await?;
@@ -2868,12 +5121,26 @@ impl Channel for MatrixChannel {
                         streaming::PartialFinalizeAction::EditDraft => {
                             let kinds = delivery.failure_kinds();
                             let any_attachment_landed = delivery.last_attachment_id.is_some();
-                            if let Err(edit_err) =
-                                outbound::edit(client, recipient, &draft.event_id, &delivery.text)
-                                    .await
+                            if let Err(edit_err) = outbound::edit(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                &delivery.text,
+                                None,
+                            )
+                            .await
                             {
-                                tracing::warn!(
-                                    "matrix: partial finalize edit failed: {edit_err}; sending cleaned text fallback"
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        ::serde_json::json!({"edit_err": edit_err.to_string()})
+                                    ),
+                                    "matrix: partial finalize edit failed: ; sending cleaned text fallback"
                                 );
                                 let mut fallback = SendMessage::new(&delivery.text, recipient);
                                 fallback.thread_ts =
@@ -2888,9 +5155,7 @@ impl Channel for MatrixChannel {
                                         .await;
                                     }
                                     Err(send_err) if any_attachment_landed => {
-                                        tracing::warn!(
-                                            "matrix: partial finalize cleaned text fallback failed after attachment upload: {send_err}; suppressing error to avoid duplicate attachment retry"
-                                        );
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"send_err": send_err.to_string()})), "matrix: partial finalize cleaned text fallback failed after attachment upload: ; suppressing error to avoid duplicate attachment retry");
                                     }
                                     Err(send_err) => {
                                         return Err(edit_err).with_context(|| {
@@ -2914,29 +5179,158 @@ impl Channel for MatrixChannel {
                             )
                             .await
                             {
-                                tracing::warn!(
-                                    "matrix: partial finalize redaction failed after attachment-only upload: {err}; leaving placeholder to avoid duplicate attachment retry"
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                                    "matrix: partial finalize redaction failed after attachment-only upload: ; leaving placeholder to avoid duplicate attachment retry"
                                 );
                             }
                         }
                         streaming::PartialFinalizeAction::EmptyError => {
-                            return Err(anyhow!(
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"phase": "partial_finalize"})),
                                 "matrix: empty partial draft body and no successful attachment"
+                            );
+                            return Err(anyhow::Error::msg(
+                                "matrix: empty partial draft body and no successful attachment",
                             ));
                         }
                     }
                 }
                 Ok(())
             }
-            StreamMode::MultiMessage => {
+            MatrixStreamMode::SingleMessage => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_single(&mut state, &key)
+                };
+                let plan = streaming::single_finalize_plan(
+                    draft.is_some(),
+                    self.config.stream_draft_delete,
+                    !text.trim().is_empty(),
+                );
+
+                if plan.deletes_draft_first()
+                    && let Some(draft) = draft.as_ref()
+                {
+                    // Matrix implements message deletion through redaction.
+                    // Delete before the final send so the user's timeline
+                    // lands on the final answer rather than a trailing
+                    // "message deleted" event after it.
+                    Self::redact_single_draft_before_final(
+                        client,
+                        recipient,
+                        &draft.event_id,
+                        "streaming draft replaced by final response",
+                    )
+                    .await;
+                }
+
+                if plan.keeps_draft()
+                    && let Some(draft) = draft.as_ref()
+                {
+                    match streaming::single_retained_draft_action(
+                        draft,
+                        self.config.effective_message_max_bytes(),
+                    ) {
+                        streaming::SingleRetainedDraftAction::DeletePlaceholder => {
+                            Self::redact_single_draft_before_final(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                "empty streaming draft removed before final response",
+                            )
+                            .await;
+                        }
+                        streaming::SingleRetainedDraftAction::Flush(visible_text) => {
+                            if let Err(edit_err) = outbound::edit(
+                                client,
+                                recipient,
+                                &draft.event_id,
+                                &visible_text,
+                                Some(self.config.effective_message_max_bytes()),
+                            )
+                            .await
+                            {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"err": edit_err.to_string()})),
+                                    "matrix: single-message retained draft flush failed before final send"
+                                );
+                                if draft.last_text == DRAFT_PLACEHOLDER {
+                                    // Buffered progress is not durable until
+                                    // an edit succeeds. Remove the still-
+                                    // visible placeholder before sending the
+                                    // final answer rather than retaining an
+                                    // empty progress event.
+                                    Self::redact_single_draft_before_final(
+                                        client,
+                                        recipient,
+                                        &draft.event_id,
+                                        "unpublished streaming draft removed before final response",
+                                    )
+                                    .await;
+                                }
+                                // Once a successful edit establishes a
+                                // durable transcript, retention is
+                                // best-effort. A stale retained draft is less
+                                // harmful than suppressing the separate final
+                                // Matrix answer, so final delivery proceeds.
+                            }
+                        }
+                        streaming::SingleRetainedDraftAction::KeepCurrent => {}
+                    }
+                }
+
+                if plan.sends_final() {
+                    let mut msg = SendMessage::new(text, recipient);
+                    msg.thread_ts = draft
+                        .as_ref()
+                        .and_then(|draft| draft.thread_anchor.as_ref())
+                        .map(|e| e.to_string());
+                    outbound::send(&self.final_outbox(client), &msg).await?;
+                }
+                Ok(())
+            }
+            MatrixStreamMode::MultiMessage => {
                 // Drain the trailing paragraph (or whatever's left after the
                 // last \n\n boundary) as one final message.
-                let multi = self.streaming_state.write().await.multi.remove(&key);
+                let multi = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_multi(&mut state, &key)
+                };
                 let Some(state) = multi else {
                     return Ok(());
                 };
-                let remainder = if text.len() > state.sent_so_far {
-                    text[state.sent_so_far..].trim().to_string()
+                // The reconciled final text is built to preserve the confirmed
+                // prefix byte-for-byte; remap defensively so a divergent frame
+                // degrades to re-sending whole paragraphs, never a corrupt slice.
+                let sent_so_far = if text
+                    .as_bytes()
+                    .starts_with(state.confirmed_prefix.as_bytes())
+                {
+                    state.confirmed_prefix.len()
+                } else {
+                    crate::orchestrator::remap_confirmed_offset(&state.confirmed_prefix, text)
+                };
+                let remainder = if text.len() > sent_so_far {
+                    text[sent_so_far..].trim().to_string()
                 } else {
                     String::new()
                 };
@@ -2947,16 +5341,32 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
+        };
+
+        // `finalize_draft` carries no force_voice: the runtime routes those
+        // through send_final instead. Errors skip this by returning early.
+        if finalized.is_ok()
+            && !suppress_voice
+            && self.tts.is_some()
+            && self.room_has_voice_peer(client, recipient).await
+        {
+            self.deliver_voice_note(client, recipient, text, voice_anchor)
+                .await;
         }
+        finalized
     }
 
-    async fn cancel_draft(&self, recipient: &str, _message_id: &str) -> Result<()> {
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> Result<()> {
         let client = self.ensure_client().await?;
-        let key = streaming_key(recipient)?;
+        let key = streaming_key(recipient, message_id)?;
         match self.config.stream_mode {
-            StreamMode::Off => Ok(()),
-            StreamMode::Partial => {
-                if let Some(d) = self.streaming_state.write().await.partial.remove(&key) {
+            MatrixStreamMode::Off => Ok(()),
+            MatrixStreamMode::Partial => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_partial(&mut state, &key)
+                };
+                if let Some(d) = draft {
                     let _ = outbound::redact(
                         client,
                         recipient,
@@ -2967,18 +5377,40 @@ impl Channel for MatrixChannel {
                 }
                 Ok(())
             }
-            StreamMode::MultiMessage => {
+            MatrixStreamMode::SingleMessage => {
+                let draft = {
+                    let mut state = self.streaming_state.write().await;
+                    streaming::take_single(&mut state, &key)
+                };
+                if let Some(draft) = draft
+                    && streaming::single_cancel_deletes_draft(
+                        &draft,
+                        self.config.stream_draft_delete,
+                    )
+                {
+                    let _ = outbound::redact(
+                        client,
+                        recipient,
+                        &draft.event_id,
+                        Some("cancelled".to_string()),
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            MatrixStreamMode::MultiMessage => {
                 // Already-sent paragraphs are independent room messages and
                 // are not redacted on cancel — partial output is preferable
                 // to silent disappearance. Just drop our state.
-                self.streaming_state.write().await.multi.remove(&key);
+                let mut state = self.streaming_state.write().await;
+                streaming::take_multi(&mut state, &key);
                 Ok(())
             }
         }
     }
 
     async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
-        if !self.config.ack_reactions {
+        if !self.ack_reactions {
             return Ok(());
         }
         let client = self.ensure_client().await?;
@@ -2987,6 +5419,9 @@ impl Channel for MatrixChannel {
     }
 
     async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
+        if !self.ack_reactions {
+            return Ok(());
+        }
         let client = self.ensure_client().await?;
         let event_id: OwnedEventId = message_id.parse()?;
         outbound::unreact(&self.outbox(client), channel_id, &event_id, emoji).await
@@ -3003,57 +5438,2370 @@ impl Channel for MatrixChannel {
         outbound::redact(client, channel_id, &event_id, reason).await
     }
 
+    async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
+        let client = self.ensure_client().await?;
+        let request = room_management::build_create_room_request(options)?;
+        let room = client.create_room(request).await?;
+        Ok(room.room_id().to_string())
+    }
+
+    async fn invite_user(&self, room_id: &str, user_id: &str) -> Result<()> {
+        let client = self.ensure_client().await?;
+        let request = room_management::build_invite_user_request(room_id, user_id)?;
+        client.send(request).await?;
+        Ok(())
+    }
+
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        let client = self.ensure_client().await?;
+        let destination = client::resolve_room(client, &self.alias_cache, recipient)
+            .await?
+            .to_string();
         let token = approval::generate_token_default();
-        let prompt = format!(
-            "APPROVAL REQUIRED [{token}]\nTool: {}\nArgs: {}\n\nReply `{token} approve` / `{token} deny` / `{token} always`.",
-            request.tool_name, request.arguments_summary
+        let prompt = crate::util::build_approve_deny_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
+            request.position_counter(),
         );
 
-        // Register the waiter BEFORE sending the prompt so a fast operator
-        // reply landing on the inbound event handler between send and
-        // register isn't silently dropped (the inbound parser would find
-        // no matching token in `pending_approvals` and treat the reply as
-        // a normal message). If the send itself fails, clean up the
-        // registration before propagating the error.
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination,
+                tool_name: request.tool_name.clone(),
+            },
+        );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
-        let send_msg = SendMessage::new(prompt, recipient);
+        let send_msg = approval::build_prompt_message(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(e);
         }
 
         let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
         let result = tokio::time::timeout(timeout, rx).await;
-        if result.is_err() {
-            self.pending_approvals.lock().await.remove(&token);
-        }
+        // Only the first arm is an operator decision; the other two are the
+        // runtime denying because nobody replied, and must say so.
         match result {
-            Ok(Ok(resp)) => Ok(Some(resp)),
-            Ok(Err(_)) => Ok(Some(ChannelApprovalResponse::Deny)),
-            Err(_) => Ok(Some(ChannelApprovalResponse::Deny)),
+            Ok(Ok(resp)) => {
+                guard.disarm();
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
+                ))
+            }
+            Ok(Err(_)) => {
+                guard.remove().await;
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    ),
+                ))
+            }
+            Err(_) => {
+                guard.remove().await;
+                Ok(Some(
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    ),
+                ))
+            }
         }
     }
 }
 
-fn streaming_key(recipient: &str) -> Result<streaming::DraftKey> {
+fn streaming_room(recipient: &str) -> Result<OwnedRoomId> {
     recipient
         .parse::<OwnedRoomId>()
         .with_context(|| format!("parse recipient room id {recipient}"))
 }
 
+fn streaming_key(recipient: &str, message_id: &str) -> Result<streaming::DraftKey> {
+    streaming::draft_key(streaming_room(recipient)?, message_id)
+}
+
 // ─── tests ─────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
+    /// Regression: Matrix
+    /// streams paragraphs via `update_draft` and does NOT implement the
+    /// `flush_draft_turn` narration contract, so it must NOT opt into the
+    /// orchestrator's narration-policy + flush-barrier path. Otherwise outbound
+    /// hooks fire on phantom flushes that deliver nothing while Matrix's real
+    /// paragraph sends bypass the policy. `supports_multi_message_streaming` stays
+    /// true (its own paragraph streaming); only the turn-flush capability is off.
+    #[test]
+    fn matrix_does_not_opt_into_turn_flush_narration() {
+        use super::MatrixChannel;
+        use std::sync::Arc;
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
+
+        let config = MatrixConfig {
+            homeserver: "https://matrix.example".to_string(),
+            access_token: Some("token".to_string()),
+            stream_mode: MatrixStreamMode::MultiMessage,
+            ..MatrixConfig::default()
+        };
+        let ch = MatrixChannel::new(
+            config,
+            "alias",
+            Arc::new(Vec::<String>::new),
+            std::env::temp_dir(),
+        )
+        .expect("matrix channel constructs from valid config");
+
+        assert!(
+            ch.supports_multi_message_streaming(),
+            "Matrix still streams paragraphs in multi_message mode"
+        );
+        assert!(
+            !ch.supports_turn_flush_narration(),
+            "Matrix must not run the orchestrator narration-policy path on phantom flushes"
+        );
+    }
+
+    mod voice_reply_delivery {
+        use std::sync::Arc;
+
+        use matrix_sdk::config::SyncSettings;
+        use matrix_sdk::ruma::{owned_room_id, owned_user_id};
+        use tempfile::TempDir;
+        use wiremock::matchers::{body_partial_json, method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::{Channel, SendMessage};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, MatrixConfig, OpenAITtsProviderConfig, TtsProviderConfig,
+        };
+
+        use super::super::MatrixChannel;
+
+        /// Opus is the OpenAI family default, so `synthesize_opus` returns the
+        /// provider bytes unchanged and no `ffmpeg` transcode is attempted.
+        const OPUS_BYTES: &[u8] = b"OggS-fake-opus-payload";
+
+        async fn homeserver_with_room(room: &str) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND", "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/(upload|query)$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}, "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": { "join": { room: {
+                        "state": { "events": [] },
+                        "timeline": { "limited": false, "prev_batch": "t0", "events": [] }
+                    }}}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND", "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+            // The SDK reads the media config before any upload.
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/media/(v3|r0)/config$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "m.upload.size": 10_000_000
+                })))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// A voice group names users, so deciding whether a room should be
+        /// voiced costs a member lookup. Proactive sends (cron announces) have
+        /// no inbound sender, so this is the only identity available to them.
+        async fn mount_room_members(server: &MockServer, room: &str, members: &[&str]) {
+            let chunk: Vec<serde_json::Value> = members
+                .iter()
+                .enumerate()
+                .map(|(i, user)| {
+                    serde_json::json!({
+                        "type": "m.room.member",
+                        "sender": user,
+                        "state_key": user,
+                        "event_id": format!("$member{i}:server"),
+                        "origin_server_ts": 0,
+                        "room_id": room,
+                        "content": { "membership": "join" }
+                    })
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/members$"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"chunk": chunk})),
+                )
+                .mount(server)
+                .await;
+        }
+
+        async fn tts_endpoint() -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/speech"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(OPUS_BYTES))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        fn config_with_tts(uri: String) -> Config {
+            let mut config = Config::default();
+            config.tts.enabled = true;
+            config.providers.tts.openai.insert(
+                "local".to_string(),
+                OpenAITtsProviderConfig {
+                    base: TtsProviderConfig {
+                        api_key: Some("test-key".to_string()),
+                        uri: Some(uri),
+                        response_format: Some("opus".to_string()),
+                        ..TtsProviderConfig::default()
+                    },
+                },
+            );
+            config.agents.insert(
+                "default".to_string(),
+                AliasedAgentConfig {
+                    tts_provider: "openai.local".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            config
+        }
+
+        async fn channel_for(
+            homeserver: &MockServer,
+            tts_config: Config,
+            voice_peers: Vec<String>,
+            state_dir: &TempDir,
+        ) -> MatrixChannel {
+            let matrix_config = MatrixConfig {
+                homeserver: homeserver.uri(),
+                access_token: Some("secret-token".to_string()),
+                user_id: Some(owned_user_id!("@bot:server").to_string()),
+                device_id: Some("DEVICE".to_string()),
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let tts_config = Arc::new(tts_config);
+            MatrixChannel::new(
+                matrix_config,
+                "voice",
+                Arc::new(Vec::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel")
+            .with_voice_peer_resolver(Arc::new(move || voice_peers.clone()))
+            .with_tts_manager_factory(move || {
+                if !tts_config.tts.enabled {
+                    return None;
+                }
+                Some(crate::tts::TtsManager::from_config_for_agent(
+                    &tts_config,
+                    Some("default"),
+                ))
+            })
+        }
+
+        /// A voice group lists Matrix users (`@user:server`); the reply is
+        /// addressed to a room. Before this was a literal comparison of the two,
+        /// so a correctly configured group never voiced anything.
+        #[tokio::test]
+        async fn a_room_holding_a_voice_peer_receives_both_a_voice_note_and_the_text_reply() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(&homeserver, room_id.as_str(), &["@alice:server"]).await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "msgtype": "m.audio",
+                    "org.matrix.msc3245.voice": {}
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$voice:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("text reply is delivered");
+
+            // Mock `.expect(1)` assertions verify on drop: the text message,
+            // the media upload and the MSC3245 voice event must each land once.
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(1),
+                "the TTS endpoint must be asked to synthesize exactly once"
+            );
+        }
+
+        /// The event wrapper was always encrypted by `send_raw`; the audio was
+        /// not. Uploading the synthesized bytes in the clear hands the
+        /// homeserver a playable copy of an otherwise encrypted reply, so the
+        /// bytes that leave this process must not be the Opus payload.
+        #[tokio::test]
+        async fn an_encrypted_room_never_uploads_the_audio_in_the_clear() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(&homeserver, room_id.as_str(), &["@alice:server"]).await;
+            // The shared fixture answers this route with "not encrypted"; a
+            // higher priority (lower number) overrides it for this room only.
+            // Everything else about the fixture is unchanged.
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "algorithm": "m.megolm.v1.aes-sha2"
+                })))
+                .with_priority(1)
+                .mount(&homeserver)
+                .await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.(message|encrypted)/.*$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$sent:server"
+                })))
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .mount(&homeserver)
+                .await;
+            // Megolm key sharing runs before the event send. Answering these
+            // keeps the test on its first attempt instead of retry backoff.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/claim$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "failures": {}, "one_time_keys": {}
+                })))
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sendToDevice/.*$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("text reply is delivered");
+
+            let requests = homeserver.received_requests().await.unwrap_or_default();
+            let uploads: Vec<Vec<u8>> = requests
+                .iter()
+                .filter(|r| r.url.path().ends_with("/upload"))
+                .map(|r| r.body.clone())
+                .collect();
+            assert!(
+                requests
+                    .iter()
+                    .all(|r| !r.url.path().contains("/send/m.room.message/")),
+                "an encrypted room must carry no plaintext room message"
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| r.url.path().contains("/send/m.room.encrypted/")),
+                "the voice note and its text reply are sent as encrypted events"
+            );
+            assert!(
+                !uploads.is_empty(),
+                "the voice note is still uploaded in an encrypted room"
+            );
+            for body in &uploads {
+                assert_ne!(
+                    body.as_slice(),
+                    OPUS_BYTES,
+                    "the synthesized audio must not reach the homeserver verbatim"
+                );
+                assert!(
+                    !body.starts_with(b"OggS"),
+                    "ciphertext must not carry the Ogg container magic: {:?}",
+                    &body[..body.len().min(8)]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn suppressed_voice_delivers_text_without_synthesizing() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec![room_id.to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("error notice", room_id.as_str()).suppress_voice())
+                .await
+                .expect("text reply is delivered");
+
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(0),
+                "suppress_voice must not reach the synthesizer"
+            );
+        }
+
+        /// Delivery-level regression: a non-member sender's reply must stay
+        /// text-only even in a room that also holds a voice-group member.
+        /// Before the fix, the orchestrator's no-`send_via` reply arm kept
+        /// only the positive sender verdict (`force_voice`); a negative
+        /// verdict collapsed to `force_voice = false` with no
+        /// `suppress_voice` override, so `should_voice` fell back to
+        /// `room_has_voice_peer` and voiced the reply anyway because the
+        /// room's *other* occupant, `@alice:server`, was a voice peer.
+        ///
+        /// Drives the real production mapping
+        /// (`orchestrator::voice_override_from_sender_verdict`) — not a
+        /// hand-rolled stand-in — with the tri-state a non-member sender like
+        /// `@bob:server` actually gets (`Some(false)`, asserted separately in
+        /// `orchestrator::tests::matrix_voice_group_member_gets_a_voiced_reply_by_user_id`),
+        /// so this test is tied to that mapping and fails to build without
+        /// it. `matrix.rs`'s own `suppress_voice` handling predates the fix
+        /// and would pass this scenario either way, which is why the room
+        /// membership and the mapping call both have to be present here
+        /// rather than hand-constructing an already-suppressed `SendMessage`.
+        #[tokio::test]
+        async fn a_non_member_senders_reply_stays_text_only_in_a_room_with_a_voice_peer() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(
+                &homeserver,
+                room_id.as_str(),
+                &["@alice:server", "@bob:server"],
+            )
+            .await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            // Alice being a voice peer in this room must not matter for
+            // Bob's reply: nothing may ever be uploaded for it.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            let (suppress, force_voice) =
+                crate::orchestrator::voice_override_from_sender_verdict(Some(false));
+            assert_eq!(
+                (suppress, force_voice),
+                (Some(true), false),
+                "sanity-check the mapping this test depends on"
+            );
+
+            let mut send_msg = SendMessage::new("reply to bob", room_id.as_str());
+            if suppress.unwrap_or(false) {
+                send_msg = send_msg.suppress_voice();
+            } else if force_voice {
+                send_msg = send_msg.force_voice();
+            }
+
+            channel
+                .send_final(&send_msg)
+                .await
+                .expect("text reply is delivered");
+
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(0),
+                "a non-member sender's reply must never be synthesized, even \
+                 though the room also holds voice-group member @alice:server"
+            );
+        }
+
+        /// Same regression as above, for the streaming-finalization path:
+        /// `finalize_draft`'s shared voice-note gate (after the
+        /// per-`stream_mode` branch) must also honor the mapped
+        /// `suppress_voice` rather than falling back to room membership.
+        /// `MatrixStreamMode::Off` (the channel default here) makes the
+        /// per-mode branch a no-op, so this needs no live draft — it
+        /// exercises exactly the shared gate at issue.
+        #[tokio::test]
+        async fn finalize_draft_keeps_a_non_member_senders_reply_text_only() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            mount_room_members(
+                &homeserver,
+                room_id.as_str(),
+                &["@alice:server", "@bob:server"],
+            )
+            .await;
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/voice"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            let (suppress, _force_voice) =
+                crate::orchestrator::voice_override_from_sender_verdict(Some(false));
+
+            channel
+                .finalize_draft(
+                    room_id.as_str(),
+                    "draft-1",
+                    "reply to bob",
+                    suppress.unwrap_or(false),
+                )
+                .await
+                .expect("finalize_draft succeeds with no live draft in Off stream mode");
+
+            assert_eq!(
+                tts.received_requests().await.map(|r| r.len()),
+                Some(0),
+                "streaming finalization must also treat a non-member sender's \
+                 negative verdict as authoritative, even though the room \
+                 holds voice-group member @alice:server"
+            );
+        }
+
+        #[tokio::test]
+        async fn synthesis_failure_still_delivers_the_text_reply() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            // The member list has to answer, or the voice gate fails closed
+            // before synthesis is ever reached and this asserts nothing.
+            mount_room_members(&homeserver, room_id.as_str(), &["@alice:server"]).await;
+            // No /v1/audio/speech route mounted: synthesis fails.
+            let tts = MockServer::start().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            // Nothing to upload when there is no audio.
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/never"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("a TTS failure must not fail the text reply");
+
+            assert!(
+                !tts.received_requests()
+                    .await
+                    .expect("wiremock records requests")
+                    .is_empty(),
+                "synthesis has to be attempted for its failure to be the thing under test"
+            );
+        }
+
+        /// The voice gate asks the homeserver who is in the room. When that
+        /// question cannot be answered, the room is not voiced: a shared room
+        /// is the wrong place to guess, and the text reply carries the answer
+        /// either way.
+        #[tokio::test]
+        async fn an_unanswerable_member_list_never_voices_the_room() {
+            let room_id = owned_room_id!("!room:server");
+            let homeserver = homeserver_with_room(room_id.as_str()).await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/members$"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&homeserver)
+                .await;
+            // Synthesis would succeed if it were reached, so a voice note here
+            // would mean the gate opened on an unverified room.
+            let tts = tts_endpoint().await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({"msgtype": "m.text"})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$text:server"
+                })))
+                .expect(1)
+                .mount(&homeserver)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^.*/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content_uri": "mxc://server/never"
+                })))
+                .expect(0)
+                .mount(&homeserver)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = channel_for(
+                &homeserver,
+                config_with_tts(format!("{}/v1/audio/speech", tts.uri())),
+                vec!["@alice:server".to_string()],
+                &state_dir,
+            )
+            .await;
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates the joined room");
+
+            channel
+                .send_final(&SendMessage::new("spoken reply", room_id.as_str()))
+                .await
+                .expect("an unreachable member list must not fail the text reply");
+
+            assert!(
+                tts.received_requests()
+                    .await
+                    .expect("wiremock records requests")
+                    .is_empty(),
+                "a room whose membership could not be read must not be synthesized for"
+            );
+        }
+    }
+
+    mod voice_reply_gate {
+        use super::super::{
+            MatrixChannel,
+            allowlist::{voice_peer_matches, voice_peers_verdict},
+        };
+        use std::sync::Arc;
+        use zeroclaw_api::channel::SendMessage;
+        use zeroclaw_config::schema::MatrixConfig;
+
+        const ROOM: &str = "!room:localhost";
+        const PEER: &str = "@alice:localhost";
+
+        fn matrix_config(reply_in_thread: bool) -> MatrixConfig {
+            MatrixConfig {
+                homeserver: "http://127.0.0.1:8008".to_string(),
+                access_token: Some("test-token".to_string()),
+                reply_in_thread,
+                ..MatrixConfig::default()
+            }
+        }
+
+        /// `tts_wired` mirrors the orchestrator having installed a resolver at
+        /// all, independent of whether TTS is enabled right now.
+        fn channel(voice_peers: Vec<String>, tts_wired: bool) -> MatrixChannel {
+            let channel = MatrixChannel::new(
+                matrix_config(false),
+                "default",
+                Arc::new(Vec::new),
+                std::env::temp_dir(),
+            )
+            .expect("fixture Matrix config is valid");
+            let channel = channel.with_voice_peer_resolver(Arc::new(move || voice_peers.clone()));
+            if tts_wired {
+                channel.with_tts_manager_factory(|| None)
+            } else {
+                channel
+            }
+        }
+
+        // ── the half that needs no homeserver ──────────────────────────────
+
+        #[test]
+        fn force_voice_reaches_a_text_default_peer() {
+            let channel = channel(Vec::new(), true);
+            assert_eq!(
+                channel.voice_intent(&SendMessage::new("hello", ROOM).force_voice()),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn suppress_voice_beats_force_voice() {
+            let channel = channel(Vec::new(), true);
+            let message = SendMessage::new("hello", ROOM)
+                .force_voice()
+                .suppress_voice();
+            assert_eq!(channel.voice_intent(&message), Some(false));
+        }
+
+        #[test]
+        fn suppress_voice_beats_a_voice_peer() {
+            let channel = channel(vec![PEER.to_string()], true);
+            assert_eq!(
+                channel.voice_intent(&SendMessage::new("hello", ROOM).suppress_voice()),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn without_a_tts_resolver_nothing_is_voiced() {
+            // The channel runtime never installed one, so the channel has no
+            // way to synthesize regardless of configuration.
+            let channel = channel(vec![PEER.to_string()], false);
+            assert_eq!(
+                channel.voice_intent(&SendMessage::new("hello", ROOM)),
+                Some(false)
+            );
+            assert_eq!(
+                channel.voice_intent(&SendMessage::new("hello", ROOM).force_voice()),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn an_ordinary_reply_defers_to_the_room() {
+            // Nothing about the message settles it, so the target room's
+            // membership has to be consulted.
+            let channel = channel(vec![PEER.to_string()], true);
+            assert_eq!(channel.voice_intent(&SendMessage::new("hello", ROOM)), None);
+        }
+
+        // ── the room verdict that avoids a homeserver round-trip ───────────
+
+        #[test]
+        fn no_configured_voice_peers_voices_nobody() {
+            assert_eq!(voice_peers_verdict(&[]), Some(false));
+        }
+
+        #[test]
+        fn wildcard_voices_every_room_without_asking_for_members() {
+            // The literal comparison this replaces never matched `"*"` against
+            // a room id, so a wildcard voice group was silently inert.
+            assert_eq!(voice_peers_verdict(&["*".to_string()]), Some(true));
+            assert_eq!(
+                voice_peers_verdict(&[PEER.to_string(), "*".to_string()]),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn named_peers_require_the_member_list() {
+            // A user ID cannot be compared with a room id, so membership is
+            // the only thing that can answer this.
+            assert_eq!(voice_peers_verdict(&[PEER.to_string()]), None);
+        }
+
+        #[test]
+        fn membership_matching_accepts_the_same_shapes_the_runtime_does() {
+            // The runtime normalizes an inbound sender with
+            // `normalize_peer_username`, which strips a leading `@` and
+            // lowercases. Membership matching has to agree, or a group written
+            // without the `@` voices ordinary replies and silently drops
+            // proactive ones.
+            assert!(voice_peer_matches(PEER, PEER));
+            assert!(voice_peer_matches("alice:localhost", PEER));
+            assert!(voice_peer_matches("@ALICE:LOCALHOST", PEER));
+            assert!(!voice_peer_matches("@bob:localhost", PEER));
+            assert!(
+                !voice_peer_matches(ROOM, PEER),
+                "a room id is not a peer identity on either side"
+            );
+        }
+
+        #[test]
+        fn voice_peers_resolve_per_call_not_at_construction() {
+            // Peer groups are reloadable; a cached list would go stale.
+            let peers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let read = Arc::clone(&peers);
+            let channel = MatrixChannel::new(
+                matrix_config(false),
+                "default",
+                Arc::new(Vec::new),
+                std::env::temp_dir(),
+            )
+            .expect("fixture Matrix config is valid")
+            .with_tts_manager_factory(|| None)
+            .with_voice_peer_resolver(Arc::new(move || {
+                read.lock().map(|p| p.clone()).unwrap_or_default()
+            }));
+
+            assert_eq!(voice_peers_verdict(&(channel.voice_peers)()), Some(false));
+            if let Ok(mut p) = peers.lock() {
+                p.push("*".to_string());
+            }
+            assert_eq!(voice_peers_verdict(&(channel.voice_peers)()), Some(true));
+        }
+
+        #[test]
+        fn thread_anchor_follows_reply_in_thread() {
+            let threaded = MatrixChannel::new(
+                matrix_config(true),
+                "default",
+                Arc::new(Vec::new),
+                std::env::temp_dir(),
+            )
+            .expect("fixture Matrix config is valid");
+            let mut message = SendMessage::new("hello", ROOM);
+            message.thread_ts = Some("$anchor:localhost".to_string());
+            assert!(threaded.voice_thread_anchor(&message).is_some());
+
+            let flat = channel(Vec::new(), true);
+            assert!(
+                flat.voice_thread_anchor(&message).is_none(),
+                "reply_in_thread = false must keep the voice note out of a thread"
+            );
+        }
+    }
+
+    mod transcription_provider_resolution {
+        use super::super::build_transcription_manager;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, LocalWhisperConfig,
+            LocalWhisperTranscriptionProviderConfig, TranscriptionConfig,
+        };
+
+        fn local_whisper_config(url: &str) -> LocalWhisperConfig {
+            LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        fn with_transcription(transcription: TranscriptionConfig) -> Config {
+            Config {
+                transcription,
+                ..Config::default()
+            }
+        }
+
+        /// A typed `[providers.transcription.local_whisper.stoa]` entry plus the
+        /// owning agent's `transcription_provider`, and no legacy provider.
+        fn typed_config() -> Config {
+            let mut config = with_transcription(TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            });
+            config.providers.transcription.local_whisper.insert(
+                "stoa".to_string(),
+                LocalWhisperTranscriptionProviderConfig {
+                    uri: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+                    ..LocalWhisperTranscriptionProviderConfig::default()
+                },
+            );
+            config.agents.insert(
+                "local".to_string(),
+                AliasedAgentConfig {
+                    transcription_provider: "local_whisper.stoa".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+            config
+        }
+
+        #[tokio::test]
+        async fn registers_typed_provider_and_binds_the_agent_alias() {
+            // Regression: the channel built its manager from the legacy
+            // `[transcription]` section alone, so typed entries never
+            // registered and the agent's provider was never read — voice
+            // ingest failed with "no transcription provider registered".
+            let config = typed_config();
+
+            let manager = build_transcription_manager(&config, "local_whisper.stoa").unwrap();
+
+            assert!(
+                manager
+                    .available_providers()
+                    .contains(&"local_whisper.stoa"),
+                "typed provider must register, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the bound alias, got the empty-alias bail: {err}"
+            );
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected the dispatched provider to reject the format, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn agent_alias_wins_over_the_sole_provider_heuristic() {
+            // Two providers register, so the sole-provider fallback cannot
+            // fire; only the agent's explicit alias can bind here.
+            let mut config = typed_config();
+            config.transcription.local_whisper =
+                Some(local_whisper_config("http://127.0.0.1:9998/v1/transcribe"));
+
+            let manager = build_transcription_manager(&config, "local_whisper.stoa").unwrap();
+            assert!(
+                manager.available_providers().len() > 1,
+                "fixture must register more than one provider, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "the explicit agent alias must be bound, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn binds_alias_when_exactly_one_provider_is_configured() {
+            let config = with_transcription(TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            });
+
+            let manager = build_transcription_manager(&config, "").unwrap();
+            assert_eq!(
+                manager.available_providers(),
+                vec!["local_whisper"],
+                "fixture must register exactly one provider"
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.aiff")
+                .await
+                .expect_err("an unsupported format must be rejected");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected the dispatched provider to reject the format, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn leaves_alias_unbound_when_multiple_providers_are_configured() {
+            let config = with_transcription(TranscriptionConfig {
+                enabled: true,
+                api_key: Some("test-groq-key".to_string()),
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            });
+
+            let manager = build_transcription_manager(&config, "").unwrap();
+            assert!(
+                manager.available_providers().len() > 1,
+                "fixture must register more than one provider, got {:?}",
+                manager.available_providers()
+            );
+
+            let err = manager
+                .transcribe(b"not-real-audio", "voice.ogg")
+                .await
+                .expect_err("an unbound alias must fail");
+            assert!(
+                err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected the empty-alias bail, got: {err}"
+            );
+        }
+    }
+
+    mod media_filename_resolution {
+        use super::super::build_transcription_manager;
+        use super::super::inbound::transcription_safe_filename;
+        use zeroclaw_config::schema::TranscriptionConfig;
+
+        fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
+            zeroclaw_config::schema::LocalWhisperConfig {
+                url: url.to_string(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }
+        }
+
+        fn config_with(transcription: TranscriptionConfig) -> zeroclaw_config::schema::Config {
+            zeroclaw_config::schema::Config {
+                transcription,
+                ..zeroclaw_config::schema::Config::default()
+            }
+        }
+
+        #[test]
+        fn unaccepted_extension_with_supported_mime_uses_mime_derived_name() {
+            let resolved = transcription_safe_filename("recording.bin", Some("audio/ogg"));
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[test]
+        fn accepted_extension_is_preserved_even_when_mime_differs() {
+            let resolved = transcription_safe_filename("recording.mp3", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.mp3");
+        }
+
+        #[test]
+        fn accepted_extension_matching_mime_is_passed_through_unchanged() {
+            let resolved = transcription_safe_filename("recording.ogg", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.ogg");
+        }
+
+        #[test]
+        fn accepted_extension_is_matched_case_insensitively() {
+            let resolved = transcription_safe_filename("recording.OGG", Some("audio/ogg"));
+            assert_eq!(resolved, "recording.OGG");
+        }
+
+        #[test]
+        fn oga_extension_is_accepted_and_preserved() {
+            let resolved = transcription_safe_filename("note.oga", Some("audio/ogg"));
+            assert_eq!(resolved, "note.oga");
+        }
+
+        #[test]
+        fn no_mime_with_an_accepted_extension_is_passed_through() {
+            let resolved = transcription_safe_filename("recording.mp3", None);
+            assert_eq!(resolved, "recording.mp3");
+        }
+
+        #[test]
+        fn unaccepted_extension_with_no_mime_is_preserved_for_local_rejection() {
+            let resolved = transcription_safe_filename("recording.bin", None);
+            assert_eq!(resolved, "recording.bin");
+        }
+
+        #[test]
+        fn no_mime_and_no_extension_is_preserved_for_local_rejection() {
+            let resolved = transcription_safe_filename("Meeting recap", None);
+            assert_eq!(resolved, "Meeting recap");
+        }
+
+        #[test]
+        fn unsupported_mime_and_extension_are_preserved() {
+            let resolved = transcription_safe_filename("recording.aac", Some("audio/aac"));
+            assert_eq!(resolved, "recording.aac");
+        }
+
+        #[test]
+        fn synthesizes_extension_from_mime_when_no_extension_at_all() {
+            let resolved = transcription_safe_filename("Voice message", Some("audio/ogg"));
+            assert_eq!(resolved, "attachment.ogg");
+        }
+
+        #[tokio::test]
+        async fn caption_only_body_reaches_provider_dispatch_not_format_rejection() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("fixture audio bytes are not real, dispatch must still fail");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Unsupported audio format"),
+                "expected a resolved .ogg filename to pass format validation, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn unaccepted_extension_reaches_provider_dispatch_not_format_rejection() {
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe")),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("recording.bin", Some("audio/ogg"));
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("fixture audio bytes are not real, dispatch must still fail");
+            assert!(
+                !err.to_string()
+                    .contains("Agent has no transcription_provider configured"),
+                "expected dispatch to the sole provider, got the empty-alias bail: {err}"
+            );
+            assert!(
+                !err.to_string().contains("Unsupported audio format"),
+                "expected the unaccepted .bin extension to be replaced with the MIME-derived .ogg, got: {err}"
+            );
+        }
+
+        // An unsupported format must be rejected locally by the resolver —
+        // the provider endpoint must see zero requests.
+        #[tokio::test]
+        async fn unsupported_mime_sends_no_request() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("recording.aac", Some("audio/aac"));
+            assert_eq!(file_name, "recording.aac");
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("unsupported format must be rejected before dispatch");
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected local format rejection, got: {err}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn missing_mime_and_extension_sends_no_request() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", None);
+            assert_eq!(file_name, "Voice message");
+
+            let err = manager
+                .transcribe(b"not-real-audio", &file_name)
+                .await
+                .expect_err("missing format must be rejected before dispatch");
+            assert!(
+                err.to_string().contains("Unsupported audio format"),
+                "expected local format rejection, got: {err}"
+            );
+            server.verify().await;
+        }
+
+        // attach_media only inserts non-empty transcripts.
+        #[tokio::test]
+        async fn caption_only_body_transcript_is_produced_for_insertion() {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"text": "this is the transcribed voice message"}),
+                ))
+                .mount(&server)
+                .await;
+
+            let config = TranscriptionConfig {
+                enabled: true,
+                local_whisper: Some(local_whisper_config(&format!(
+                    "{}/v1/transcribe",
+                    server.uri()
+                ))),
+                ..TranscriptionConfig::default()
+            };
+            let manager = build_transcription_manager(&config_with(config), "").unwrap();
+
+            let file_name = transcription_safe_filename("Voice message", Some("audio/ogg"));
+
+            let text = manager.transcribe(b"fake-audio", &file_name).await.unwrap();
+            assert_eq!(text, "this is the transcribed voice message");
+            assert!(!text.trim().is_empty());
+        }
+
+        #[test]
+        fn transcription_only_name_may_diverge_from_the_real_filename() {
+            let real_filename = "recording.bin";
+            let transcribe_name = transcription_safe_filename(real_filename, Some("audio/ogg"));
+            assert_ne!(transcribe_name, real_filename);
+            assert_eq!(transcribe_name, "attachment.ogg");
+        }
+    }
+
+    // Route-level hermetic coverage: a real (constructed) WAV file travels
+    // event parsing → media download/save → attach_media → transcript
+    // insertion, with only the homeserver and STT provider mocked at HTTP.
+    mod inbound_route {
+        use std::collections::{HashMap, HashSet};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{RoomId, room_id, user_id};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use matrix_sdk_test::JoinedRoomBuilder;
+        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
+
+        use super::super::inbound::{HandlerCtx, register_event_handlers};
+
+        const TRANSCRIPT: &str = "route level transcript of the voice note";
+
+        fn test_room() -> &'static RoomId {
+            room_id!("!room:localhost")
+        }
+
+        fn timeline_raw(json: &serde_json::Value) -> Raw<AnySyncTimelineEvent> {
+            Raw::new(json).expect("event json").cast_unchecked()
+        }
+
+        async fn recv_forwarded(
+            rx: &mut mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+        ) -> zeroclaw_api::channel::ChannelMessage {
+            tokio::time::timeout(Duration::from_secs(15), rx.recv())
+                .await
+                .expect("inbound message must be forwarded before timeout")
+                .expect("channel must stay open")
+        }
+
+        // 0.1 s of a 440 Hz sine at 16 kHz mono 16-bit PCM: a genuinely
+        // valid, decodable WAV file, generated in-test.
+        fn build_wav() -> Vec<u8> {
+            let sample_rate: u32 = 16_000;
+            let samples: Vec<i16> = (0..(sample_rate / 10))
+                .map(|i| {
+                    let t = i as f32 / sample_rate as f32;
+                    ((t * 440.0 * std::f32::consts::TAU).sin() * f32::from(i16::MAX) * 0.5) as i16
+                })
+                .collect();
+            let data_len = (samples.len() * 2) as u32;
+            let mut wav = Vec::with_capacity(44 + data_len as usize);
+            wav.extend_from_slice(b"RIFF");
+            wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+            wav.extend_from_slice(b"WAVEfmt ");
+            wav.extend_from_slice(&16u32.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&1u16.to_le_bytes());
+            wav.extend_from_slice(&sample_rate.to_le_bytes());
+            wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+            wav.extend_from_slice(&2u16.to_le_bytes());
+            wav.extend_from_slice(&16u16.to_le_bytes());
+            wav.extend_from_slice(b"data");
+            wav.extend_from_slice(&data_len.to_le_bytes());
+            for s in &samples {
+                wav.extend_from_slice(&s.to_le_bytes());
+            }
+            wav
+        }
+
+        /// The handler context every route test drives, with the
+        /// transcription resolver left to the caller so a test can supply the
+        /// one a *configured* channel installed instead of the legacy
+        /// single-endpoint resolver.
+        fn handler_ctx_with_resolver(
+            transcription: Option<super::super::TranscriptionResolver>,
+            workspace: &std::path::Path,
+            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            HandlerCtx {
+                config: Arc::new(MatrixConfig::default()),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["*".to_string()]),
+                transcription,
+                workspace_dir: Some(Arc::new(workspace.to_path_buf())),
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            }
+        }
+
+        /// Legacy-resolver context: the single `[transcription]` endpoint at
+        /// `stt_url`, which is what most route tests want.
+        fn handler_ctx(
+            stt_url: &str,
+            workspace: &std::path::Path,
+            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            handler_ctx_with_resolver(
+                Some(super::super::legacy_transcription_resolver(
+                    TranscriptionConfig {
+                        enabled: true,
+                        local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                            url: stt_url.to_string(),
+                            bearer_token: Some("test-token".to_string()),
+                            max_audio_bytes: 10 * 1024 * 1024,
+                            timeout_secs: 30,
+                        }),
+                        ..TranscriptionConfig::default()
+                    },
+                )),
+                workspace,
+                tx,
+            )
+        }
+
+        fn voice_event_json(event_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "url": "mxc://localhost/audioblob",
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            })
+        }
+
+        async fn stt_server() -> wiremock::MockServer {
+            let stt = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "text": TRANSCRIPT })),
+                )
+                .expect(1)
+                .mount(&stt)
+                .await;
+            stt
+        }
+
+        async fn mount_media_download(matrix: &MatrixMockServer, wav: &[u8]) {
+            matrix
+                .mock_media_download()
+                .respond_with(ResponseTemplate::new(200).set_body_raw(wav.to_vec(), "audio/wav"))
+                .mount()
+                .await;
+            matrix
+                .mock_authed_media_download()
+                .ok_bytes(wav.to_vec())
+                .mount()
+                .await;
+        }
+
+        fn assert_stt_received_the_wav(reqs: &[wiremock::Request], wav: &[u8]) {
+            assert_eq!(reqs.len(), 1, "exactly one transcription request");
+            let body = &reqs[0].body;
+            assert!(
+                body.windows(wav.len()).any(|w| w == wav),
+                "request must carry the constructed WAV bytes verbatim"
+            );
+            let text = String::from_utf8_lossy(body);
+            assert!(
+                text.contains("filename=\"voice.wav\""),
+                "part filename: {text}"
+            );
+            assert!(text.contains("audio/wav"), "part content-type: {text}");
+            assert_eq!(&wav[..4], b"RIFF");
+            assert_eq!(&wav[8..12], b"WAVE");
+        }
+
+        #[tokio::test]
+        async fn direct_voice_note_inserts_transcript_and_keeps_real_filename() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            // The production handlers, registered exactly as `run_sync_loop`
+            // does; the event arrives through the real sync-dispatch pipeline.
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$audio1:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript must be inserted into the inbound content: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the real filename: {}",
+                msg.content
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            let saved_path = saved[0].path();
+            assert!(
+                saved_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .ends_with("voice.wav"),
+                "saved file keeps the real-name-derived filename: {saved_path:?}"
+            );
+            assert_eq!(std::fs::read(&saved_path).unwrap(), wav);
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        /// A voice note arriving on a *really configured* Matrix channel must
+        /// reach the STT server the owning agent's `transcription_provider`
+        /// names — not merely "some" registered provider.
+        ///
+        /// The channel is built by the production factory
+        /// [`crate::orchestrator::build_configured_matrix_channel`], and only
+        /// the resolver it installed is handed to the route, so nothing here
+        /// short-circuits provider selection.
+        ///
+        /// Two providers are registered on purpose:
+        /// [`super::super::build_transcription_manager`] binds a *sole*
+        /// registered provider when the agent states no preference, so a
+        /// one-provider fixture passes even with routing completely broken.
+        /// The decoy is what makes the assertion mean something.
+        #[tokio::test]
+        async fn configured_route_transcribes_via_the_agents_provider() {
+            use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
+
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            let wanted = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "text": TRANSCRIPT })),
+                )
+                .expect(1)
+                .mount(&wanted)
+                .await;
+
+            let decoy = wiremock::MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/transcribe"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "text": "decoy transcript" })),
+                )
+                .expect(0)
+                .mount(&decoy)
+                .await;
+
+            // Provider aliases share no name with the channel alias or the
+            // agent alias, so nothing can route correctly by coincidence.
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.transcription.enabled = true;
+            config.channels.matrix.insert(
+                "home".to_string(),
+                MatrixConfig {
+                    enabled: true,
+                    homeserver: "https://matrix.invalid".to_string(),
+                    access_token: Some("test-token".to_string()),
+                    ..MatrixConfig::default()
+                },
+            );
+            config.agents.insert(
+                "listener".to_string(),
+                zeroclaw_config::schema::AliasedAgentConfig {
+                    enabled: true,
+                    channels: vec!["matrix.home".into()],
+                    transcription_provider: "local_whisper.wanted".into(),
+                    ..Default::default()
+                },
+            );
+            config.providers.transcription.local_whisper.insert(
+                "wanted".to_string(),
+                LocalWhisperTranscriptionProviderConfig {
+                    uri: format!("{}/v1/transcribe", wanted.uri()),
+                    ..Default::default()
+                },
+            );
+            config.providers.transcription.local_whisper.insert(
+                "decoy".to_string(),
+                LocalWhisperTranscriptionProviderConfig {
+                    uri: format!("{}/v1/transcribe", decoy.uri()),
+                    ..Default::default()
+                },
+            );
+
+            let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
+            let channel = {
+                let config = config_arc.read();
+                crate::orchestrator::build_configured_matrix_channel(
+                    &config_arc,
+                    &config,
+                    "home",
+                    config
+                        .channels
+                        .matrix
+                        .get("home")
+                        .expect("configured Matrix alias"),
+                )
+                .expect("configured Matrix channel builds")
+            };
+
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx =
+                handler_ctx_with_resolver(channel.transcription.clone(), workspace.path(), tx);
+            assert!(
+                ctx.transcription.is_some(),
+                "the configured channel must install a transcription resolver"
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$configured1:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript from the routed provider must land in the inbound content: {}",
+                msg.content
+            );
+
+            assert_stt_received_the_wav(&wanted.received_requests().await.unwrap(), &wav);
+            assert!(
+                decoy.received_requests().await.unwrap().is_empty(),
+                "the provider the agent did not name must never be called"
+            );
+            wanted.verify().await;
+            decoy.verify().await;
+        }
+
+        #[tokio::test]
+        async fn reply_to_voice_note_inserts_parent_transcript() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
+            // parent m.audio event verbatim.
+            let parent = voice_event_json("$parentaudio:localhost");
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/v3/rooms/.*/event/\$parentaudio:localhost$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+                .mount(matrix.server())
+                .await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$reply1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "what does this say?",
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": "$parentaudio:localhost" }
+                    }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "parent transcript must be inserted: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the parent's real filename: {}",
+                msg.content
+            );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        /// `voice_origin` is the event's own MSC3245 flag, forwarded so the
+        /// orchestrator can answer a `mirror` peer in kind.
+        #[tokio::test]
+        async fn a_voice_message_forwards_voice_origin() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = voice_event_json("$audio-origin:localhost");
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.voice_origin,
+                "an m.audio event carrying org.matrix.msc3245.voice is voice-origin"
+            );
+        }
+
+        /// A text event is not voice-origin, whatever its body says.
+        #[tokio::test]
+        async fn a_text_message_does_not_forward_voice_origin() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let json = text_parent_event(
+                "$text-origin:localhost",
+                "@alice:localhost",
+                "[voice transcript]: not actually a voice note",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                !msg.voice_origin,
+                "an m.text event is text-origin even when its body mimics a transcript"
+            );
+        }
+
+        /// A text reply whose parent is a voice note borrows the parent's
+        /// transcript but not its modality: only the event itself decides.
+        #[tokio::test]
+        async fn a_reply_to_a_voice_parent_does_not_forward_voice_origin() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+            mount_parent_event(&matrix, voice_event_json("$parent-origin:localhost"), 1).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = plain_reply_event(
+                "$reply-origin:localhost",
+                "$parent-origin:localhost",
+                "what does this say?",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "the parent transcript is still inserted: {}",
+                msg.content
+            );
+            assert!(
+                !msg.voice_origin,
+                "a text reply to a voice note is text-origin"
+            );
+        }
+
+        // Encrypted-media variant: the event carries an E2EE `file` source;
+        // the homeserver serves ciphertext and the client decrypts during
+        // download, so the saved copy and the STT request must contain the
+        // original plaintext WAV.
+        #[tokio::test]
+        async fn encrypted_voice_note_decrypts_and_inserts_transcript() {
+            use std::io::Read as _;
+
+            use matrix_sdk::ruma::OwnedMxcUri;
+            use matrix_sdk::ruma::events::room::EncryptedFile;
+            use matrix_sdk_base::crypto::AttachmentEncryptor;
+
+            let wav = build_wav();
+            let mut reader = wav.as_slice();
+            let mut encryptor = AttachmentEncryptor::new(&mut reader);
+            let mut ciphertext = Vec::new();
+            encryptor.read_to_end(&mut ciphertext).unwrap();
+            let keys = encryptor.finish();
+            let file = EncryptedFile::new(
+                OwnedMxcUri::from("mxc://localhost/encryptedaudioblob"),
+                keys.encryption_info,
+                keys.hashes,
+            );
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &ciphertext).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$encaudio1:localhost",
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.wav",
+                    "file": serde_json::to_value(&file).unwrap(),
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/wav" }
+                }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "transcript must be inserted for encrypted media: {}",
+                msg.content
+            );
+            assert!(
+                msg.content.contains("voice.wav"),
+                "marker must keep the real filename: {}",
+                msg.content
+            );
+
+            let media_dir = workspace.path().join("matrix_files");
+            let saved: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(saved.len(), 1, "exactly one saved media file");
+            assert_eq!(
+                std::fs::read(saved[0].path()).unwrap(),
+                wav,
+                "saved copy must be the decrypted plaintext"
+            );
+
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+
+        fn mention_only_handler_ctx(
+            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            let mut ctx = handler_ctx(
+                "http://127.0.0.1:9/v1/transcribe",
+                std::path::Path::new("/tmp"),
+                tx,
+            );
+            // Clone config Arc contents with mention_only enabled.
+            let mut config = (*ctx.config).clone();
+            config.mention_only = true;
+            ctx.config = Arc::new(config);
+            ctx.transcription = None;
+            ctx.workspace_dir = None;
+            ctx
+        }
+
+        fn text_parent_event(event_id: &str, sender: &str, body: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": sender,
+                "origin_server_ts": 1_000_000u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": body
+                }
+            })
+        }
+
+        fn plain_reply_event(event_id: &str, parent_id: &str, body: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": body,
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": parent_id }
+                    }
+                }
+            })
+        }
+
+        async fn mount_parent_event(
+            matrix: &MatrixMockServer,
+            parent: serde_json::Value,
+            expected_gets: u64,
+        ) {
+            let parent_id = parent["event_id"]
+                .as_str()
+                .expect("parent event_id")
+                .to_string();
+            // Event ids in these tests are `$name:localhost` — escape `$` for the regex.
+            let pattern = format!(
+                r"^/_matrix/client/v3/rooms/.*/event/{}$",
+                parent_id.replace('$', r"\$")
+            );
+            Mock::given(method("GET"))
+                .and(path_regex(pattern))
+                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+                .expect(expected_gets)
+                .mount(matrix.server())
+                .await;
+        }
+
+        #[tokio::test]
+        async fn mention_only_forwards_unmentioned_reply_to_bot_with_one_parent_fetch() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let parent = text_parent_event("$botparent:localhost", "@bot:localhost", "bot said hi");
+            mount_parent_event(&matrix, parent, 1).await;
+
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = mention_only_handler_ctx(tx);
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let json = plain_reply_event(
+                "$reply-bot:localhost",
+                "$botparent:localhost",
+                "thanks, continuing without an @mention",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert_eq!(
+                msg.content, "thanks, continuing without an @mention",
+                "unmentioned reply-to-bot must be forwarded under mention_only"
+            );
+        }
+
+        #[tokio::test]
+        async fn mention_only_drops_unmentioned_reply_to_non_bot_parent() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let parent = text_parent_event(
+                "$aliceparent:localhost",
+                "@carol:localhost",
+                "human chatter",
+            );
+            mount_parent_event(&matrix, parent, 1).await;
+
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = mention_only_handler_ctx(tx);
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let json = plain_reply_event(
+                "$reply-human:localhost",
+                "$aliceparent:localhost",
+                "replying to carol, not the bot",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let timed_out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err();
+            assert!(
+                timed_out,
+                "unmentioned reply to a non-bot parent must be dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn mention_only_reply_to_bot_voice_reuses_single_parent_fetch() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            // Parent is a bot voice note: gate + parent-media must share one GET.
+            let mut parent = voice_event_json("$botvoice:localhost");
+            parent["sender"] = serde_json::json!("@bot:localhost");
+            mount_parent_event(&matrix, parent, 1).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let mut ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+            let mut config = (*ctx.config).clone();
+            config.mention_only = true;
+            ctx.config = Arc::new(config);
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = plain_reply_event(
+                "$reply-voice:localhost",
+                "$botvoice:localhost",
+                "what did you say?",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "admitted reply must still attach parent media once: {}",
+                msg.content
+            );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+        }
+        #[tokio::test]
+        async fn sync_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            let (tx, mut inbound_rx) = mpsc::channel(4);
+            let ctx = HandlerCtx {
+                config: Arc::new(MatrixConfig {
+                    allowed_rooms: vec![test_room().to_string()],
+                    ..MatrixConfig::default()
+                }),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(|| vec!["@operator:localhost".to_string()]),
+                transcription: None,
+                workspace_dir: None,
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            };
+            let (approved_tx, approved_rx) = oneshot::channel();
+            let (wrong_tx, _wrong_rx) = oneshot::channel();
+            let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
+            {
+                let mut approvals = ctx.pending_approvals.lock().await;
+                approvals.insert(
+                    "AUTH0001".into(),
+                    crate::util::PendingApproval {
+                        sender: approved_tx,
+                        destination: test_room().to_string(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+                approvals.insert(
+                    "WRONG001".into(),
+                    crate::util::PendingApproval {
+                        sender: wrong_tx,
+                        destination: "!other:localhost".into(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+                approvals.insert(
+                    "OTHER001".into(),
+                    crate::util::PendingApproval {
+                        sender: unauthorized_tx,
+                        destination: test_room().to_string(),
+                        tool_name: "tool".to_string(),
+                    },
+                );
+            }
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let approved = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$approved:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_000u64,
+                "content": { "msgtype": "m.text", "body": "AUTH0001 approve" }
+            });
+            let wrong_destination = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$wrong-destination:localhost",
+                "sender": "@operator:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": { "msgtype": "m.text", "body": "WRONG001 deny" }
+            });
+            let unauthorized = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": "$unauthorized:localhost",
+                "sender": "@other:localhost",
+                "origin_server_ts": 1_000_002u64,
+                "content": { "msgtype": "m.text", "body": "OTHER001 deny" }
+            });
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room())
+                        .add_timeline_event(timeline_raw(&approved))
+                        .add_timeline_event(timeline_raw(&wrong_destination))
+                        .add_timeline_event(timeline_raw(&unauthorized)),
+                )
+                .await;
+
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), approved_rx)
+                    .await
+                    .expect("sync ingress should resolve the authorized approval")
+                    .expect("sync ingress should resolve the authorized approval"),
+                ChannelApprovalResponse::Approve
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
+                    .await
+                    .is_err(),
+                "approval-shaped events must not reach agent dispatch"
+            );
+            let approvals = ctx.pending_approvals.lock().await;
+            assert!(approvals.contains_key("WRONG001"));
+            assert!(approvals.contains_key("OTHER001"));
+        }
+    }
+
     mod markers {
         use super::super::markers::{MarkerKind, parse};
 
@@ -3086,6 +7834,21 @@ mod tests {
             assert_eq!(ms.len(), 2);
             assert_eq!(ms[0].kind, MarkerKind::Voice);
             assert_eq!(ms[1].kind, MarkerKind::Audio);
+        }
+
+        #[test]
+        fn echoed_media_placeholder_delivered_as_prose() {
+            // A text-only model sees the degradation placeholder in its
+            // history and may repeat it; the reply must reach the room as
+            // readable text, not as a marker or a stray bracket span.
+            let reply = format!(
+                "I can't view that, it shows as {}.",
+                zeroclaw_providers::multimodal::MEDIA_PLACEHOLDER
+            );
+            let (text, ms) = parse(&reply);
+            assert_eq!(text, reply);
+            assert!(ms.is_empty());
+            assert!(!text.contains('['));
         }
 
         #[test]
@@ -3129,12 +7892,105 @@ mod tests {
 
     mod approval {
         use super::super::approval::{
-            TOKEN_LEN, generate_token, generate_token_default, parse_reply,
+            TOKEN_LEN, build_prompt_message, generate_token, generate_token_default, parse_reply,
         };
         use rand::SeedableRng;
         use rand::rngs::StdRng;
         use std::collections::HashSet;
         use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        #[tokio::test]
+        async fn pending_approval_requires_allowed_user_and_origin_room() {
+            let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            pending.lock().await.insert(
+                "APPROVAL".to_string(),
+                crate::util::PendingApproval {
+                    sender: tx,
+                    destination: "!origin:example.invalid".to_string(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+
+            for response in [
+                ChannelApprovalResponse::Approve,
+                ChannelApprovalResponse::Deny,
+                ChannelApprovalResponse::AlwaysApprove,
+            ] {
+                assert_eq!(
+                    crate::util::resolve_pending_approval(
+                        &pending,
+                        "APPROVAL",
+                        response,
+                        super::super::allowlist::user_allowed(
+                            &["@operator:example.invalid".to_string()],
+                            "@other:example.invalid",
+                        ),
+                        "!origin:example.invalid",
+                    )
+                    .await,
+                    crate::util::PendingApprovalResolution::Rejected,
+                );
+                assert!(pending.lock().await.contains_key("APPROVAL"));
+            }
+
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVAL",
+                    ChannelApprovalResponse::Approve,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!other:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Rejected,
+            );
+            assert!(pending.lock().await.contains_key("APPROVAL"));
+
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVAL",
+                    ChannelApprovalResponse::AlwaysApprove,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!origin:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Resolved,
+            );
+            assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
+
+            let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
+            pending.lock().await.insert(
+                "APPROVE2".to_string(),
+                crate::util::PendingApproval {
+                    sender: approve_tx,
+                    destination: "!origin:example.invalid".to_string(),
+                    tool_name: "tool".to_string(),
+                },
+            );
+            assert_eq!(
+                crate::util::resolve_pending_approval(
+                    &pending,
+                    "APPROVE2",
+                    ChannelApprovalResponse::Approve,
+                    super::super::allowlist::user_allowed(
+                        &["@operator:example.invalid".to_string()],
+                        "@operator:example.invalid",
+                    ),
+                    "!origin:example.invalid",
+                )
+                .await,
+                crate::util::PendingApprovalResolution::Resolved,
+            );
+            assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        }
 
         #[test]
         fn token_length_and_alphabet() {
@@ -3209,10 +8065,120 @@ mod tests {
         fn rejects_trailing_garbage() {
             assert!(parse_reply("ABCDEFGH approve please").is_none());
         }
+
+        #[test]
+        fn approval_prompt_message_suppresses_voice() {
+            let prompt = crate::util::build_approve_deny_approval_prompt(
+                &generate_token_default(),
+                "shell",
+                "ls -la",
+                None,
+            );
+
+            let message = build_prompt_message(prompt.clone(), "!room:example.invalid");
+
+            assert_eq!(message.recipient, "!room:example.invalid");
+            assert_eq!(message.content, prompt);
+            assert!(
+                message.suppress_voice,
+                "the approval prompt must suppress voice synthesis"
+            );
+            assert!(!message.force_voice);
+        }
+
+        #[test]
+        fn localized_request_approval_prompt_still_parses_via_matrix_own_parser() {
+            // Localization must not desync the (possibly translated) prompt
+            // prose from Matrix's own approve/deny/always parser: the
+            // keywords the prompt shows must remain the literal ASCII words
+            // `parse_reply` expects, whatever locale is active.
+            let token = generate_token_default();
+            let prompt =
+                crate::util::build_approve_deny_approval_prompt(&token, "shell", "ls -la", None);
+            assert!(
+                prompt.contains(&token),
+                "prompt should echo the token verbatim; got {prompt:?}"
+            );
+
+            for (word, expected) in [
+                ("approve", ChannelApprovalResponse::Approve),
+                ("deny", ChannelApprovalResponse::Deny),
+                ("always", ChannelApprovalResponse::AlwaysApprove),
+            ] {
+                let reply = format!("{token} {word}");
+                assert!(
+                    prompt.contains(&reply),
+                    "prompt should show the exact reply {reply:?}; got {prompt:?}"
+                );
+                let (parsed_token, response) =
+                    parse_reply(&reply).unwrap_or_else(|| panic!("{reply:?} should parse"));
+                assert_eq!(parsed_token, token);
+                assert_eq!(response, expected);
+            }
+        }
+    }
+
+    mod room_management {
+        use super::super::room_management::{build_create_room_request, build_invite_user_request};
+        use matrix_sdk::ruma::api::client::room::Visibility as MatrixVisibility;
+        use serde_json::json;
+        use zeroclaw_api::channel::{RoomCreationOptions, RoomVisibility};
+
+        #[test]
+        fn create_room_request_maps_typed_options() {
+            let request = build_create_room_request(&RoomCreationOptions {
+                name: Some("Ops room".into()),
+                topic: Some("Operations".into()),
+                invites: vec!["@alice:example.org".into(), "@bob:example.org".into()],
+                visibility: Some(RoomVisibility::Public),
+                encryption: Some(true),
+            })
+            .expect("request builds");
+
+            assert_eq!(request.name.as_deref(), Some("Ops room"));
+            assert_eq!(request.topic.as_deref(), Some("Operations"));
+            assert_eq!(request.visibility, MatrixVisibility::Public);
+            assert_eq!(request.invite.len(), 2);
+            assert_eq!(request.invite[0].as_str(), "@alice:example.org");
+            assert_eq!(request.invite[1].as_str(), "@bob:example.org");
+            assert_eq!(request.initial_state.len(), 1);
+        }
+
+        #[test]
+        fn create_room_request_rejects_invalid_invite_user() {
+            let err = build_create_room_request(&RoomCreationOptions {
+                invites: vec!["not-a-mxid".into()],
+                ..RoomCreationOptions::default()
+            })
+            .unwrap_err();
+
+            assert!(err.to_string().contains("invalid invite user id"));
+        }
+
+        #[test]
+        fn invite_user_request_parses_room_and_user_ids() {
+            let request =
+                build_invite_user_request("!room:example.org", "@alice:example.org").unwrap();
+
+            assert_eq!(request.room_id.as_str(), "!room:example.org");
+            assert_eq!(
+                serde_json::to_value(&request.recipient).unwrap(),
+                json!({"user_id": "@alice:example.org"})
+            );
+        }
+
+        #[test]
+        fn invite_user_request_rejects_invalid_ids() {
+            let err = build_invite_user_request("not-a-room", "@alice:example.org").unwrap_err();
+            assert!(err.to_string().contains("invalid room id"));
+
+            let err = build_invite_user_request("!room:example.org", "not-a-user").unwrap_err();
+            assert!(err.to_string().contains("invalid user id"));
+        }
     }
 
     mod mention {
-        use super::super::mention::is_mentioned;
+        use super::super::mention::{admit_group_message, is_mentioned, sender_is_user};
         use matrix_sdk::ruma::user_id;
 
         #[test]
@@ -3264,6 +8230,25 @@ mod tests {
                 None,
                 "no mention here"
             ));
+        }
+
+        #[test]
+        fn admit_group_message_allows_reply_to_bot_without_mention() {
+            assert!(admit_group_message(false, true));
+            assert!(admit_group_message(true, false));
+            assert!(admit_group_message(true, true));
+            assert!(!admit_group_message(false, false));
+        }
+
+        #[test]
+        fn sender_is_user_matches_bot_parent_event() {
+            let bot = user_id!("@bot:example.org");
+            let parent =
+                r#"{"sender":"@bot:example.org","type":"m.room.message","content":{"body":"hi"}}"#;
+            let other = r#"{"sender":"@alice:example.org","type":"m.room.message","content":{"body":"hi"}}"#;
+            assert!(sender_is_user(parent, bot));
+            assert!(!sender_is_user(other, bot));
+            assert!(!sender_is_user("not-json", bot));
         }
     }
 
@@ -3326,6 +8311,266 @@ mod tests {
         }
     }
 
+    mod ack_reactions {
+        use std::sync::Arc;
+
+        use tempfile::TempDir;
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::MatrixConfig;
+
+        use super::super::MatrixChannel;
+
+        #[tokio::test]
+        async fn matrix_remove_reaction_noops_before_parsing_when_ack_disabled() {
+            let config = MatrixConfig {
+                homeserver: "https://matrix.example.com".to_string(),
+                access_token: Some("token".to_string()),
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            channel
+                .remove_reaction("bad-room", "bad-event", "✅")
+                .await
+                .expect("ack-disabled reaction removal should be a no-op");
+        }
+    }
+
+    mod user_boundary {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use matrix_sdk::config::SyncSettings;
+        use matrix_sdk::event_handler::RawEvent;
+        use matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent;
+        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{owned_room_id, owned_user_id};
+        use tempfile::TempDir;
+        use tokio::sync::mpsc;
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+        use zeroclaw_config::schema::{Config, MatrixConfig, MatrixStreamMode};
+
+        use super::super::{MatrixChannel, inbound};
+
+        async fn assert_matrix_single_message_crosses_inbound_and_outbound_user_boundary() {
+            let server = MockServer::start().await;
+            let room_id = owned_room_id!("!room:server");
+            let bot_user_id = owned_user_id!("@bot:server");
+            let sender = "@alice:server";
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "ZeroClaw Test"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id.as_str(): {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": []
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/typing/.*$"))
+                .and(body_partial_json(serde_json::json!({ "typing": false })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({ "body": "..." })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$draft:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$redaction:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({ "body": "ok" })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let matrix_config = MatrixConfig {
+                homeserver: server.uri(),
+                access_token: Some("secret-token".to_string()),
+                user_id: Some(bot_user_id.to_string()),
+                device_id: Some("DEVICE".to_string()),
+                allowed_rooms: vec![room_id.to_string()],
+                stream_mode: MatrixStreamMode::SingleMessage,
+                stream_draft_delete: true,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = Arc::new(
+                MatrixChannel::new(
+                    matrix_config.clone(),
+                    "single",
+                    Arc::new(move || vec![sender.to_string()]),
+                    state_dir.path().to_path_buf(),
+                )
+                .expect("matrix channel"),
+            );
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default())
+                .await
+                .expect("mock sync populates joined room");
+            let room = client.get_room(&room_id).expect("joined room");
+
+            let event_json = serde_json::json!({
+                "type": "m.room.message",
+                "sender": sender,
+                "event_id": "$inbound:server",
+                "origin_server_ts": 1,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "hello"
+                }
+            });
+            let event: OriginalSyncRoomMessageEvent =
+                serde_json::from_value(event_json.clone()).expect("Matrix room-message event");
+            let raw: Raw<serde_json::Value> = Raw::new(&event_json).expect("raw Matrix event");
+            let (tx, mut rx) = mpsc::channel(1);
+            let handler_ctx = inbound::HandlerCtx {
+                config: Arc::clone(&channel.config),
+                alias: channel.alias.clone(),
+                peer_resolver: Arc::clone(&channel.peer_resolver),
+                transcription: channel.transcription.clone(),
+                workspace_dir: channel.workspace_dir.clone(),
+                tx,
+                pending_approvals: Arc::clone(&channel.pending_approvals),
+                threads_seen: Arc::clone(&channel.threads_seen),
+                bot_user_id: bot_user_id.clone(),
+                bot_display_name: Arc::clone(&channel.bot_display_name),
+                initial_sync_done: Arc::clone(&channel.initial_sync_done),
+                undecryptable_seen: Arc::clone(&channel.undecryptable_seen),
+            };
+            inbound::handle_message_for_test(handler_ctx, event, room, RawEvent(raw.into_json()))
+                .await
+                .expect("Matrix inbound adapter accepts event");
+            let message = rx.recv().await.expect("adapter forwards channel message");
+
+            assert_eq!(message.content, "hello");
+            assert_eq!(message.sender, sender);
+            assert_eq!(message.reply_target, room_id.as_str());
+            assert_eq!(message.channel_alias.as_deref(), Some("single"));
+
+            let mut config = Config::default();
+            config
+                .channels
+                .matrix
+                .insert("single".to_string(), matrix_config);
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::orchestrator::tests::process_message_with_dummy_provider(
+                    channel as Arc<dyn Channel>,
+                    message,
+                    config,
+                ),
+            )
+            .await
+            .expect("Matrix inbound-to-outbound dispatch completes");
+        }
+
+        #[test]
+        fn matrix_single_message_crosses_inbound_and_outbound_user_boundary() {
+            crate::orchestrator::tests::run_channel_dispatch_test(|| {
+                Box::pin(assert_matrix_single_message_crosses_inbound_and_outbound_user_boundary())
+            });
+        }
+    }
+
     mod context {
         use super::super::context::{claim_first_visit, format_preamble, mark_seen};
         use matrix_sdk::ruma::{OwnedEventId, owned_event_id};
@@ -3366,12 +8611,41 @@ mod tests {
     }
 
     mod streaming {
+        use super::super::MatrixChannel;
+        use super::super::outbound;
+        use super::super::streaming;
         use super::super::streaming::{
-            PartialDraft, PartialFinalizeAction, decide_partial_finalize_action,
-            partial_should_edit, partial_visible_text,
+            MultiDraft, PartialDraft, PartialFinalizeAction, SingleDraft,
+            SingleRetainedDraftAction, State, decide_partial_finalize_action, insert_multi,
+            insert_partial, insert_single, mark_single_edit_delivered, multi_contains,
+            normalize_matrix_progress_line, partial_contains, partial_len, partial_should_edit,
+            partial_visible_text, push_single_progress, push_single_progress_line,
+            single_cancel_deletes_draft, single_contains, single_edit_interval_elapsed,
+            single_finalize_plan, single_render_changed, single_retained_draft_action,
+            single_visible_text_with_budget, single_visible_text_with_edit_budget,
         };
-        use matrix_sdk::ruma::owned_event_id;
+        use matrix_sdk::config::SyncSettings;
+        use matrix_sdk::ruma::{
+            OwnedEventId,
+            events::room::message::{
+                MessageType, ReplacementMetadata, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation, TextMessageEventContent,
+            },
+            owned_event_id, owned_room_id,
+        };
+        use std::collections::VecDeque;
+        use std::sync::Arc;
         use std::time::{Duration, Instant};
+        use tempfile::TempDir;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{body_partial_json, method, path_regex},
+        };
+        use zeroclaw_api::channel::{Channel, DraftProgress, DraftProgressKind, SendMessage};
+        use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
+        use zeroclaw_runtime::agent::loop_::{
+            DRAFT_PLACEHOLDER, REASONING_FULL_PREFIX, THINKING_STATUS_PREFIX, thinking_status_text,
+        };
 
         fn draft(text: &str, last_edit: Instant) -> PartialDraft {
             PartialDraft {
@@ -3379,6 +8653,65 @@ mod tests {
                 thread_anchor: None,
                 last_text: text.to_string(),
                 last_edit,
+            }
+        }
+
+        fn partial_draft(event_id: OwnedEventId, text: &str) -> PartialDraft {
+            PartialDraft {
+                event_id,
+                thread_anchor: None,
+                last_text: text.to_string(),
+                last_edit: Instant::now(),
+            }
+        }
+
+        #[test]
+        fn single_message_final_budget_keeps_utf8_safe_rendered_prefix() {
+            let text = format!("{}NEWEST", "**x** ".repeat(8_000));
+            let budget = 48_000;
+            let bounded = outbound::bounded_body(&text, Some(budget));
+            let serialized = serde_json::to_vec(&RoomMessageEventContent::text_markdown(&bounded))
+                .expect("plain Matrix message serializes");
+
+            assert!(bounded.starts_with("**x** "));
+            assert!(!bounded.ends_with("NEWEST"));
+            assert!(serialized.len() <= budget);
+            assert!(
+                serialized.len() > bounded.len(),
+                "formatted_body expansion must be included in the budget"
+            );
+
+            let event_id = owned_event_id!("$draft:server");
+            let bounded_edit = outbound::bounded_edit_body(&text, &event_id, Some(budget));
+            let edited = RoomMessageEventContentWithoutRelation::new(MessageType::Text(
+                TextMessageEventContent::markdown(&bounded_edit),
+            ))
+            .make_replacement(ReplacementMetadata::new(event_id, None));
+            assert!(bounded_edit.starts_with("**x** "));
+            assert!(!bounded_edit.ends_with("NEWEST"));
+            assert!(
+                serde_json::to_vec(&edited)
+                    .expect("replacement Matrix message serializes")
+                    .len()
+                    <= budget
+            );
+
+            for message_max_bytes in [0, 511] {
+                let config = MatrixConfig {
+                    message_max_bytes,
+                    ..Default::default()
+                };
+                assert_eq!(config.effective_message_max_bytes(), 512);
+            }
+        }
+
+        fn single_draft(event_id: OwnedEventId) -> SingleDraft {
+            SingleDraft {
+                event_id,
+                thread_anchor: None,
+                lines: VecDeque::new(),
+                last_text: DRAFT_PLACEHOLDER.to_string(),
+                last_edit: Instant::now(),
             }
         }
 
@@ -3432,6 +8765,1015 @@ mod tests {
         }
 
         #[test]
+        fn single_progress_slides_oldest_entries() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 2);
+            push_single_progress_line(&mut draft, "two", 2);
+            push_single_progress_line(&mut draft, "three", 2);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                "two\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_limit_counts_visible_lines_not_events() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
+                2,
+            );
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}two\nthree")
+            );
+
+            push_single_progress_line(&mut draft, "shell: printf 'a\\nb'\nnext\r\n", 2);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}three\nshell\\: printf \\'a\\\\nb\\'␊next")
+            );
+        }
+
+        #[test]
+        fn single_progress_window_keeps_the_newest_physical_reasoning_lines() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let reasoning = (1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}{reasoning}"),
+                5,
+            );
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}line 16\nline 17\nline 18\nline 19\nline 20")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_progress_updates_existing_line() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX}Thinking (round 2) through"),
+                10,
+            );
+            push_single_progress_line(
+                &mut draft,
+                &format!("{REASONING_FULL_PREFIX} carefully"),
+                10,
+            );
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX} now"), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{REASONING_FULL_PREFIX}Thinking \\(round 2\\) through carefully now")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_progress_keeps_complete_line_until_exact_event_fitting() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
+
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}abcd"), 10);
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}efgh"), 10);
+
+            let retained = draft.lines.front().expect("reasoning line retained");
+            assert_eq!(retained.text, format!("{REASONING_FULL_PREFIX}abcdefgh"));
+            assert!(retained.text.len() > max_bytes);
+        }
+
+        #[test]
+        fn single_reasoning_progress_does_not_merge_into_static_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(
+                &mut draft,
+                &format!("{THINKING_STATUS_PREFIX}Thinking...\n"),
+                10,
+            );
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}The"), 10);
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX} answer"), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking...\n{REASONING_FULL_PREFIX}The answer")
+            );
+        }
+
+        #[test]
+        fn single_reasoning_preserves_kind_when_text_matches_thinking_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let status = thinking_status_text(0);
+            let reasoning = format!("{REASONING_FULL_PREFIX}Thinking...\n");
+
+            // Preserve source identity even though the two raw strings match.
+            push_single_progress(&mut draft, DraftProgress::status(status.clone()), 10);
+            push_single_progress(&mut draft, DraftProgress::reasoning(reasoning.clone()), 10);
+
+            assert_eq!(
+                status, reasoning,
+                "the regression requires an exact collision"
+            );
+            assert_eq!(draft.lines.len(), 2);
+            assert_eq!(draft.lines[0].kind, DraftProgressKind::Status);
+            assert_eq!(draft.lines[1].kind, DraftProgressKind::Reasoning);
+        }
+
+        #[test]
+        fn single_reasoning_progress_starts_new_line_after_tool_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX}The"), 10);
+            push_single_progress_line(&mut draft, "\u{2705} shell: command=true (0s)\n", 10);
+            push_single_progress_line(&mut draft, &format!("{REASONING_FULL_PREFIX} answer"), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!(
+                    "{REASONING_FULL_PREFIX}The\n✅ shell\\: command\\=true \\(0s\\)\n{REASONING_FULL_PREFIX} answer"
+                )
+            );
+        }
+
+        #[test]
+        fn single_status_progress_remains_one_static_line() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            let status = thinking_status_text(0);
+            push_single_progress_line(&mut draft, &status, 10);
+            push_single_progress_line(&mut draft, &status, 10);
+            push_single_progress_line(&mut draft, &status, 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking...")
+            );
+        }
+
+        #[test]
+        fn single_status_progress_starts_new_line_after_tool_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &thinking_status_text(0), 10);
+            push_single_progress_line(&mut draft, "\u{2705} shell: command=true (0s)\n", 10);
+            push_single_progress_line(&mut draft, &thinking_status_text(1), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!(
+                    "{THINKING_STATUS_PREFIX}Thinking...\n✅ shell\\: command\\=true \\(0s\\)\n{THINKING_STATUS_PREFIX}Thinking (round 2)..."
+                )
+            );
+        }
+
+        #[test]
+        fn single_status_progress_does_not_downgrade_round_status() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &thinking_status_text(1), 10);
+            push_single_progress_line(&mut draft, &thinking_status_text(0), 10);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                format!("{THINKING_STATUS_PREFIX}Thinking (round 2)...")
+            );
+        }
+
+        #[test]
+        fn single_progress_zero_limit_keeps_all_entries() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 0);
+            push_single_progress_line(&mut draft, "two", 0);
+            push_single_progress_line(&mut draft, "three", 0);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, usize::MAX),
+                "one\ntwo\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_byte_budget_drops_oldest_entries_after_line_limit() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 0);
+            push_single_progress_line(&mut draft, "two", 0);
+            push_single_progress_line(&mut draft, "three", 0);
+
+            assert_eq!(
+                single_visible_text_with_budget(&draft, "two\nthree".len()),
+                "two\nthree"
+            );
+        }
+
+        #[test]
+        fn single_progress_edit_budget_replaces_oversized_utf8_line_with_alert() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &"😀".repeat(300), 0);
+
+            let visible = single_visible_text_with_edit_budget(&draft, 512);
+
+            assert!(visible.contains("too large to fit"));
+            assert!(
+                outbound::serialized_edit_content_len(&visible, &draft.event_id)
+                    .is_some_and(|actual| actual <= 512)
+            );
+        }
+
+        #[test]
+        fn single_progress_edit_budget_preserves_tool_identity_in_oversized_alert() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, &format!("✅ browser: {}", "😀".repeat(300)), 0);
+
+            let visible = single_visible_text_with_edit_budget(&draft, 512);
+
+            assert!(visible.starts_with("✅ browser: "));
+            assert!(visible.contains("too large to fit"));
+            assert!(
+                outbound::serialized_edit_content_len(&visible, &draft.event_id)
+                    .is_some_and(|actual| actual <= 512)
+            );
+        }
+
+        #[test]
+        fn single_progress_normalizes_vertical_whitespace_for_matrix_only() {
+            assert_eq!(
+                normalize_matrix_progress_line("shell: printf 'a\\nb'\nnext\r\n"),
+                "shell\\: printf \\'a\\\\nb\\'␊next"
+            );
+            assert_eq!(
+                normalize_matrix_progress_line("delegate: prompt=Check **service**\nthen _report_"),
+                "delegate\\: prompt\\=Check \\*\\*service\\*\\*␊then \\_report\\_"
+            );
+            assert_eq!(
+                normalize_matrix_progress_line(&format!(
+                    "{REASONING_FULL_PREFIX}Check **service**\nthen _report_"
+                )),
+                format!("{REASONING_FULL_PREFIX}Check \\*\\*service\\*\\*\nthen \\_report\\_")
+            );
+        }
+
+        #[test]
+        fn single_progress_uses_literal_matrix_markdown_transport_once() {
+            let raw = "    **bold** <div data-x=\"1\">&amp;</div> `code`\t\u{001b}[31m";
+            let encoded = normalize_matrix_progress_line(raw);
+
+            assert!(encoded.starts_with('\u{00a0}'));
+            assert!(
+                encoded.starts_with("\u{00a0}   "),
+                "indentation width is preserved"
+            );
+            assert!(encoded.contains("\\*\\*bold\\*\\*"));
+            assert!(encoded.contains("\\<div data\\-x\\=\\\"1\\\"\\>\\&amp\\;\\<\\/div\\>"));
+            assert!(encoded.contains('␉'));
+            assert!(encoded.contains('␛'));
+
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, raw, 0);
+            let first_render = single_visible_text_with_budget(&draft, usize::MAX);
+            let second_render = single_visible_text_with_budget(&draft, usize::MAX);
+            assert_eq!(first_render, encoded);
+            assert_eq!(
+                second_render, encoded,
+                "retained drafts must not double-escape"
+            );
+
+            let content = RoomMessageEventContent::text_markdown(&encoded);
+            let serialized = serde_json::to_value(content).expect("Matrix content serializes");
+            let formatted = serialized
+                .get("formatted_body")
+                .and_then(serde_json::Value::as_str)
+                .expect("Markdown content has formatted body");
+            assert!(formatted.contains("&lt;div"));
+            assert!(!formatted.contains("<div data-x"));
+            assert!(!formatted.contains("<strong>bold</strong>"));
+            assert!(!formatted.contains("<pre><code>"));
+        }
+
+        #[test]
+        fn single_edit_interval_can_skip_render_until_debounce_elapses() {
+            let now = Instant::now();
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_edit = now - Duration::from_millis(100);
+
+            assert!(!single_edit_interval_elapsed(
+                &draft,
+                now,
+                Duration::from_millis(500)
+            ));
+
+            draft.last_edit = now - Duration::from_millis(600);
+            assert!(single_edit_interval_elapsed(
+                &draft,
+                now,
+                Duration::from_millis(500)
+            ));
+        }
+
+        #[test]
+        fn single_render_changed_skips_duplicate_matrix_edits() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_text = "one\ntwo".to_string();
+
+            assert!(!single_render_changed(&draft, "one\ntwo"));
+            assert!(single_render_changed(&draft, "two\nthree"));
+        }
+
+        #[test]
+        fn failed_single_edit_leaves_retained_draft_flushable() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 10);
+
+            // Simulate a rendered edit body whose Matrix request fails: the
+            // line buffer advanced, but the delivery checkpoint must not.
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::Flush("one".to_string())
+            );
+
+            assert!(mark_single_edit_delivered(
+                &mut draft,
+                &owned_event_id!("$single:server"),
+                "one".to_string(),
+                Instant::now(),
+            ));
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::KeepCurrent
+            );
+        }
+
+        #[test]
+        fn single_edit_delivery_ignores_replaced_draft_event() {
+            let mut draft = single_draft(owned_event_id!("$current:server"));
+
+            assert!(!mark_single_edit_delivered(
+                &mut draft,
+                &owned_event_id!("$old:server"),
+                "old progress".to_string(),
+                Instant::now(),
+            ));
+            assert_eq!(draft.last_text, DRAFT_PLACEHOLDER);
+        }
+
+        #[test]
+        fn single_finalize_plan_deletes_draft_before_sending_final_when_enabled() {
+            assert_eq!(
+                single_finalize_plan(true, true, true),
+                streaming::SingleFinalizePlan::DeleteDraftThenSendFinal
+            );
+        }
+
+        #[test]
+        fn single_finalize_plan_keeps_draft_but_still_sends_final_when_disabled() {
+            assert_eq!(
+                single_finalize_plan(true, false, true),
+                streaming::SingleFinalizePlan::KeepDraftThenSendFinal
+            );
+            assert_eq!(
+                single_finalize_plan(false, true, true),
+                streaming::SingleFinalizePlan::SendFinalOnly
+            );
+            assert_eq!(
+                single_finalize_plan(false, true, false),
+                streaming::SingleFinalizePlan::Noop
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_flushes_latest_unflushed_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            draft.last_text = "one".to_string();
+            push_single_progress_line(&mut draft, "one", 10);
+            push_single_progress_line(&mut draft, "two", 10);
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::Flush("one\ntwo".to_string())
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_uses_the_serialized_edit_budget() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "old", 0);
+            push_single_progress_line(&mut draft, &"😀".repeat(300), 0);
+
+            let action = single_retained_draft_action(&draft, 512);
+            let SingleRetainedDraftAction::Flush(visible) = action else {
+                panic!("unflushed progress must produce a Matrix edit");
+            };
+
+            assert!(visible.contains("too large to fit"));
+            assert!(
+                outbound::serialized_edit_content_len(&visible, &draft.event_id)
+                    .is_some_and(|actual| actual <= 512)
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_keeps_current_visible_text() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "one", 10);
+            draft.last_text = "one".to_string();
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::KeepCurrent
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_deletes_placeholder_without_progress() {
+            let draft = single_draft(owned_event_id!("$single:server"));
+
+            assert_eq!(
+                single_retained_draft_action(&draft, usize::MAX),
+                SingleRetainedDraftAction::DeletePlaceholder
+            );
+        }
+
+        #[test]
+        fn single_retained_draft_action_deletes_placeholder_when_progress_cannot_fit() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            push_single_progress_line(&mut draft, "unpublished progress", 10);
+
+            assert_eq!(
+                single_retained_draft_action(&draft, 0),
+                SingleRetainedDraftAction::DeletePlaceholder
+            );
+        }
+
+        #[test]
+        fn single_cancel_deletes_placeholder_but_retains_durable_progress() {
+            let mut draft = single_draft(owned_event_id!("$single:server"));
+            assert!(single_cancel_deletes_draft(&draft, false));
+
+            push_single_progress_line(&mut draft, "one", 10);
+            assert!(single_cancel_deletes_draft(&draft, false));
+
+            draft.last_text = "one".to_string();
+            assert!(!single_cancel_deletes_draft(&draft, false));
+            assert!(single_cancel_deletes_draft(&draft, true));
+        }
+
+        #[tokio::test]
+        async fn single_message_update_draft_ignores_answer_text() {
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: "https://matrix.invalid".to_string(),
+                    access_token: Some("test-token".to_string()),
+                    stream_mode: MatrixStreamMode::SingleMessage,
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+            let key =
+                super::super::streaming_key("!room:server", "$draft:server").expect("draft key");
+
+            {
+                let mut state = channel.streaming_state.write().await;
+                insert_single(
+                    &mut state,
+                    key.clone(),
+                    single_draft(owned_event_id!("$draft:server")),
+                )
+                .expect("single-message state accepts draft");
+            }
+
+            Channel::update_draft(&channel, "!room:server", "$draft:server", "final prose")
+                .await
+                .expect("single_message answer deltas are ignored without Matrix I/O");
+
+            let mut state = channel.streaming_state.write().await;
+            let draft =
+                streaming::single_for_update(&mut state, &key).expect("draft remains active");
+            assert!(draft.lines.is_empty());
+            assert_eq!(draft.last_text, DRAFT_PLACEHOLDER);
+        }
+
+        async fn assert_retained_single_draft_flush_failure(
+            last_text: &str,
+            expect_placeholder_cleanup: bool,
+        ) {
+            let server = MockServer::start().await;
+            let room_id = "!room:server";
+            let draft_id = owned_event_id!("$draft:server");
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "ZeroClaw Test"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id: {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": [{
+                                        "type": "m.room.message",
+                                        "sender": "@bot:server",
+                                        "event_id": draft_id.as_str(),
+                                        "origin_server_ts": 1,
+                                        "content": {
+                                            "msgtype": "m.text",
+                                            "body": last_text
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/rooms/.*/event/.*$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "type": "m.room.message",
+                    "sender": "@bot:server",
+                    "event_id": draft_id.as_str(),
+                    "origin_server_ts": 1,
+                    "room_id": room_id,
+                    "content": {
+                        "msgtype": "m.text",
+                        "body": last_text
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            if expect_placeholder_cleanup {
+                Mock::given(method("PUT"))
+                    .and(path_regex(
+                        r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                    ))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "event_id": "$redaction:server"
+                    })))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "m.relates_to": {
+                        "rel_type": "m.replace",
+                        "event_id": draft_id.as_str()
+                    }
+                })))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "errcode": "M_BAD_JSON",
+                    "error": "edit failed"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": "final answer"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: server.uri(),
+                    access_token: Some("secret-token".to_string()),
+                    user_id: Some("@bot:server".to_string()),
+                    device_id: Some("DEVICE".to_string()),
+                    allowed_rooms: vec![room_id.to_string()],
+                    stream_mode: MatrixStreamMode::SingleMessage,
+                    stream_draft_delete: false,
+                    reply_in_thread: false,
+                    ack_reactions: Some(false),
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            if let Err(err) = client.sync_once(SyncSettings::default()).await {
+                let paths = server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|request| request.url.path().to_string())
+                    .collect::<Vec<_>>();
+                panic!("mock sync populates joined room: {err}; received paths: {paths:?}");
+            }
+
+            let key = super::super::streaming_key(room_id, draft_id.as_str()).expect("draft key");
+            {
+                let mut draft = single_draft(draft_id.clone());
+                draft.last_text = last_text.to_string();
+                push_single_progress_line(&mut draft, "new progress", 10);
+                let mut state = channel.streaming_state.write().await;
+                insert_single(&mut state, key, draft).expect("single-message state accepts draft");
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                channel.finalize_draft(room_id, draft_id.as_str(), "final answer", false),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!(
+                        "retained draft flush failure must not block final send: {err}; received paths: {paths:?}"
+                    );
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("retained draft finalize timed out; received paths: {paths:?}");
+                }
+            }
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("requests captured by Matrix mock");
+            let redaction_index = requests
+                .iter()
+                .position(|request| request.url.path().contains("/redact/"));
+            assert_eq!(
+                redaction_index.is_some(),
+                expect_placeholder_cleanup,
+                "placeholder cleanup must match the Matrix delivery checkpoint"
+            );
+            if let Some(redaction_index) = redaction_index {
+                let final_index = requests
+                    .iter()
+                    .position(|request| {
+                        request.url.path().contains("/send/m.room.message/")
+                            && String::from_utf8_lossy(&request.body).contains("final answer")
+                    })
+                    .expect("final answer request captured");
+                assert!(
+                    redaction_index < final_index,
+                    "placeholder cleanup must be attempted before the final answer"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn retained_single_draft_flush_failure_still_sends_final() {
+            assert_retained_single_draft_flush_failure("old progress", false).await;
+        }
+
+        #[tokio::test]
+        async fn retained_placeholder_draft_flush_failure_redacts_before_final() {
+            assert_retained_single_draft_flush_failure(DRAFT_PLACEHOLDER, true).await;
+        }
+
+        async fn assert_single_redact_failure_still_sends_budgeted_final(
+            stream_draft_delete: bool,
+        ) {
+            let server = MockServer::start().await;
+            let room_id = "!room:server";
+            let draft_id = owned_event_id!("$draft:server");
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/versions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["r0.6.0", "v1.1", "v1.2", "v1.3", "v1.4", "v1.5"],
+                    "unstable_features": {}
+                })))
+                .expect(1..)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/profile/.*/displayname$",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "displayname": "ZeroClaw Test"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/user/.*/account_data/m\.secret_storage\.default_key$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "not found"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/upload$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "one_time_key_counts": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/keys/query$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "device_keys": {}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/_matrix/client/(v3|r0)/sync$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "next_batch": "s1",
+                    "rooms": {
+                        "join": {
+                            room_id: {
+                                "state": { "events": [] },
+                                "timeline": {
+                                    "limited": false,
+                                    "prev_batch": "t0",
+                                    "events": [{
+                                        "type": "m.room.message",
+                                        "sender": "@bot:server",
+                                        "event_id": draft_id.as_str(),
+                                        "origin_server_ts": 1,
+                                        "content": {
+                                            "msgtype": "m.text",
+                                            "body": "old progress"
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/state/m\.room\.encryption/?$",
+                ))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errcode": "M_NOT_FOUND",
+                    "error": "room is not encrypted"
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/redact/.*/.*$",
+                ))
+                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "errcode": "M_FORBIDDEN",
+                    "error": "redact forbidden"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": "😀😀"
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$final:server"
+                })))
+                .expect(2)
+                .mount(&server)
+                .await;
+
+            let approval_prompt =
+                "Approval required: reply approve or deny with token approval-12345";
+            Mock::given(method("PUT"))
+                .and(path_regex(
+                    r"^/_matrix/client/(v3|r0)/rooms/.*/send/m\.room\.message/.*$",
+                ))
+                .and(body_partial_json(serde_json::json!({
+                    "body": approval_prompt
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "event_id": "$approval:server"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                MatrixConfig {
+                    homeserver: server.uri(),
+                    access_token: Some("secret-token".to_string()),
+                    user_id: Some("@bot:server".to_string()),
+                    device_id: Some("DEVICE".to_string()),
+                    allowed_rooms: vec![room_id.to_string()],
+                    stream_mode: MatrixStreamMode::SingleMessage,
+                    stream_draft_delete,
+                    message_max_bytes: 5,
+                    reply_in_thread: false,
+                    ack_reactions: Some(false),
+                    ..MatrixConfig::default()
+                },
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                client.sync_once(SyncSettings::default()),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("mock sync populates joined room: {err}; received paths: {paths:?}");
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("mock sync timed out; received paths: {paths:?}");
+                }
+            }
+
+            channel
+                .send(&SendMessage::new(approval_prompt, room_id))
+                .await
+                .expect("ordinary approval-style send remains unbounded");
+            channel
+                .send_final(&SendMessage::new("😀😀", room_id))
+                .await
+                .expect("no-draft final uses the single-message budget");
+
+            let key = super::super::streaming_key(room_id, draft_id.as_str()).expect("draft key");
+            {
+                let draft = single_draft(draft_id.clone());
+                let mut state = channel.streaming_state.write().await;
+                insert_single(&mut state, key, draft).expect("single-message state accepts draft");
+            }
+
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                channel.finalize_draft(room_id, draft_id.as_str(), "😀😀", false),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!(
+                        "redaction failure must not block final send: {err}; received paths: {paths:?}"
+                    );
+                }
+                Err(_) => {
+                    let paths = server
+                        .received_requests()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|request| request.url.path().to_string())
+                        .collect::<Vec<_>>();
+                    panic!("single-message finalize timed out; received paths: {paths:?}");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn single_delete_redact_failure_still_sends_utf8_budgeted_final() {
+            assert_single_redact_failure_still_sends_budgeted_final(true).await;
+        }
+
+        #[tokio::test]
+        async fn retained_placeholder_redact_failure_still_sends_utf8_budgeted_final() {
+            assert_single_redact_failure_still_sends_budgeted_final(false).await;
+        }
+
+        #[test]
         fn marker_only_partial_finalize_redacts_placeholder_after_upload() {
             assert_eq!(
                 decide_partial_finalize_action(true, true),
@@ -3462,6 +9804,591 @@ mod tests {
                 PartialFinalizeAction::EmptyError
             );
         }
+
+        #[test]
+        fn draft_keys_include_message_id_for_same_room_concurrency() {
+            let room = owned_room_id!("!room:server");
+            let first = streaming::draft_key(room.clone(), "$draft-a:server").unwrap();
+            let second = streaming::draft_key(room.clone(), "$draft-b:server").unwrap();
+
+            assert_ne!(first, second);
+
+            let mut state = streaming::State::for_stream_mode(MatrixStreamMode::Partial);
+            insert_partial(
+                &mut state,
+                first.clone(),
+                PartialDraft {
+                    event_id: owned_event_id!("$draft-a:server"),
+                    thread_anchor: None,
+                    last_text: "first".to_string(),
+                    last_edit: Instant::now(),
+                },
+            )
+            .expect("partial state accepts first draft");
+            insert_partial(
+                &mut state,
+                second.clone(),
+                PartialDraft {
+                    event_id: owned_event_id!("$draft-b:server"),
+                    thread_anchor: None,
+                    last_text: "second".to_string(),
+                    last_edit: Instant::now(),
+                },
+            )
+            .expect("partial state accepts second draft");
+
+            assert_eq!(partial_len(&state), 2);
+            assert_eq!(
+                streaming::take_partial(&mut state, &second).map(|draft| draft.event_id),
+                Some(owned_event_id!("$draft-b:server"))
+            );
+            assert!(partial_contains(&state, &first));
+        }
+
+        #[test]
+        fn partial_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first = super::super::streaming_key(recipient, "$draft-a:server").unwrap();
+            let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
+            let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
+
+            let mut state = State::for_stream_mode(MatrixStreamMode::Partial);
+            insert_partial(
+                &mut state,
+                first.clone(),
+                partial_draft(owned_event_id!("$draft-a:server"), "first"),
+            )
+            .expect("partial state accepts first draft");
+            insert_partial(
+                &mut state,
+                second.clone(),
+                partial_draft(owned_event_id!("$draft-b:server"), "second"),
+            )
+            .expect("partial state accepts second draft");
+
+            streaming::partial_for_update(&mut state, &second)
+                .expect("second draft remains addressable")
+                .last_text = "second updated".to_string();
+
+            assert_eq!(
+                streaming::partial_for_update(&mut state, &first)
+                    .expect("first draft remains isolated")
+                    .last_text,
+                "first"
+            );
+
+            let finalized = streaming::take_partial(&mut state, &second)
+                .expect("finalize removes only the addressed draft");
+            assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
+            assert!(partial_contains(&state, &first));
+            assert!(!partial_contains(&state, &second));
+
+            insert_partial(
+                &mut state,
+                canceled.clone(),
+                partial_draft(owned_event_id!("$draft-c:server"), "cancel me"),
+            )
+            .expect("partial state accepts canceled draft");
+            let canceled_draft = streaming::take_partial(&mut state, &canceled)
+                .expect("cancel removes only the addressed draft");
+            assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
+            assert!(partial_contains(&state, &first));
+            assert!(!partial_contains(&state, &canceled));
+        }
+
+        #[test]
+        fn single_message_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first = super::super::streaming_key(recipient, "$draft-a:server").unwrap();
+            let second = super::super::streaming_key(recipient, "$draft-b:server").unwrap();
+            let canceled = super::super::streaming_key(recipient, "$draft-c:server").unwrap();
+
+            let mut state = State::for_stream_mode(MatrixStreamMode::SingleMessage);
+            insert_single(
+                &mut state,
+                first.clone(),
+                single_draft(owned_event_id!("$draft-a:server")),
+            )
+            .expect("single state accepts first draft");
+            insert_single(
+                &mut state,
+                second.clone(),
+                single_draft(owned_event_id!("$draft-b:server")),
+            )
+            .expect("single state accepts second draft");
+
+            push_single_progress_line(
+                streaming::single_for_update(&mut state, &second)
+                    .expect("second draft remains addressable"),
+                "second updated",
+                10,
+            );
+
+            assert_eq!(
+                streaming::single_for_update(&mut state, &first)
+                    .expect("first draft remains isolated")
+                    .lines
+                    .len(),
+                0
+            );
+
+            let finalized = streaming::take_single(&mut state, &second)
+                .expect("finalize removes only the addressed draft");
+            assert_eq!(finalized.event_id, owned_event_id!("$draft-b:server"));
+            assert!(single_contains(&state, &first));
+            assert!(!single_contains(&state, &second));
+
+            insert_single(
+                &mut state,
+                canceled.clone(),
+                single_draft(owned_event_id!("$draft-c:server")),
+            )
+            .expect("single state accepts canceled draft");
+            let canceled_draft = streaming::take_single(&mut state, &canceled)
+                .expect("cancel removes only the addressed draft");
+            assert_eq!(canceled_draft.event_id, owned_event_id!("$draft-c:server"));
+            assert!(single_contains(&state, &first));
+            assert!(!single_contains(&state, &canceled));
+        }
+
+        #[test]
+        fn multi_message_lifecycle_lookup_isolates_update_finalize_and_cancel_by_message_id() {
+            let recipient = "!room:server";
+            let first =
+                super::super::streaming_key(recipient, "multi_message_synthetic:first").unwrap();
+            let second =
+                super::super::streaming_key(recipient, "multi_message_synthetic:second").unwrap();
+            let canceled =
+                super::super::streaming_key(recipient, "multi_message_synthetic:cancel").unwrap();
+
+            let mut state = State::for_stream_mode(MatrixStreamMode::MultiMessage);
+            insert_multi(
+                &mut state,
+                first.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    confirmed_prefix: "one\n\n".to_string(),
+                },
+            )
+            .expect("multi state accepts first draft");
+            insert_multi(
+                &mut state,
+                second.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    confirmed_prefix: String::new(),
+                },
+            )
+            .expect("multi state accepts second draft");
+
+            streaming::multi_for_update(&mut state, &second)
+                .expect("second multi-message draft remains addressable")
+                .confirmed_prefix = "second one\n\n".to_string();
+
+            assert_eq!(
+                streaming::multi_for_update(&mut state, &first)
+                    .expect("first multi-message draft remains isolated")
+                    .confirmed_prefix,
+                "one\n\n"
+            );
+
+            let finalized = streaming::take_multi(&mut state, &second)
+                .expect("finalize removes only the addressed multi-message draft");
+            assert_eq!(finalized.confirmed_prefix, "second one\n\n");
+            assert!(multi_contains(&state, &first));
+            assert!(!multi_contains(&state, &second));
+
+            insert_multi(
+                &mut state,
+                canceled.clone(),
+                MultiDraft {
+                    thread_anchor: None,
+                    confirmed_prefix: "c\n\n".to_string(),
+                },
+            )
+            .expect("multi state accepts canceled draft");
+            let canceled_draft = streaming::take_multi(&mut state, &canceled)
+                .expect("cancel removes only the addressed multi-message draft");
+            assert_eq!(canceled_draft.confirmed_prefix, "c\n\n");
+            assert!(multi_contains(&state, &first));
+            assert!(!multi_contains(&state, &canceled));
+        }
+
+        #[test]
+        fn multi_message_synthetic_draft_ids_are_unique() {
+            let first = streaming::new_multi_message_draft_id();
+            let second = streaming::new_multi_message_draft_id();
+
+            assert_ne!(first, second);
+            assert!(first.starts_with("multi_message_synthetic:"));
+            assert!(second.starts_with("multi_message_synthetic:"));
+        }
+    }
+
+    mod live_smoke {
+        use std::{
+            env,
+            sync::Arc,
+            time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+        };
+
+        use matrix_sdk::config::SyncSettings;
+        use tempfile::TempDir;
+        use zeroclaw_api::channel::{Channel, SendMessage};
+        use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
+
+        use super::super::{
+            MatrixChannel, inbound::SYNC_LONGPOLL_TIMEOUT, streaming, streaming_key,
+        };
+
+        fn env_first(primary: &str, fallback: &str) -> String {
+            env::var(primary)
+                .or_else(|_| env::var(fallback))
+                .unwrap_or_else(|_| panic!("set {primary} or {fallback} to run Matrix live smoke"))
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable test room"]
+        async fn same_room_partial_draft_lifecycle_uses_real_draft_ids() {
+            let homeserver = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_HOMESERVER",
+                "ZEROCLAW_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("ZEROCLAW_MATRIX_SMOKE_ROOM_ID", "ZEROCLAW_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
+                "ZEROCLAW_MATRIX_ACCESS_TOKEN",
+            );
+            let device_id = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_DEVICE_ID",
+                "ZEROCLAW_MATRIX_DEVICE_ID",
+            );
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_secs();
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                device_id: Some(device_id),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: MatrixStreamMode::Partial,
+                draft_update_interval_ms: 50,
+                multi_message_delay_ms: 0,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                approval_timeout_secs: 1,
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let first = channel
+                .send_draft(&SendMessage::new(
+                    format!("zeroclaw draft lifecycle smoke {stamp} first"),
+                    &room_id,
+                ))
+                .await
+                .expect("send first draft")
+                .expect("partial mode returns first draft event id");
+            let second = channel
+                .send_draft(&SendMessage::new(
+                    format!("zeroclaw draft lifecycle smoke {stamp} second"),
+                    &room_id,
+                ))
+                .await
+                .expect("send second draft")
+                .expect("partial mode returns second draft event id");
+            assert_ne!(first, second);
+
+            let first_key = streaming_key(&room_id, &first).expect("first draft key");
+            let second_key = streaming_key(&room_id, &second).expect("second draft key");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(streaming::partial_contains(&state, &first_key));
+                assert!(streaming::partial_contains(&state, &second_key));
+            }
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let first_update = format!("zeroclaw draft lifecycle smoke {stamp} first update");
+            channel
+                .update_draft(&room_id, &first, &first_update)
+                .await
+                .expect("update first draft by id");
+            {
+                let mut state = channel.streaming_state.write().await;
+                assert_eq!(
+                    streaming::partial_for_update(&mut state, &first_key)
+                        .map(|draft| draft.last_text.as_str()),
+                    Some(first_update.as_str())
+                );
+                assert!(streaming::partial_contains(&state, &second_key));
+            }
+
+            channel
+                .finalize_draft(
+                    &room_id,
+                    &second,
+                    &format!("zeroclaw draft lifecycle smoke {stamp} second final"),
+                    false,
+                )
+                .await
+                .expect("finalize second draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert!(streaming::partial_contains(&state, &first_key));
+                assert!(!streaming::partial_contains(&state, &second_key));
+            }
+
+            channel
+                .cancel_draft(&room_id, &first)
+                .await
+                .expect("cancel first draft by id");
+            {
+                let state = channel.streaming_state.read().await;
+                assert_eq!(streaming::partial_len(&state), 0);
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable test room"]
+        async fn same_room_single_message_draft_edits_one_real_event() {
+            let homeserver = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_HOMESERVER",
+                "ZEROCLAW_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("ZEROCLAW_MATRIX_SMOKE_ROOM_ID", "ZEROCLAW_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
+                "ZEROCLAW_MATRIX_ACCESS_TOKEN",
+            );
+            let device_id = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_DEVICE_ID",
+                "ZEROCLAW_MATRIX_DEVICE_ID",
+            );
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_secs();
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                device_id: Some(device_id),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: MatrixStreamMode::SingleMessage,
+                draft_update_interval_ms: 50,
+                stream_draft_lines: 5,
+                message_max_bytes: 512,
+                stream_draft_delete: true,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                approval_timeout_secs: 1,
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            let client = channel.ensure_client().await.expect("matrix client");
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let draft = channel
+                .send_draft(&SendMessage::new(
+                    format!("zeroclaw single-message smoke {stamp} draft"),
+                    &room_id,
+                ))
+                .await
+                .expect("send single-message draft")
+                .expect("single-message mode returns a real draft event id");
+            let key = streaming_key(&room_id, &draft).expect("draft key");
+
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            channel
+                .update_draft_progress(
+                    &room_id,
+                    &draft,
+                    &format!("💭 zeroclaw single-message smoke {stamp} **literal** <tag>"),
+                )
+                .await
+                .expect("edit the same single-message draft event");
+            {
+                let state = channel.streaming_state.read().await;
+                let active = streaming::single_contains(&state, &key);
+                assert!(active, "the edited draft remains one active event");
+            }
+
+            channel
+                .finalize_draft(
+                    &room_id,
+                    &draft,
+                    &format!("zeroclaw single-message smoke {stamp} final"),
+                    false,
+                )
+                .await
+                .expect("finalize after editing the single-message draft");
+            let state = channel.streaming_state.read().await;
+            assert!(
+                !streaming::single_contains(&state, &key),
+                "finalization removes the local single-message draft state"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Matrix smoke credentials and a disposable idle test room"]
+        async fn idle_sync_does_not_error_at_30s_cadence() {
+            let homeserver = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_HOMESERVER",
+                "ZEROCLAW_MATRIX_HOMESERVER",
+            );
+            let room_id = env_first("ZEROCLAW_MATRIX_SMOKE_ROOM_ID", "ZEROCLAW_MATRIX_ROOM_ID");
+            let access_token = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_ACCESS_TOKEN",
+                "ZEROCLAW_MATRIX_ACCESS_TOKEN",
+            );
+            let device_id = env_first(
+                "ZEROCLAW_MATRIX_SMOKE_DEVICE_ID",
+                "ZEROCLAW_MATRIX_DEVICE_ID",
+            );
+
+            let idle_secs: u64 = env::var("ZEROCLAW_MATRIX_SMOKE_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(35);
+            assert!(
+                idle_secs > 30,
+                "idle soak must exceed 30s to exercise the pre-fix failure window; got {idle_secs}s"
+            );
+            let min_longpoll_ms: u64 = env::var("ZEROCLAW_MATRIX_SMOKE_MIN_LONGPOLL_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000);
+
+            let config = MatrixConfig {
+                enabled: true,
+                homeserver,
+                access_token: Some(access_token),
+                device_id: Some(device_id),
+                allowed_rooms: vec![room_id.clone()],
+                stream_mode: MatrixStreamMode::Off,
+                reply_in_thread: false,
+                ack_reactions: Some(false),
+                ..MatrixConfig::default()
+            };
+            let state_dir = TempDir::new().expect("temp state dir");
+            let channel = MatrixChannel::new(
+                config,
+                "matrix",
+                Arc::new(Vec::<String>::new),
+                state_dir.path().to_path_buf(),
+            )
+            .expect("matrix channel");
+
+            // Building the client exercises `CLIENT_REQUEST_TIMEOUT` on the
+            // underlying `RequestConfig`. If that constant ever regresses below
+            // `SYNC_LONGPOLL_TIMEOUT`, the very first long-poll below will
+            // error out at the HTTP deadline.
+            let client = channel.ensure_client().await.expect("matrix client");
+
+            // Prime the sync token with a single bounded sync_once so the
+            // subsequent loop measures true idle long-poll behavior rather
+            // than the initial state-fetch round-trip.
+            client
+                .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                .await
+                .expect("initial Matrix sync");
+
+            let soak = Duration::from_secs(idle_secs);
+            let min_longpoll = Duration::from_millis(min_longpoll_ms);
+            let deadline = Instant::now() + soak;
+            let mut call_count: u32 = 0;
+            let mut short_longpoll_count: u32 = 0;
+            let mut max_call: Duration = Duration::from_millis(0);
+
+            while Instant::now() < deadline {
+                let started = Instant::now();
+                let result = client
+                    .sync_once(SyncSettings::default().timeout(SYNC_LONGPOLL_TIMEOUT))
+                    .await;
+                let elapsed = started.elapsed();
+
+                // Primary reviewer assertion: idle `/sync` must not error out.
+                // The pre-fix bug surfaced as a request-deadline error at ~30s
+                // when the HTTP timeout fired before the long-poll returned.
+                result.unwrap_or_else(|e| {
+                    panic!(
+                        "idle sync_once errored after {elapsed:?} (call #{call_count}); this is the 30s-cadence regression \
+                         the PR aims to fix: {e}"
+                    )
+                });
+
+                call_count += 1;
+                if elapsed > max_call {
+                    max_call = elapsed;
+                }
+                if elapsed < min_longpoll {
+                    short_longpoll_count += 1;
+                }
+            }
+
+            // Defense-in-depth against the other half of the pre-fix bug: a
+            // missing `?timeout=` made the homeserver reply instantly, so the
+            // SDK would busy-poll. With `SYNC_LONGPOLL_TIMEOUT` set, an idle
+            // room should produce only a handful of round-trips per 30s.
+            assert!(
+                call_count > 0,
+                "expected at least one sync_once call during the {idle_secs}s soak"
+            );
+            assert!(
+                max_call >= min_longpoll,
+                "every sync_once call returned in <{min_longpoll:?} (max observed: {max_call:?}); \
+                 homeserver appears to be replying without honoring `?timeout=` — likely the pre-fix \
+                 busy-poll regression. call_count={call_count}"
+            );
+            // Allow a couple of legitimate early returns (e.g. presence pings)
+            // but flag anything that smells like a tight busy-poll loop.
+            let busy_poll_budget = ((idle_secs / 5).max(2)) as u32;
+            assert!(
+                short_longpoll_count <= busy_poll_budget,
+                "{short_longpoll_count} of {call_count} sync_once calls returned in <{min_longpoll:?} \
+                 (budget for an idle room over {idle_secs}s is {busy_poll_budget}); this matches the \
+                 pre-fix busy-poll pattern"
+            );
+
+            // Mirror the validation-evidence shape requested on the PR: emit a
+            // concise note so a captured `cargo test -- --nocapture` run reads
+            // like the reviewer's "short Matrix smoke result" ask.
+            eprintln!(
+                "matrix idle-sync smoke: soak={idle_secs}s, sync_once_calls={call_count}, \
+                 max_call={max_call:?}, short_calls={short_longpoll_count}, no errors at 30s cadence"
+            );
+        }
     }
 
     mod session {
@@ -3490,11 +10417,6 @@ mod tests {
 
         #[test]
         fn corrupt_returns_none() {
-            // Contract change: a corrupt session.json (manually edited,
-            // truncated by a crash, partial write) must NOT propagate as
-            // an error that stalls startup. Returning None lets the build
-            // flow auto-recover via fresh login when credentials are
-            // available.
             let dir = TempDir::new().unwrap();
             let p = dir.path().join("session.json");
             std::fs::write(p, "{not valid json").unwrap();
@@ -3530,7 +10452,8 @@ mod tests {
         //! corruption-recovery decisions verifiable without touching the SDK.
 
         use super::super::client::{
-            can_password_relogin, resolve_access_token_identity, store_has_orphan_data,
+            can_password_relogin, resolve_access_token_identity, saved_session_is_foreign,
+            store_has_orphan_data,
         };
         use tempfile::TempDir;
         use wiremock::{
@@ -3545,30 +10468,41 @@ mod tests {
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
-                access_token: String::new(),
+                access_token: None,
                 user_id: user_id.map(String::from),
                 device_id: None,
-                allowed_users: vec![],
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
                 stream_mode: Default::default(),
+                stream_tool_arguments: vec![],
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
                 mention_only: false,
                 recovery_key: None,
                 password: password.map(String::from),
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
-                ack_reactions: true,
+                ack_reactions: Some(true),
+                excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             }
         }
 
         fn access_token_cfg(homeserver: String) -> MatrixConfig {
             MatrixConfig {
                 homeserver,
-                access_token: "secret-token".into(),
+                access_token: Some("secret-token".into()),
                 ..cfg(None, None)
             }
+        }
+
+        fn resolved_homeserver(url: &str) -> reqwest::Url {
+            reqwest::Url::parse(url).unwrap()
         }
 
         #[test]
@@ -3583,6 +10517,42 @@ mod tests {
         fn relogin_rejects_empty_strings() {
             assert!(!can_password_relogin(&cfg(Some(""), Some("@bot:m"))));
             assert!(!can_password_relogin(&cfg(Some("pw"), Some(""))));
+        }
+
+        fn blob_for(user_id: &str) -> super::super::session::SessionBlob {
+            super::super::session::SessionBlob {
+                user_id: user_id.to_string(),
+                device_id: "DEV1".to_string(),
+                access_token: "secret".to_string(),
+                refresh_token: None,
+            }
+        }
+
+        #[test]
+        fn foreign_session_detected_when_user_ids_differ() {
+            let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
+            let foreign = blob_for("@bender-bending-rodriguez-zeroclaw:matrix.org");
+            assert!(saved_session_is_foreign(&cfg, &foreign));
+        }
+
+        #[test]
+        fn matching_session_not_foreign() {
+            let cfg = cfg(Some("pw"), Some("@clamps-bot:matrix.org"));
+            let own = blob_for("@clamps-bot:matrix.org");
+            assert!(!saved_session_is_foreign(&cfg, &own));
+        }
+
+        #[test]
+        fn unset_or_bare_user_id_never_flags() {
+            // No configured user_id, or a bare localpart that cannot be
+            // compared against the canonical MXID, must not false-positive.
+            let any = blob_for("@whoever:matrix.org");
+            assert!(!saved_session_is_foreign(&cfg(Some("pw"), None), &any));
+            assert!(!saved_session_is_foreign(&cfg(Some("pw"), Some("")), &any));
+            assert!(!saved_session_is_foreign(
+                &cfg(Some("pw"), Some("clamps-bot")),
+                &any
+            ));
         }
 
         #[test]
@@ -3621,9 +10591,112 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let identity = resolve_access_token_identity(&access_token_cfg(server.uri()))
+            let identity = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+        }
+
+        #[tokio::test]
+        async fn access_token_whoami_uses_discovered_delegated_homeserver() {
+            let root = MockServer::start().await;
+            let delegated = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/.well-known/matrix/client"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "m.homeserver": { "base_url": delegated.uri() }
+                })))
+                .expect(1)
+                .mount(&root)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/_matrix/client/versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["v1.1"],
+                    "unstable_features": {}
+                })))
+                .mount(&delegated)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .expect(1)
+                .mount(&delegated)
+                .await;
+
+            let server_name =
+                matrix_sdk::ruma::ServerName::parse(root.address().to_string()).unwrap();
+            let client = matrix_sdk::Client::builder()
+                .insecure_server_name_no_tls(&server_name)
+                .build()
                 .await
                 .unwrap();
+            assert_eq!(
+                client.homeserver().as_str().trim_end_matches('/'),
+                delegated.uri()
+            );
+
+            let identity = resolve_access_token_identity(
+                &access_token_cfg(server_name.to_string()),
+                &client.homeserver(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+            assert!(
+                root.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.url.path() != WHOAMI_PATH)
+            );
+        }
+
+        #[tokio::test]
+        async fn access_token_whoami_preserves_direct_homeserver_url_and_base_path() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/matrix/_matrix/client/versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["v1.1"],
+                    "unstable_features": {}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/matrix{WHOAMI_PATH}")))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let homeserver = format!("{}/matrix", server.uri());
+            let client = matrix_sdk::Client::builder()
+                .server_name_or_homeserver_url(&homeserver)
+                .build()
+                .await
+                .unwrap();
+            let identity =
+                resolve_access_token_identity(&access_token_cfg(homeserver), &client.homeserver())
+                    .await
+                    .unwrap();
 
             assert_eq!(identity.user_id, "@bot:example.org");
             assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
@@ -3641,9 +10714,12 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let err = resolve_access_token_identity(&access_token_cfg(server.uri()))
-                .await
-                .unwrap_err();
+            let err = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap_err();
 
             assert!(
                 err.to_string()
@@ -3658,7 +10734,10 @@ mod tests {
             config.user_id = Some(" @bot:example.org ".into());
             config.device_id = Some(" DEVICE42 ".into());
 
-            let identity = resolve_access_token_identity(&config).await.unwrap();
+            let identity =
+                resolve_access_token_identity(&config, &resolved_homeserver("http://127.0.0.1:9"))
+                    .await
+                    .unwrap();
 
             assert_eq!(identity.user_id, "@bot:example.org");
             assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
@@ -3679,7 +10758,9 @@ mod tests {
             let mut config = access_token_cfg(server.uri());
             config.user_id = Some("@configured:example.org".into());
 
-            let err = resolve_access_token_identity(&config).await.unwrap_err();
+            let err = resolve_access_token_identity(&config, &resolved_homeserver(&server.uri()))
+                .await
+                .unwrap_err();
 
             assert!(
                 err.to_string()
@@ -3702,9 +10783,12 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let err = resolve_access_token_identity(&access_token_cfg(server.uri()))
-                .await
-                .unwrap_err();
+            let err = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap_err();
             let message = err.to_string();
 
             assert!(message.contains("M_FORBIDDEN: token rejected"), "{message}");
@@ -3727,7 +10811,9 @@ mod tests {
             let mut config = access_token_cfg(server.uri());
             config.device_id = Some("CONFIGURED_DEVICE".into());
 
-            let err = resolve_access_token_identity(&config).await.unwrap_err();
+            let err = resolve_access_token_identity(&config, &resolved_homeserver(&server.uri()))
+                .await
+                .unwrap_err();
 
             assert!(
                 err.to_string()
@@ -3772,7 +10858,10 @@ mod tests {
     }
 
     mod thread_extraction {
-        use super::super::inbound::{extract_mentions_user_ids, extract_thread_id};
+        use super::super::inbound::{
+            extract_mentions_user_ids, extract_thread_id, interruption_scope_from_anchor,
+            resolve_outbound_anchor,
+        };
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
 
@@ -3815,6 +10904,81 @@ mod tests {
                 }
             }));
             assert!(extract_thread_id(&r).is_none());
+        }
+
+        #[test]
+        fn root_inbound_starts_new_thread_when_reply_in_thread_enabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(
+                resolve_outbound_anchor(None, &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn root_inbound_stays_root_when_reply_in_thread_disabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(resolve_outbound_anchor(None, &event_id, false), None);
+        }
+
+        #[test]
+        fn threaded_inbound_keeps_existing_thread_root() {
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread id");
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, false).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        // ── interruption_scope_from_anchor ──────────────────────────
+
+        #[test]
+        fn self_anchored_root_strips_interruption_scope() {
+            // when reply_in_thread anchors on the inbound event
+            // itself the anchor is a delivery detail, not a conversation
+            // boundary — interruption_scope_id should be None so
+            // cancellation keys match sender+room.
+            let event_id = "$ev:server".parse().expect("event id");
+            let outbound = resolve_outbound_anchor(None, &event_id, true);
+            // thread_ts stays set to the event_id
+            assert_eq!(outbound.as_deref(), Some("$ev:server"));
+            // interruption_scope_id is stripped
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id),
+                None
+            );
+        }
+
+        #[test]
+        fn real_thread_reply_preserves_interruption_scope() {
+            // A reply inside an existing thread: outbound anchor is the
+            // thread root, not the inbound event itself.
+            // interruption_scope_id must stay set to the thread root.
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread root");
+            let outbound = resolve_outbound_anchor(Some(&thread_root), &event_id, true);
+            assert_eq!(outbound.as_deref(), Some("$root:server"));
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn no_anchor_yields_no_interruption_scope() {
+            // reply_in_thread disabled on a root event: no anchor at all.
+            let event_id = "$ev:server".parse().expect("event id");
+            let outbound = resolve_outbound_anchor(None, &event_id, false);
+            assert_eq!(outbound, None);
+            assert_eq!(
+                interruption_scope_from_anchor(outbound.as_deref(), &event_id),
+                None
+            );
         }
 
         #[test]
@@ -4014,6 +11178,37 @@ mod tests {
         }
 
         #[test]
+        fn parent_audio_real_filename_survives_even_with_unrecognized_extension() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Meeting recap.",
+                    "filename": "recording.bin",
+                    "url": "mxc://example.org/m",
+                    "info": { "mimetype": "audio/ogg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert_eq!(info.file_name, "recording.bin");
+        }
+
+        #[test]
+        fn parent_voice_filename_preferred_over_caption_body() {
+            let p = parent_raw(serde_json::json!({
+                "content": {
+                    "msgtype": "m.audio",
+                    "body": "Voice message",
+                    "filename": "voice.ogg",
+                    "url": "mxc://example.org/v",
+                    "org.matrix.msc3245.voice": {},
+                    "info": { "mimetype": "audio/ogg" }
+                }
+            }));
+            let info = parent_media_info(p).expect("media info");
+            assert_eq!(info.file_name, "voice.ogg");
+        }
+
+        #[test]
         fn parent_encrypted_file_decoded() {
             // The `file` key (instead of `url`) signals encrypted media —
             // parent_media_info must decode it as MediaSource::Encrypted.
@@ -4147,10 +11342,10 @@ mod tests {
         #[test]
         fn rejects_absolute_outside_workspace() {
             let workspace = TempDir::new().unwrap();
-            // `/etc/hostname` exists on every Linux host; we don't actually
-            // read it, just canonicalise.
-            let result = validate_marker_target("/etc/hostname", Some(workspace.path()));
-            assert!(result.is_err(), "expected Err for /etc target");
+            let outside = tempfile::NamedTempFile::new().unwrap();
+            let result =
+                validate_marker_target(outside.path().to_str().unwrap(), Some(workspace.path()));
+            assert!(result.is_err(), "expected Err for outside target");
             let msg = result.unwrap_err().to_string();
             assert!(
                 msg.contains("outside workspace_dir"),
@@ -4161,8 +11356,6 @@ mod tests {
         #[test]
         fn rejects_dotdot_traversal() {
             let workspace = TempDir::new().unwrap();
-            // Build a file outside the workspace, then try to reach it via
-            // `<workspace>/../<sibling-name>/file`.
             let parent = workspace.path().parent().unwrap();
             let outside_dir = parent.join("zeroclaw-test-outside");
             let _ = std::fs::create_dir(&outside_dir);
@@ -4258,18 +11451,217 @@ mod tests {
             let result = validate_marker_target("https://example.com/x.jpg", None);
             assert!(matches!(result, Ok(MarkerTarget::Http(_))));
         }
+
+        fn assert_ssr_refused(target: &str) {
+            let workspace = TempDir::new().unwrap();
+            let result = validate_marker_target(target, Some(workspace.path()));
+            let msg = result
+                .expect_err(&format!("expected SSRF refusal for {target}"))
+                .to_string();
+            assert!(
+                msg.contains("private or local host"),
+                "expected SSRF refusal message for {target}, got: {msg}"
+            );
+        }
+
+        #[test]
+        fn ssrf_refuses_loopback_v4() {
+            assert_ssr_refused("http://127.0.0.1/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_trailing_dot_local_hosts() {
+            for target in [
+                "http://localhost./admin",
+                "http://printer.local./admin",
+                "http://192.168.1.1../admin",
+            ] {
+                assert_ssr_refused(target);
+            }
+        }
+
+        #[test]
+        fn ssrf_refuses_loopback_v6() {
+            assert_ssr_refused("http://[::1]/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_rfc1918_v4() {
+            for h in ["10.0.0.5", "172.16.0.1", "192.168.1.1"] {
+                assert_ssr_refused(&format!("http://{h}/internal"));
+            }
+        }
+
+        #[test]
+        fn ssrf_refuses_link_local_v4() {
+            // AWS / GCP / Azure cloud-metadata endpoint.
+            assert_ssr_refused("http://169.254.169.254/latest/meta-data/");
+        }
+
+        #[test]
+        fn ssrf_refuses_cgnat_v4() {
+            // RFC 6598 shared address space (100.64.0.0/10).
+            assert_ssr_refused("http://100.64.0.1/api");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv4_mapped_loopback() {
+            // ::ffff:127.0.0.1 — IPv4-mapped loopback, often missed by
+            // naive IP-literal checks.
+            assert_ssr_refused("http://[::ffff:127.0.0.1]/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_localhost_name() {
+            assert_ssr_refused("http://localhost/admin");
+            assert_ssr_refused("http://foo.localhost/admin");
+        }
+
+        #[test]
+        fn ssrf_refuses_local_suffix_name() {
+            assert_ssr_refused("http://printer.local/");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv6_unique_local() {
+            // fc00::/7 — RFC 4193 unique local addresses.
+            assert_ssr_refused("http://[fd00::1]/");
+        }
+
+        #[test]
+        fn ssrf_refuses_ipv6_link_local() {
+            // fe80::/10 — link-local.
+            assert_ssr_refused("http://[fe80::1]/");
+        }
+
+        #[test]
+        fn ssrf_refuses_https_same_as_http() {
+            // The guard is scheme-agnostic; the same private host is
+            // refused over https:// too.
+            assert_ssr_refused("https://10.0.0.5/secret");
+            assert_ssr_refused("https://[::1]/secret");
+        }
+
+        #[test]
+        fn ssrf_refuses_with_userinfo_attempt() {
+            // An attacker who controls the host string might smuggle a
+            // private host through userinfo syntax; the SSRF guard fires
+            // on the host portion regardless.
+            assert_ssr_refused("http://attacker@127.0.0.1/");
+        }
+
+        #[test]
+        fn accepts_public_host() {
+            // Sanity: a normal public-looking host must still pass through.
+            for h in ["example.com", "cdn.example.com", "1.1.1.1", "8.8.8.8"] {
+                let workspace = TempDir::new().unwrap();
+                let result = validate_marker_target(
+                    &format!("https://{h}/photo.jpg"),
+                    Some(workspace.path()),
+                );
+                assert!(
+                    matches!(result, Ok(MarkerTarget::Http(_))),
+                    "public host {h} must be accepted, got: {result:?}"
+                );
+            }
+        }
+    }
+
+    mod outbound_redirect_ssrf {
+
+        use super::super::outbound::fetch_http;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn private_redirect_body(location: &str) -> ResponseTemplate {
+            ResponseTemplate::new(302).insert_header("Location", location)
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_cloud_metadata_ip() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body(
+                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to cloud-metadata IP must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_loopback() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body("http://127.0.0.1:9200/_cat/indices"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to loopback must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn rejects_redirect_to_trailing_dot_localhost() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/photo.jpg"))
+                .respond_with(private_redirect_body("http://localhost./secret"))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let url = reqwest::Url::parse(&format!("{}/photo.jpg", server.uri())).unwrap();
+            let err: anyhow::Error = fetch_http(url)
+                .await
+                .expect_err("redirect to trailing-dot localhost must be rejected");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("private or local host") || msg.contains("PermissionDenied"),
+                "expected SSRF redirect refusal, got: {msg}"
+            );
+            server.verify().await;
+        }
+
+        #[tokio::test]
+        async fn follows_public_redirect_target() {
+            assert!(
+                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("example.com"),
+                "public hostnames must not be classified as private by the per-hop guard"
+            );
+            assert!(
+                !zeroclaw_tools::helpers::domain_guard::is_private_or_local_host("cdn.example.com"),
+                "public subdomains must not be classified as private"
+            );
+        }
     }
 
     mod transcription_gate {
-        //! `should_transcribe` decides whether to run STT on a downloaded
-        //! media attachment. The previous gate also required
-        //! `is_voice_message(raw)` to be true on the *current* event, which
-        //! short-circuited reply-to-voice flows because the current event
-        //! is the user's text reply, not the parent voice note. The new
-        //! gate trusts `info.kind` (set by `parent_media_info` for parent
-        //! media or the inbound match for direct media).
 
         use super::super::inbound::{MediaCategory, should_transcribe};
+        use super::super::legacy_transcription_resolver;
         use zeroclaw_config::schema::TranscriptionConfig;
 
         fn enabled_cfg() -> TranscriptionConfig {
@@ -4286,55 +11678,42 @@ mod tests {
         }
 
         #[test]
-        fn voice_with_enabled_cfg_transcribes() {
-            assert!(should_transcribe(
-                &MediaCategory::Voice,
-                Some(&enabled_cfg())
-            ));
+        fn voice_transcribes() {
+            assert!(should_transcribe(&MediaCategory::Voice));
         }
 
         #[test]
-        fn voice_with_disabled_cfg_does_not_transcribe() {
-            assert!(!should_transcribe(
-                &MediaCategory::Voice,
-                Some(&disabled_cfg())
-            ));
-        }
-
-        #[test]
-        fn voice_without_cfg_does_not_transcribe() {
-            assert!(!should_transcribe(&MediaCategory::Voice, None));
-        }
-
-        #[test]
-        fn audio_with_enabled_cfg_does_not_transcribe() {
+        fn audio_does_not_transcribe() {
             // Plain m.audio (no MSC3245 voice flag) is left as a regular
             // audio file — only voice notes get transcribed.
-            assert!(!should_transcribe(
-                &MediaCategory::Audio,
-                Some(&enabled_cfg())
-            ));
+            assert!(!should_transcribe(&MediaCategory::Audio));
         }
 
         #[test]
-        fn image_with_enabled_cfg_does_not_transcribe() {
-            assert!(!should_transcribe(
-                &MediaCategory::Image,
-                Some(&enabled_cfg())
-            ));
+        fn image_does_not_transcribe() {
+            assert!(!should_transcribe(&MediaCategory::Image));
         }
 
         #[test]
-        fn voice_kind_alone_is_sufficient() {
-            // The bug fix: parent-voice replies set info.kind = Voice via
-            // parent_media_info, but the previous gate also looked at the
-            // *current* event's voice flag (which is the text reply event,
-            // never carrying the flag) and skipped transcription.
-            // info.kind alone is sufficient now.
-            assert!(should_transcribe(
-                &MediaCategory::Voice,
-                Some(&enabled_cfg())
-            ));
+        fn resolver_yields_nothing_when_disabled() {
+            // The enabled gate moved from `should_transcribe` onto the
+            // resolver, which reads it from live config on every message.
+            let resolver = legacy_transcription_resolver(disabled_cfg());
+            assert!(resolver().is_none());
+        }
+
+        #[test]
+        fn resolver_yields_a_manager_when_enabled() {
+            let resolver = legacy_transcription_resolver(TranscriptionConfig {
+                local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
+                    bearer_token: None,
+                    max_audio_bytes: 10 * 1024 * 1024,
+                    timeout_secs: 30,
+                }),
+                ..enabled_cfg()
+            });
+            assert!(resolver().is_some_and(|manager| manager.is_ok()));
         }
     }
 
@@ -4369,6 +11748,717 @@ mod tests {
         fn empty_text_without_attachment_is_error() {
             // True empty-message case: nothing to deliver, surface the error.
             assert_eq!(decide_send_outcome(true, false), SendOutcome::EmptyError);
+        }
+    }
+
+    mod outbound_attachment_info {
+        use super::super::outbound::{AttachmentKind, attachment_config_for};
+        use matrix_sdk::{attachment::AttachmentInfo, ruma::UInt};
+        use zeroclaw_api::media::MediaAttachment;
+
+        fn attachment(file_name: &str, mime_type: &str, len: usize) -> MediaAttachment {
+            MediaAttachment {
+                file_name: file_name.to_string(),
+                data: vec![0; len],
+                mime_type: Some(mime_type.to_string()),
+                marker: None,
+            }
+        }
+
+        fn info_size(info: AttachmentInfo) -> Option<UInt> {
+            match info {
+                AttachmentInfo::Image(info) => info.size,
+                AttachmentInfo::Video(info) => info.size,
+                AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => info.size,
+                AttachmentInfo::File(info) => info.size,
+            }
+        }
+
+        #[test]
+        fn structured_file_attachment_carries_matrix_size_info() {
+            let att = attachment("report.pdf", "application/pdf", 4096);
+
+            let mime = super::super::outbound::attachment_mime(&att);
+            let config = attachment_config_for(&att, AttachmentKind::Auto, &mime, None);
+
+            let info = config.info.expect("attachment info is populated");
+            assert!(matches!(info, AttachmentInfo::File(_)));
+            assert_eq!(info_size(info), UInt::try_from(4096usize).ok());
+        }
+
+        #[test]
+        fn media_markers_use_type_specific_matrix_info_with_size() {
+            let cases = [
+                (
+                    AttachmentKind::Image,
+                    attachment("photo.png", "image/png", 17),
+                    "image",
+                ),
+                (
+                    AttachmentKind::Audio,
+                    attachment("clip.ogg", "audio/ogg", 23),
+                    "audio",
+                ),
+                (
+                    AttachmentKind::Video,
+                    attachment("movie.mp4", "video/mp4", 31),
+                    "video",
+                ),
+            ];
+
+            for (kind, att, expected_kind) in cases {
+                let mime = super::super::outbound::attachment_mime(&att);
+                let config = attachment_config_for(&att, kind, &mime, None);
+                let info = config.info.expect("attachment info is populated");
+                match (&info, expected_kind) {
+                    (AttachmentInfo::Image(_), "image") => {}
+                    (AttachmentInfo::Audio(_), "audio") => {}
+                    (AttachmentInfo::Video(_), "video") => {}
+                    _ => panic!("unexpected attachment info kind {info:?}"),
+                }
+                assert_eq!(info_size(info), UInt::try_from(att.data.len()).ok());
+            }
+        }
+
+        #[test]
+        fn attachment_info_kind_matches_final_mime_type() {
+            let image_named_as_file = attachment("photo.png", "image/png", 47);
+            let mime = super::super::outbound::attachment_mime(&image_named_as_file);
+            let config =
+                attachment_config_for(&image_named_as_file, AttachmentKind::File, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::Image(_)),
+                "info must match the MIME-selected Matrix event type"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_named_as_file.data.len()).ok()
+            );
+
+            let image_marker_with_file_mime = attachment("report.pdf", "application/pdf", 53);
+            let mime = super::super::outbound::attachment_mime(&image_marker_with_file_mime);
+            let config = attachment_config_for(
+                &image_marker_with_file_mime,
+                AttachmentKind::Image,
+                &mime,
+                None,
+            );
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::File(_)),
+                "file MIME should use file info so SDK preserves size"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_marker_with_file_mime.data.len()).ok()
+            );
+        }
+    }
+
+    /// A voice note has to carry its own length or clients render it as a
+    /// `00:00` bubble with no seek bar. ZeroClaw reads that length out of the
+    /// Ogg container rather than decoding the audio, so these cover the parse
+    /// itself, the layouts it refuses to guess at, and the event the send path
+    /// actually puts on the wire.
+    mod outbound_voice_duration {
+        use std::time::Duration;
+
+        use matrix_sdk::attachment::AttachmentInfo;
+        use matrix_sdk::ruma::{event_id, mxc_uri, room_id};
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use zeroclaw_api::media::MediaAttachment;
+
+        use super::super::outbound::{
+            AttachmentKind, attachment_config_for, opus_duration, upload_attachment,
+        };
+
+        /// One second of tone encoded by `opusenc`, so the parser is measured
+        /// against a real encoder rather than against our own idea of the
+        /// format. `opusinfo` reports its playback length as `0m:01.000s`, and
+        /// its `OpusTags` carry only encoder strings.
+        const VOICE_NOTE: &[u8] = include_bytes!("testdata/voice_note.ogg");
+        /// The fixture's length, on the 48 kHz granule clock.
+        const VOICE_NOTE_SAMPLES: u64 = 48_000;
+
+        // ---- helpers over real encoded bytes ------------------------------
+
+        /// Ogg's page checksum: polynomial `0x04c1_1db7`, no reflection, zero
+        /// initial value, no final inversion.
+        fn ogg_crc(page: &[u8]) -> u32 {
+            let mut crc = 0u32;
+            for &byte in page {
+                crc ^= u32::from(byte) << 24;
+                for _ in 0..8 {
+                    crc = if crc & 0x8000_0000 == 0 {
+                        crc << 1
+                    } else {
+                        (crc << 1) ^ 0x04c1_1db7
+                    };
+                }
+            }
+            crc
+        }
+
+        /// Split a stream into its pages, as `(offset, end)` pairs.
+        fn page_bounds(bytes: &[u8]) -> Vec<(usize, usize)> {
+            let mut bounds = Vec::new();
+            let mut cursor = 0usize;
+            while cursor < bytes.len() {
+                let segments = usize::from(bytes[cursor + 26]);
+                let body_start = cursor + 27 + segments;
+                let body_len: usize = bytes[cursor + 27..body_start]
+                    .iter()
+                    .map(|&n| usize::from(n))
+                    .sum();
+                let end = body_start + body_len;
+                bounds.push((cursor, end));
+                cursor = end;
+            }
+            bounds
+        }
+
+        /// Rebuild every page with a new serial and/or a shifted granule,
+        /// restoring each checksum so the result is a file a decoder would
+        /// accept, not merely one this parser happens to walk.
+        fn rewrite_pages(bytes: &[u8], serial: Option<u32>, granule_offset: u64) -> Vec<u8> {
+            let mut out = Vec::with_capacity(bytes.len());
+            for (start, end) in page_bounds(bytes) {
+                let mut page = bytes[start..end].to_vec();
+                let granule =
+                    u64::from_le_bytes(page[6..14].try_into().expect("eight granule bytes"));
+                if granule != u64::MAX {
+                    page[6..14].copy_from_slice(&(granule + granule_offset).to_le_bytes());
+                }
+                if let Some(serial) = serial {
+                    page[14..18].copy_from_slice(&serial.to_le_bytes());
+                }
+                page[22..26].copy_from_slice(&0u32.to_le_bytes());
+                let crc = ogg_crc(&page);
+                page[22..26].copy_from_slice(&crc.to_le_bytes());
+                out.extend_from_slice(&page);
+            }
+            out
+        }
+
+        /// Whether every page in a stream carries the checksum of its contents.
+        fn checksums_hold(bytes: &[u8]) -> bool {
+            page_bounds(bytes).into_iter().all(|(start, end)| {
+                let mut page = bytes[start..end].to_vec();
+                let stored =
+                    u32::from_le_bytes(page[22..26].try_into().expect("four checksum bytes"));
+                page[22..26].copy_from_slice(&0u32.to_le_bytes());
+                ogg_crc(&page) == stored
+            })
+        }
+
+        /// Rebuild a stream with all of its audio on one page, keeping the
+        /// final granule and recomputing the checksum.
+        ///
+        /// This is the layout `opusenc` emits for any clip shorter than about a
+        /// second: a single audio page that also ends the stream, whose granule
+        /// trims the tail of the last packet and so sits *below* the samples
+        /// completing on it. `header_type` lets a test build the same page
+        /// without the end-of-stream flag, which is the invalid form.
+        fn repaged_onto_one_audio_page(bytes: &[u8], header_type: u8, granule: u64) -> Vec<u8> {
+            let bounds = page_bounds(bytes);
+            let (headers, audio) = bounds.split_at(2);
+            let mut out: Vec<u8> = headers
+                .iter()
+                .flat_map(|&(start, end)| bytes[start..end].to_vec())
+                .collect();
+
+            let mut table = Vec::new();
+            let mut body = Vec::new();
+            for &(start, end) in audio {
+                let page = &bytes[start..end];
+                assert_eq!(
+                    page[5] & 0x01,
+                    0,
+                    "a packet spanning pages cannot be merged naively"
+                );
+                let segments = usize::from(page[26]);
+                table.extend_from_slice(&page[27..27 + segments]);
+                body.extend_from_slice(&page[27 + segments..]);
+            }
+            assert!(table.len() <= 255, "one page holds at most 255 segments");
+
+            let first = &bytes[audio[0].0..audio[0].1];
+            let mut page = Vec::from(*b"OggS");
+            page.push(0);
+            page.push(header_type);
+            page.extend_from_slice(&granule.to_le_bytes());
+            page.extend_from_slice(&first[14..22]); // serial and sequence
+            page.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            page.push(u8::try_from(table.len()).expect("segment count below 256"));
+            page.extend_from_slice(&table);
+            page.extend_from_slice(&body);
+            let crc = ogg_crc(&page);
+            page[22..26].copy_from_slice(&crc.to_le_bytes());
+
+            out.extend_from_slice(&page);
+            out
+        }
+
+        // ---- helpers building streams byte by byte ------------------------
+        //
+        // These carry zero checksums. The parser does not read them, and these
+        // fixtures exist to pin down which byte makes a stream unreadable.
+
+        /// Header-type bit for a page opening mid-packet.
+        const CONTINUED: u8 = 0x01;
+        /// Header-type bit for a page beginning a logical stream.
+        const BOS: u8 = 0x02;
+        /// Header-type bit for a page ending a logical stream.
+        const EOS: u8 = 0x04;
+        const PRE_SKIP: u16 = 312;
+        const SERIAL: u32 = 0x5a43_0001;
+        /// Table of contents for 20 ms of SILK wideband, one frame per packet.
+        const AUDIO_TOC: u8 = 0x08;
+        /// Samples one `AUDIO_TOC` packet decodes to at 48 kHz.
+        const PACKET_SAMPLES: u64 = 960;
+
+        /// `OpusHead` identification packet. Only the magic and `pre_skip`
+        /// matter to the parser; the rest is spec-shaped filler.
+        fn opus_head(pre_skip: u16) -> Vec<u8> {
+            let mut head = Vec::from(*b"OpusHead");
+            head.push(1); // version
+            head.push(1); // channel count
+            head.extend_from_slice(&pre_skip.to_le_bytes());
+            head.extend_from_slice(&48_000u32.to_le_bytes()); // input sample rate
+            head.extend_from_slice(&0u16.to_le_bytes()); // output gain
+            head.push(0); // channel mapping family
+            head
+        }
+
+        /// `OpusTags` comment packet with an empty vendor string and no
+        /// comments.
+        fn opus_tags() -> Vec<u8> {
+            let mut tags = Vec::from(*b"OpusTags");
+            tags.extend_from_slice(&0u32.to_le_bytes()); // vendor string length
+            tags.extend_from_slice(&0u32.to_le_bytes()); // user comment count
+            tags
+        }
+
+        /// An audio packet worth `PACKET_SAMPLES`.
+        fn audio_packet() -> Vec<u8> {
+            vec![AUDIO_TOC, 0x00, 0x00, 0x00]
+        }
+
+        /// One Ogg page with a segment table that really describes `packets`.
+        fn page(granule: u64, header_type: u8, packets: &[Vec<u8>]) -> Vec<u8> {
+            let mut table = Vec::new();
+            let mut body = Vec::new();
+            for packet in packets {
+                let mut remaining = packet.len();
+                while remaining >= 255 {
+                    table.push(255u8);
+                    remaining -= 255;
+                }
+                table.push(u8::try_from(remaining).expect("lacing value below 255"));
+                body.extend_from_slice(packet);
+            }
+            raw_page(granule, header_type, SERIAL, &table, &body)
+        }
+
+        /// A page with an arbitrary segment table, so tests can claim a body
+        /// length the buffer does not actually hold.
+        fn raw_page(
+            granule: u64,
+            header_type: u8,
+            serial: u32,
+            table: &[u8],
+            body: &[u8],
+        ) -> Vec<u8> {
+            let mut out = Vec::from(*b"OggS");
+            out.push(0); // stream structure version
+            out.push(header_type);
+            out.extend_from_slice(&granule.to_le_bytes());
+            out.extend_from_slice(&serial.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // page sequence
+            out.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            out.push(u8::try_from(table.len()).expect("segment count below 256"));
+            out.extend_from_slice(table);
+            out.extend_from_slice(body);
+            out
+        }
+
+        /// The two header pages every Opus stream opens with.
+        fn header_pages() -> Vec<u8> {
+            let mut bytes = page(0, BOS, &[opus_head(PRE_SKIP)]);
+            bytes.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            bytes
+        }
+
+        /// A spec-shaped stream running `samples` of audio: `OpusHead` alone on
+        /// a beginning-of-stream page, then `OpusTags`, then audio. The final
+        /// page's granule trims the tail of its packet, which is how an encoder
+        /// expresses a length that does not land on a packet boundary.
+        fn stream(samples: u64) -> Vec<u8> {
+            let final_granule = samples + u64::from(PRE_SKIP);
+            let whole_packets = final_granule / PACKET_SAMPLES;
+            let packets: Vec<Vec<u8>> = (0..whole_packets).map(|_| audio_packet()).collect();
+
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(whole_packets * PACKET_SAMPLES, 0, &packets));
+            bytes.extend_from_slice(&page(final_granule, EOS, &[audio_packet()]));
+            bytes
+        }
+
+        // ---- the parse ----------------------------------------------------
+
+        #[test]
+        fn a_real_encoded_stream_measures_its_playback_length() {
+            assert!(
+                checksums_hold(VOICE_NOTE),
+                "the fixture must be a checksum-valid Ogg stream"
+            );
+            assert_eq!(opus_duration(VOICE_NOTE), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn elapsed_time_is_measured_from_the_clip_start_not_the_timeline_origin() {
+            // A clip cropped out of a longer recording keeps the granule
+            // positions of its source, so the final granule is a timestamp
+            // rather than a sample count. One minute of origin must not become
+            // one minute of playback.
+            let origin = 60 * 48_000;
+            let cropped = rewrite_pages(VOICE_NOTE, None, origin);
+
+            assert!(
+                checksums_hold(&cropped),
+                "the shifted stream must stay checksum-valid"
+            );
+            assert_eq!(opus_duration(&cropped), opus_duration(VOICE_NOTE));
+            assert_eq!(opus_duration(&cropped), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn a_lone_end_of_stream_audio_page_may_trim_below_its_packet_samples() {
+            // `opusenc` emits this for any clip under about a second: one audio
+            // page that also ends the stream, whose granule sits below the
+            // samples completing on it because the tail is trimmed. The origin
+            // is zero rather than something to derive by working backwards.
+            let trimmed = repaged_onto_one_audio_page(VOICE_NOTE, 0x04, 48_312);
+
+            assert!(checksums_hold(&trimmed), "the repaged stream stays valid");
+            assert_eq!(opus_duration(&trimmed), opus_duration(VOICE_NOTE));
+            assert_eq!(opus_duration(&trimmed), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn chained_streams_with_distinct_serials_report_no_duration() {
+            // Concatenated logical streams each restart their own granule
+            // timeline, so no single duration describes the result.
+            let mut chained = VOICE_NOTE.to_vec();
+            chained.extend_from_slice(&rewrite_pages(VOICE_NOTE, Some(0x0bad_f00d), 0));
+
+            assert!(checksums_hold(&chained));
+            assert_eq!(opus_duration(&chained), None);
+        }
+
+        /// Kept apart from the distinct-serial case on purpose: with both in
+        /// one test the serial check answers first and this guard is never
+        /// the assertion that fires.
+        #[test]
+        fn a_chain_reusing_the_serial_is_still_a_chain() {
+            let mut chained = VOICE_NOTE.to_vec();
+            chained.extend_from_slice(VOICE_NOTE);
+
+            // Every page carries the opening stream's serial, so only the
+            // second stream's beginning-of-stream page marks the boundary.
+            assert!(checksums_hold(&chained));
+            assert_eq!(opus_duration(&chained), None);
+        }
+
+        #[test]
+        fn duration_spans_the_granule_positions_less_the_priming_samples() {
+            assert_eq!(
+                opus_duration(&stream(144_000)),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                opus_duration(&stream(72_000)),
+                Some(Duration::from_millis(1_500))
+            );
+            assert_eq!(opus_duration(&stream(720)), Some(Duration::from_millis(15)));
+        }
+
+        #[test]
+        fn a_length_between_milliseconds_lands_exactly() {
+            // A lone audio page holds 960 samples, 312 of which are priming:
+            // 648 samples, or 13.5 ms.
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_micros(13_500)));
+        }
+
+        #[test]
+        fn last_page_granule_wins() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(96_312, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(240_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(5)));
+        }
+
+        #[test]
+        fn unknown_granule_pages_are_skipped_but_still_advance() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            // `u64::MAX` means "no granule for this page", not "zero length".
+            bytes.extend_from_slice(&page(u64::MAX, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn empty_body_page_does_not_stall_the_walk() {
+            let mut bytes = header_pages();
+            bytes.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            bytes.extend_from_slice(&page(u64::MAX, 0, &[]));
+            bytes.extend_from_slice(&raw_page(u64::MAX, 0, SERIAL, &[], b""));
+            bytes.extend_from_slice(&page(96_312, EOS, &[audio_packet()]));
+
+            assert_eq!(opus_duration(&bytes), Some(Duration::from_secs(2)));
+        }
+
+        #[test]
+        fn unreadable_streams_report_no_duration_instead_of_guessing() {
+            let valid = stream(144_000);
+
+            let mut short_header = Vec::from(*b"OggS");
+            short_header.extend_from_slice(&[0u8; 8]);
+
+            let mut table_overruns = header_pages();
+            table_overruns.extend_from_slice(&raw_page(48_312, 0, SERIAL, &[255], b"five!"));
+
+            let mut below_pre_skip = header_pages();
+            below_pre_skip.extend_from_slice(&page(PACKET_SAMPLES, 0, &[audio_packet()]));
+            below_pre_skip.extend_from_slice(&page(
+                u64::from(PRE_SKIP) - 1,
+                EOS,
+                &[audio_packet()],
+            ));
+
+            let mut head_too_short = page(0, BOS, &[opus_head(PRE_SKIP)[..9].to_vec()]);
+            head_too_short.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            head_too_short.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut opens_mid_packet = header_pages();
+            opens_mid_packet.extend_from_slice(&page(48_312, CONTINUED, &[audio_packet()]));
+
+            let mut first_audio_granule_unknown = header_pages();
+            first_audio_granule_unknown.extend_from_slice(&page(u64::MAX, 0, &[audio_packet()]));
+            first_audio_granule_unknown.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut zero_frame_count = header_pages();
+            // Table-of-contents code 3 reads its frame count from the next
+            // byte, and a packet of no frames has no length.
+            zero_frame_count.extend_from_slice(&page(48_312, EOS, &[vec![AUDIO_TOC | 0x03, 0x00]]));
+
+            let mut packet_too_long = header_pages();
+            // 60 ms frames, 48 of them: four times what a packet may hold.
+            packet_too_long.extend_from_slice(&page(48_312, EOS, &[vec![0x1b, 48]]));
+
+            let mut audio_shares_the_tags_page = page(0, BOS, &[opus_head(PRE_SKIP)]);
+            audio_shares_the_tags_page.extend_from_slice(&page(
+                48_312,
+                EOS,
+                &[opus_tags(), audio_packet()],
+            ));
+
+            // The same trimmed page without the end-of-stream flag: a granule
+            // below the page's samples is only legal on a page ending the
+            // stream.
+            let trims_without_ending_the_stream =
+                repaged_onto_one_audio_page(VOICE_NOTE, 0, 48_312);
+            // Ending the stream does not license a granule below `pre_skip`:
+            // that would skip more samples than the stream contains.
+            let trimmed_below_pre_skip =
+                repaged_onto_one_audio_page(VOICE_NOTE, 0x04, u64::from(PRE_SKIP) - 1);
+
+            let mut head_shares_its_page = page(0, BOS, &[opus_head(PRE_SKIP), opus_tags()]);
+            head_shares_its_page.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let mut not_beginning_of_stream = page(0, 0, &[opus_head(PRE_SKIP)]);
+            not_beginning_of_stream.extend_from_slice(&page(0, 0, &[opus_tags()]));
+            not_beginning_of_stream.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+
+            let cases: [(&str, Vec<u8>); 20] = [
+                ("empty", Vec::new()),
+                ("garbage", b"not an ogg file, just some plain text".to_vec()),
+                ("header shorter than a page header", short_header),
+                ("truncated mid body", valid[..valid.len() - 3].to_vec()),
+                ("trailing junk after the last page", {
+                    let mut b = valid.clone();
+                    b.extend_from_slice(b"tail");
+                    b
+                }),
+                ("first packet is not OpusHead", {
+                    let mut b = page(0, BOS, &[b"VorbisHead padding bytes".to_vec()]);
+                    b.extend_from_slice(&page(48_312, EOS, &[audio_packet()]));
+                    b
+                }),
+                ("OpusHead truncated before pre_skip", head_too_short),
+                ("OpusHead sharing its page", head_shares_its_page),
+                (
+                    "audio sharing the OpusTags page",
+                    audio_shares_the_tags_page,
+                ),
+                (
+                    "first page not marked beginning-of-stream",
+                    not_beginning_of_stream,
+                ),
+                ("segment table claims more than exists", table_overruns),
+                ("span shorter than pre_skip", below_pre_skip),
+                (
+                    "granule below the page's samples without ending the stream",
+                    trims_without_ending_the_stream,
+                ),
+                (
+                    "end-of-stream granule below pre_skip",
+                    trimmed_below_pre_skip,
+                ),
+                ("first audio page opens mid-packet", opens_mid_packet),
+                (
+                    "first audio page has no granule",
+                    first_audio_granule_unknown,
+                ),
+                ("packet claiming no frames", zero_frame_count),
+                ("packet claiming more than 120 ms", packet_too_long),
+                (
+                    "every granule unknown",
+                    page(u64::MAX, BOS, &[opus_head(PRE_SKIP)]),
+                ),
+                ("header pages but no audio", header_pages()),
+            ];
+
+            for (label, bytes) in cases {
+                assert_eq!(
+                    opus_duration(&bytes),
+                    None,
+                    "{label} must not yield a duration"
+                );
+            }
+        }
+
+        // ---- the event that ships -----------------------------------------
+
+        fn voice_attachment(data: Vec<u8>) -> MediaAttachment {
+            MediaAttachment {
+                file_name: "voice.ogg".to_string(),
+                data,
+                mime_type: Some("audio/ogg".to_string()),
+                marker: None,
+            }
+        }
+
+        fn info_duration(info: AttachmentInfo) -> Option<Duration> {
+            match info {
+                AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => info.duration,
+                _ => panic!("unexpected attachment info kind {info:?}"),
+            }
+        }
+
+        /// The voice arm of `attachment_info_for` is what the SDK send path
+        /// hands to `send_attachment`, so the measured length has to land here.
+        #[test]
+        fn voice_attachment_info_reports_the_measured_length() {
+            let att = voice_attachment(VOICE_NOTE.to_vec());
+            let mime = super::super::outbound::attachment_mime(&att);
+
+            let config = attachment_config_for(&att, AttachmentKind::Voice, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+
+            assert!(matches!(info, AttachmentInfo::Voice(_)));
+            assert_eq!(info_duration(info), Some(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn unmeasurable_voice_attachment_keeps_the_zero_fallback() {
+            let att = voice_attachment(b"OggS-fake-opus-payload".to_vec());
+            let mime = super::super::outbound::attachment_mime(&att);
+
+            let config = attachment_config_for(&att, AttachmentKind::Voice, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+
+            // Still `Some`: the SDK only emits `org.matrix.msc1767.audio` when
+            // duration and waveform are both present.
+            assert_eq!(info_duration(info), Some(Duration::ZERO));
+        }
+
+        /// Voice attachments go out through the SDK's shared attachment path,
+        /// with `AttachmentInfo::Voice` carrying the measured length, so the
+        /// proof belongs on the event that reaches the homeserver: both
+        /// duration fields must carry the clip's length, next to the
+        /// `org.matrix.msc3245.voice` flag that marks it a voice note.
+        #[tokio::test]
+        async fn the_sent_event_carries_the_measured_length() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.mock_room_state_encryption().plain().mount().await;
+            let room = matrix
+                .sync_joined_room(&client, room_id!("!room:localhost"))
+                .await;
+
+            matrix
+                .mock_authenticated_media_config()
+                .ok_default()
+                .mount()
+                .await;
+            matrix
+                .mock_upload()
+                .ok(mxc_uri!("mxc://localhost/voicenote"))
+                .mount()
+                .await;
+            matrix
+                .mock_room_send()
+                .ok(event_id!("$voicenote"))
+                .expect(1)
+                .mount()
+                .await;
+
+            let att = voice_attachment(VOICE_NOTE.to_vec());
+            upload_attachment(&room, &att, AttachmentKind::Voice, None)
+                .await
+                .expect("the voice note is sent");
+
+            let sent = matrix
+                .server()
+                .received_requests()
+                .await
+                .expect("the mock server records requests")
+                .into_iter()
+                .filter(|req| req.url.path().contains("/send/"))
+                .map(|req| req.body_json::<serde_json::Value>().expect("a JSON event"))
+                .next_back()
+                .expect("the voice event reached the homeserver");
+
+            assert_eq!(sent["msgtype"], serde_json::json!("m.audio"));
+            assert!(sent.get("org.matrix.msc3245.voice").is_some());
+            assert_eq!(sent["info"]["duration"], serde_json::json!(1_000));
+            assert_eq!(
+                sent["org.matrix.msc1767.audio"]["duration"],
+                serde_json::json!(1_000)
+            );
+        }
+
+        #[test]
+        fn the_fixture_is_the_length_the_tests_assert() {
+            // Guards the fixture against being replaced by a clip of another
+            // length without the expectations moving with it.
+            assert_eq!(
+                opus_duration(VOICE_NOTE),
+                Some(Duration::new(
+                    VOICE_NOTE_SAMPLES / 48_000,
+                    u32::try_from((VOICE_NOTE_SAMPLES % 48_000) * 1_000_000_000 / 48_000)
+                        .expect("a remainder below one second")
+                ))
+            );
         }
     }
 }

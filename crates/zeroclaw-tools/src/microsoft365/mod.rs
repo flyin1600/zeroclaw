@@ -1,8 +1,5 @@
 //! Microsoft 365 integration tool — Graph API access for Mail, Teams, Calendar,
 //! OneDrive, and SharePoint via a single action-dispatched tool surface.
-//!
-//! Auth is handled through direct HTTP calls to the Microsoft identity platform
-//! (client credentials or device code flow) with token caching.
 
 pub mod auth;
 pub mod graph_client;
@@ -11,7 +8,7 @@ pub mod types;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -70,7 +67,7 @@ impl Microsoft365Tool {
             "sharepoint_search" => self.handle_sharepoint_search(args).await,
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Unknown action: {action}")),
             }),
         }
@@ -81,7 +78,16 @@ impl Microsoft365Tool {
     async fn handle_mail_list(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Read, "microsoft365.mail_list")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
         let folder = args["folder"].as_str();
@@ -93,7 +99,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -104,15 +110,36 @@ impl Microsoft365Tool {
     ) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Read, "microsoft365.teams_message_list")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
-        let team_id = args["team_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("team_id is required"))?;
-        let channel_id = args["channel_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("channel_id is required"))?;
+        let team_id = args["team_id"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: team_id is required"
+            );
+            anyhow::Error::msg("team_id is required")
+        })?;
+        let channel_id = args["channel_id"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: channel_id is required"
+            );
+            anyhow::Error::msg("channel_id is required")
+        })?;
         let top = u32::try_from(args["top"].as_u64().unwrap_or(u64::from(DEFAULT_TOP)))
             .unwrap_or(DEFAULT_TOP);
 
@@ -122,7 +149,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -133,15 +160,36 @@ impl Microsoft365Tool {
     ) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Read, "microsoft365.calendar_events_list")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
-        let start = args["start"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("start datetime is required"))?;
-        let end = args["end"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("end datetime is required"))?;
+        let start = args["start"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: start datetime is required"
+            );
+            anyhow::Error::msg("start datetime is required")
+        })?;
+        let end = args["end"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: end datetime is required"
+            );
+            anyhow::Error::msg("end datetime is required")
+        })?;
         let top = u32::try_from(args["top"].as_u64().unwrap_or(u64::from(DEFAULT_TOP)))
             .unwrap_or(DEFAULT_TOP);
 
@@ -157,7 +205,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -165,7 +213,16 @@ impl Microsoft365Tool {
     async fn handle_onedrive_list(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Read, "microsoft365.onedrive_list")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
         let path = args["path"].as_str();
@@ -175,7 +232,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -186,12 +243,27 @@ impl Microsoft365Tool {
     ) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Read, "microsoft365.onedrive_download")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
-        let item_id = args["item_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("item_id is required"))?;
+        let item_id = args["item_id"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: item_id is required"
+            );
+            anyhow::Error::msg("item_id is required")
+        })?;
         let max_size = args["max_size"]
             .as_u64()
             .and_then(|v| usize::try_from(v).ok())
@@ -216,7 +288,8 @@ impl Microsoft365Tool {
             output: format!(
                 "Downloaded {} bytes (base64 encoded):\n{encoded}",
                 bytes.len()
-            ),
+            )
+            .into(),
             error: None,
         })
     }
@@ -227,12 +300,27 @@ impl Microsoft365Tool {
     ) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Read, "microsoft365.sharepoint_search")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
-        let query = args["query"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("query is required"))?;
+        let query = args["query"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: query is required"
+            );
+            anyhow::Error::msg("query is required")
+        })?;
         let top = u32::try_from(args["top"].as_u64().unwrap_or(u64::from(DEFAULT_TOP)))
             .unwrap_or(DEFAULT_TOP);
 
@@ -240,7 +328,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&result)?,
+            output: serde_json::to_string_pretty(&result)?.into(),
             error: None,
         })
     }
@@ -250,12 +338,29 @@ impl Microsoft365Tool {
     async fn handle_mail_send(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Act, "microsoft365.mail_send")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
         let to: Vec<String> = args["to"]
             .as_array()
-            .ok_or_else(|| anyhow::anyhow!("to must be an array of email addresses"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "mod: to must be an array of email addresses"
+                );
+                anyhow::Error::msg("to must be an array of email addresses")
+            })?
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
@@ -264,12 +369,24 @@ impl Microsoft365Tool {
             anyhow::bail!("to must contain at least one email address");
         }
 
-        let subject = args["subject"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("subject is required"))?;
-        let body = args["body"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("body is required"))?;
+        let subject = args["subject"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: subject is required"
+            );
+            anyhow::Error::msg("subject is required")
+        })?;
+        let body = args["body"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: body is required"
+            );
+            anyhow::Error::msg("body is required")
+        })?;
 
         graph_client::mail_send(
             &self.http_client,
@@ -283,7 +400,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("Email sent to: {}", to.join(", ")),
+            output: format!("Email sent to: {}", to.join(", ")).into(),
             error: None,
         })
     }
@@ -294,25 +411,52 @@ impl Microsoft365Tool {
     ) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Act, "microsoft365.teams_message_send")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
-        let team_id = args["team_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("team_id is required"))?;
-        let channel_id = args["channel_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("channel_id is required"))?;
-        let body = args["body"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("body is required"))?;
+        let team_id = args["team_id"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: team_id is required"
+            );
+            anyhow::Error::msg("team_id is required")
+        })?;
+        let channel_id = args["channel_id"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: channel_id is required"
+            );
+            anyhow::Error::msg("channel_id is required")
+        })?;
+        let body = args["body"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: body is required"
+            );
+            anyhow::Error::msg("body is required")
+        })?;
 
         graph_client::teams_message_send(&self.http_client, &token, team_id, channel_id, body)
             .await?;
 
         Ok(ToolResult {
             success: true,
-            output: "Teams message sent".to_string(),
+            output: "Teams message sent".to_string().into(),
             error: None,
         })
     }
@@ -323,18 +467,45 @@ impl Microsoft365Tool {
     ) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Act, "microsoft365.calendar_event_create")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
-        let subject = args["subject"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("subject is required"))?;
-        let start = args["start"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("start datetime is required"))?;
-        let end = args["end"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("end datetime is required"))?;
+        let subject = args["subject"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: subject is required"
+            );
+            anyhow::Error::msg("subject is required")
+        })?;
+        let start = args["start"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: start datetime is required"
+            );
+            anyhow::Error::msg("start datetime is required")
+        })?;
+        let end = args["end"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: end datetime is required"
+            );
+            anyhow::Error::msg("end datetime is required")
+        })?;
         let attendees: Vec<String> = args["attendees"]
             .as_array()
             .map(|arr| {
@@ -359,7 +530,7 @@ impl Microsoft365Tool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("Calendar event created (id: {event_id})"),
+            output: format!("Calendar event created (id: {event_id})").into(),
             error: None,
         })
     }
@@ -370,19 +541,34 @@ impl Microsoft365Tool {
     ) -> anyhow::Result<ToolResult> {
         self.security
             .enforce_tool_operation(ToolOperation::Act, "microsoft365.calendar_event_delete")
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "microsoft365: tool operation denied by policy"
+                );
+                anyhow::Error::msg(e.to_string())
+            })?;
 
         let token = self.get_token().await?;
-        let event_id = args["event_id"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("event_id is required"))?;
+        let event_id = args["event_id"].as_str().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "mod: event_id is required"
+            );
+            anyhow::Error::msg("event_id is required")
+        })?;
 
         graph_client::calendar_event_delete(&self.http_client, &token, self.user_id(), event_id)
             .await?;
 
         Ok(ToolResult {
             success: true,
-            output: format!("Calendar event {event_id} deleted"),
+            output: format!("Calendar event {event_id} deleted").into(),
             error: None,
         })
     }
@@ -492,7 +678,7 @@ impl Tool for Microsoft365Tool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("'action' parameter is required".to_string()),
                 });
             }
@@ -502,7 +688,7 @@ impl Tool for Microsoft365Tool {
             Ok(result) => Ok(result),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("microsoft365.{action} failed: {e}")),
             }),
         }

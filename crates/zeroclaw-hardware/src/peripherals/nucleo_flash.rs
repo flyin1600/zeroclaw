@@ -1,5 +1,4 @@
 //! Flash ZeroClaw Nucleo-F401RE firmware via probe-rs.
-//!
 //! Builds the Embassy firmware and flashes via ST-Link (built into Nucleo).
 //! Requires: cargo install probe-rs-tools --locked
 
@@ -58,7 +57,10 @@ pub fn flash_nucleo_firmware() -> Result<()> {
         .join("nucleo");
 
     if !elf_path.exists() {
-        anyhow::bail!("Built binary not found at {}", elf_path.display());
+        anyhow::bail!(
+            "Built binary not found at {}",
+            elf_path.display().to_string()
+        );
     }
 
     println!("Flashing to Nucleo-F401RE (connect via USB)...");

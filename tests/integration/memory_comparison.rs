@@ -1,5 +1,4 @@
 //! Head-to-head comparison: SQLite vs Markdown memory backends
-//!
 //! Run with: cargo test --test memory_comparison -- --nocapture
 
 use std::time::Instant;
@@ -11,11 +10,11 @@ use zeroclaw::memory::{Memory, MemoryCategory, markdown::MarkdownMemory, sqlite:
 // ── Helpers ────────────────────────────────────────────────────
 
 fn sqlite_backend(dir: &std::path::Path) -> SqliteMemory {
-    SqliteMemory::new(dir).expect("SQLite init failed")
+    SqliteMemory::new("test", dir).expect("SQLite init failed")
 }
 
 fn markdown_backend(dir: &std::path::Path) -> MarkdownMemory {
-    MarkdownMemory::new(dir)
+    MarkdownMemory::new("test", dir)
 }
 
 // ── Test 1: Store performance ──────────────────────────────────

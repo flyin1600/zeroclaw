@@ -1,36 +1,41 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry};
+use super::traits::{
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, StoreOptions,
+    is_recent_recall_query,
+};
 use super::vector;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, params};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use zeroclaw_api::memory_traits::PrincipalScope;
+use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::SearchMode;
 
 /// Maximum allowed open timeout (seconds) to avoid unreasonable waits.
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
+static SQLITE_MEMORY_STARTUP_LOCK: StdMutex<()> = StdMutex::new(());
 
-/// SQLite-backed persistent memory — the brain
-///
-/// Full-stack search engine:
-/// - **Vector DB**: embeddings stored as BLOB, cosine similarity search
-/// - **Keyword Search**: FTS5 virtual table with BM25 scoring
-/// - **Hybrid Merge**: weighted fusion of vector + keyword results
-/// - **Embedding Cache**: LRU-evicted cache to avoid redundant API calls
-/// - **Safe Reindex**: temp DB → seed → sync → atomic swap → rollback
+fn acquire_sqlite_startup_lock() -> MutexGuard<'static, ()> {
+    SQLITE_MEMORY_STARTUP_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Clone)]
 pub struct SqliteMemory {
+    alias: String,
     conn: Arc<Mutex<Connection>>,
-    #[allow(dead_code)] // stored for potential future use (e.g., reindex, diagnostics)
-    db_path: PathBuf,
-    embedder: Arc<dyn EmbeddingProvider>,
+    embedder: Arc<RwLock<Arc<dyn EmbeddingProvider>>>,
     vector_weight: f32,
     keyword_weight: f32,
     cache_max: usize,
@@ -38,8 +43,9 @@ pub struct SqliteMemory {
 }
 
 impl SqliteMemory {
-    pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
+    pub fn new(alias: &str, workspace_dir: &Path) -> anyhow::Result<Self> {
         Self::with_embedder(
+            alias,
             workspace_dir,
             Arc::new(super::embeddings::NoopEmbedding),
             0.7,
@@ -51,24 +57,13 @@ impl SqliteMemory {
     }
 
     /// Like `new`, but stores data in `{db_name}.db` instead of `brain.db`.
-    pub fn new_named(workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
+    pub fn new_named(alias: &str, workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join(format!("{db_name}.db"));
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let conn = Self::open_connection(&db_path, None)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous  = NORMAL;
-             PRAGMA mmap_size    = 8388608;
-             PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;",
-        )?;
-        Self::init_schema(&conn)?;
+        let conn = Self::open_and_initialize(&db_path, None)?;
         Ok(Self {
+            alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
-            db_path,
-            embedder: Arc::new(super::embeddings::NoopEmbedding),
+            embedder: Arc::new(RwLock::new(Arc::new(super::embeddings::NoopEmbedding))),
             vector_weight: 0.7,
             keyword_weight: 0.3,
             cache_max: 10_000,
@@ -76,12 +71,8 @@ impl SqliteMemory {
         })
     }
 
-    /// Build SQLite memory with optional open timeout.
-    ///
-    /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds
-    /// (capped at 300). Useful when the DB file may be locked or on slow storage.
-    /// `None` = wait indefinitely (default).
     pub fn with_embedder(
+        alias: &str,
         workspace_dir: &Path,
         embedder: Arc<dyn EmbeddingProvider>,
         vector_weight: f32,
@@ -91,38 +82,47 @@ impl SqliteMemory {
         search_mode: SearchMode,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
-
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let conn = Self::open_connection(&db_path, open_timeout_secs)?;
-
-        // ── Production-grade PRAGMA tuning ──────────────────────
-        // WAL mode: concurrent reads during writes, crash-safe
-        // normal sync: 2× write speed, still durable on WAL
-        // mmap 8 MB: let the OS page-cache serve hot reads
-        // cache 2 MB: keep ~500 hot pages in-process
-        // temp_store memory: temp tables never hit disk
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous  = NORMAL;
-             PRAGMA mmap_size    = 8388608;
-             PRAGMA cache_size   = -2000;
-             PRAGMA temp_store   = MEMORY;",
-        )?;
-
-        Self::init_schema(&conn)?;
+        let conn = Self::open_and_initialize(&db_path, open_timeout_secs)?;
 
         Ok(Self {
+            alias: alias.to_string(),
             conn: Arc::new(Mutex::new(conn)),
-            db_path,
-            embedder,
+            embedder: Arc::new(RwLock::new(embedder)),
             vector_weight,
             keyword_weight,
             cache_max,
             search_mode,
         })
+    }
+
+    /// Open and initialize a memory database using the canonical startup
+    /// sequence shared by all writable SQLite entry points.
+    pub(crate) fn open_and_initialize(
+        db_path: &Path,
+        open_timeout_secs: Option<u64>,
+    ) -> anyhow::Result<Connection> {
+        let _startup_guard = acquire_sqlite_startup_lock();
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let conn = Self::open_connection(db_path, open_timeout_secs)?;
+        conn.execute_batch(
+            // foreign_keys is OFF by default in SQLite and is a
+            // per-connection PRAGMA, so the multi-agent migration's
+            // `REFERENCES agents(id)` constraint would be unenforced
+            // without this. Set it before any writes flow through.
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous  = NORMAL;
+             PRAGMA mmap_size    = 8388608;
+             PRAGMA cache_size   = -2000;
+             PRAGMA temp_store   = MEMORY;",
+        )?;
+        Self::init_schema(&conn)?;
+        zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(db_path, &conn)?;
+        Self::init_schema(&conn)?;
+        Ok(conn)
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -158,8 +158,80 @@ impl SqliteMemory {
 
     /// Initialize all tables: memories, FTS5, `embedding_cache`
     fn init_schema(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(
-            "-- Core memories table
+        fn is_db_locked_error(e: &rusqlite::Error) -> bool {
+            use rusqlite::ffi::ErrorCode;
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(err, _)
+                    if matches!(err.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            )
+        }
+
+        fn execute_batch_retry(conn: &Connection, sql: &str) -> Result<(), rusqlite::Error> {
+            // SQLite can return "database is locked" during concurrent schema
+            // initialization even though the operations are safe/idempotent.
+            // Retry briefly instead of failing startup.
+            let mut backoff = Duration::from_millis(10);
+            let max_backoff = Duration::from_millis(250);
+            let max_attempts: usize = 24; // Worst-case sleep is ~4.8s.
+
+            for attempt in 1..=max_attempts {
+                match conn.execute_batch(sql) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if is_db_locked_error(&e) && attempt < max_attempts => {
+                        std::thread::sleep(backoff);
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // Unreachable due to early-return above, but keep control-flow explicit.
+            Ok(())
+        }
+
+        fn memories_has_column(conn: &Connection, name: &str) -> anyhow::Result<bool> {
+            let mut stmt = conn.prepare("PRAGMA table_info(memories)")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let col_name: String = row.get(1)?;
+                if col_name == name {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+
+        fn is_duplicate_column_error(e: &rusqlite::Error) -> bool {
+            matches!(
+                e,
+                rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("duplicate column name")
+            )
+        }
+
+        fn add_memories_column_if_missing(
+            conn: &Connection,
+            name: &str,
+            alter_sql: &str,
+        ) -> anyhow::Result<()> {
+            if memories_has_column(conn, name)? {
+                return Ok(());
+            }
+
+            match execute_batch_retry(conn, alter_sql) {
+                Ok(()) => Ok(()),
+                Err(e) if is_duplicate_column_error(&e) => Ok(()),
+                Err(e) => Err(e)
+                    .with_context(|| format!("SQLite migration failed adding memories.{name}")),
+            }
+        }
+
+        execute_batch_retry(
+            conn,
+            "-- Core memories table. This is an intermediate shape; the V3
+            -- migration in `zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3`
+            -- rebuilds it with the `agent_id` column and a composite
+            -- `UNIQUE (agent_id, key)` constraint immediately after init.
             CREATE TABLE IF NOT EXISTS memories (
                 id          TEXT PRIMARY KEY,
                 key         TEXT NOT NULL UNIQUE,
@@ -200,40 +272,225 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- Store-level metadata (e.g. the embedding identity that produced
+            -- the stored vectors). Sits beside schema_version, which is keyed
+            -- by component with an INTEGER version and can't carry strings.
+            CREATE TABLE IF NOT EXISTS memory_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE base schema")?;
+
+        add_memories_column_if_missing(
+            conn,
+            "session_id",
+            "ALTER TABLE memories ADD COLUMN session_id TEXT;",
+        )?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_session")?;
+
+        add_memories_column_if_missing(
+            conn,
+            "namespace",
+            "ALTER TABLE memories ADD COLUMN namespace TEXT DEFAULT 'default';",
+        )?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace")?;
+
+        add_memories_column_if_missing(
+            conn,
+            "importance",
+            "ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5;",
         )?;
 
-        // Migration: add session_id column if not present (safe to run repeatedly)
-        let schema_sql: String = conn
-            .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'")?
-            .query_row([], |row| row.get::<_, String>(0))?;
+        add_memories_column_if_missing(
+            conn,
+            "superseded_by",
+            "ALTER TABLE memories ADD COLUMN superseded_by TEXT;",
+        )?;
+        add_memories_column_if_missing(conn, "kind", "ALTER TABLE memories ADD COLUMN kind TEXT;")?;
+        add_memories_column_if_missing(
+            conn,
+            "pinned",
+            "ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "tenant_id",
+            "ALTER TABLE memories ADD COLUMN tenant_id TEXT;",
+        )?;
 
-        if !schema_sql.contains("session_id") {
-            conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN session_id TEXT;
-                 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);",
-            )?;
+        // Private principal memory (RFC 7141): NULL marks the shared/legacy
+        // plane; an owned row is reachable only through the
+        // *_for_principal operations.
+        add_memories_column_if_missing(
+            conn,
+            "principal_id",
+            "ALTER TABLE memories ADD COLUMN principal_id TEXT;",
+        )?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_principal ON memories(principal_id);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_principal")?;
+        execute_batch_retry(
+            conn,
+            "CREATE INDEX IF NOT EXISTS idx_memories_namespace_category ON memories(namespace, category);",
+        )
+        .with_context(|| "SQLite init_schema failed: CREATE INDEX idx_memories_namespace_category")?;
+
+        Self::migrate_session_ids_to_sanitized(conn)?;
+
+        Ok(())
+    }
+
+    fn migrate_session_ids_to_sanitized(conn: &Connection) -> anyhow::Result<()> {
+        let distinct: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT session_id FROM memories WHERE session_id IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut update =
+            conn.prepare("UPDATE memories SET session_id = ?1 WHERE session_id = ?2")?;
+        let mut rewritten = 0usize;
+        for old in &distinct {
+            let new = sanitize_session_key(old);
+            if new != *old {
+                update.execute(params![new, old])?;
+                rewritten += 1;
+            }
         }
 
-        // Migration: add namespace column
-        if !schema_sql.contains("namespace") {
-            conn.execute_batch(
-                "ALTER TABLE memories ADD COLUMN namespace TEXT DEFAULT 'default';
-                 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);",
-            )?;
-        }
-
-        // Migration: add importance column
-        if !schema_sql.contains("importance") {
-            conn.execute_batch("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5;")?;
-        }
-
-        // Migration: add superseded_by column
-        if !schema_sql.contains("superseded_by") {
-            conn.execute_batch("ALTER TABLE memories ADD COLUMN superseded_by TEXT;")?;
+        if rewritten > 0 {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"rewritten": rewritten})),
+                "Normalized session_id values in memories table to sanitized form"
+            );
         }
 
         Ok(())
+    }
+
+    async fn store_row_with_metadata(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(emb) => emb.map(|emb| vector::vec_to_bytes(&emb)),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "key": key,
+                            "error": format!("{e}"),
+                        })),
+                    "memory store: embedding failed; persisting row without a vector \
+                     (run `zeroclaw memory reindex` to backfill once the embedder recovers)"
+                );
+                None
+            }
+        };
+
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let content = content.to_string();
+        let sid = session_id.map(String::from);
+        let ns = options.namespace.unwrap_or_else(|| "default".to_string());
+        let imp = options.importance.unwrap_or(0.5);
+        let kind = options
+            .kind
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let pinned = i64::from(options.pinned);
+        let tenant_id = options.tenant_id;
+        let aid = agent_id.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let now = Local::now().to_rfc3339();
+            let cat = Self::category_to_str(&category);
+            let id = Uuid::new_v4().to_string();
+
+            // Shared-plane writes never touch a private row: the reserved
+            // physical-key prefix is refused outright, and the upsert only
+            // updates a row that has no owner, so a zero-row outcome means the
+            // key is held by the private plane and is refused rather than
+            // reported as stored.
+            if key.starts_with(Self::PRIVATE_KEY_PREFIX) {
+                anyhow::bail!(
+                    "memory keys beginning with {:?} are reserved for private principal memory",
+                    Self::PRIVATE_KEY_PREFIX
+                );
+            }
+            let changed = conn.execute(
+                "INSERT INTO memories (
+                    id, key, content, category, embedding, created_at, updated_at,
+                    session_id, namespace, importance, agent_id, kind, pinned, tenant_id
+                 )
+                 VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    COALESCE(?11, (SELECT id FROM agents WHERE alias = 'default' LIMIT 1)),
+                    ?12, ?13, ?14
+                 )
+                 ON CONFLICT(agent_id, key) DO UPDATE SET
+                    content = excluded.content,
+                    category = excluded.category,
+                    embedding = excluded.embedding,
+                    updated_at = excluded.updated_at,
+                    session_id = excluded.session_id,
+                    namespace = excluded.namespace,
+                    importance = excluded.importance,
+                    kind = excluded.kind,
+                    pinned = excluded.pinned,
+                    tenant_id = excluded.tenant_id
+                 WHERE memories.principal_id IS NULL",
+                params![
+                    id,
+                    key,
+                    content,
+                    cat,
+                    embedding_bytes,
+                    now,
+                    now,
+                    sid,
+                    ns,
+                    imp,
+                    aid,
+                    kind,
+                    pinned,
+                    tenant_id
+                ],
+            )?;
+            if changed == 0 {
+                anyhow::bail!(
+                    "memory key {key:?} is held by a private-plane row; the shared plane \
+                     cannot overwrite it"
+                );
+            }
+            Ok(())
+        })
+        .await?
     }
 
     fn category_to_str(cat: &MemoryCategory) -> String {
@@ -252,6 +509,28 @@ impl SqliteMemory {
             "conversation" => MemoryCategory::Conversation,
             other => MemoryCategory::Custom(other.to_string()),
         }
+    }
+
+    /// The categories whose session-NULL rows are durable global knowledge
+    /// (see [`Self::is_durable_global_row`]). Single source of truth for
+    /// the carve-out: the SQL predicate in [`Self::vector_search`] derives
+    /// its bind parameters from this slice via `category_to_str`, so the
+    /// set is never spelled twice.
+    const DURABLE_GLOBAL_CATEGORIES: [MemoryCategory; 2] =
+        [MemoryCategory::Core, MemoryCategory::Daily];
+
+    /// Whether a row is durable global knowledge: a `core`/`daily` row with
+    /// no session binding is long-term knowledge meant to be recallable
+    /// from any session, not a per-session artifact. Rows that DO carry a
+    /// session binding (consolidation keeps a survivor's `session_id` even
+    /// on `core` rows) stay session-scoped, as do `conversation` and custom
+    /// categories.
+    fn is_durable_global_row(category: &MemoryCategory, session_id: Option<&str>) -> bool {
+        session_id.is_none() && Self::DURABLE_GLOBAL_CATEGORIES.contains(category)
+    }
+
+    fn decode_kind(raw: Option<String>) -> Option<super::traits::MemoryKind> {
+        raw.and_then(|kind| serde_json::from_str(&kind).ok())
     }
 
     /// Deterministic content hash for embedding cache.
@@ -276,9 +555,92 @@ impl SqliteMemory {
         &self.conn
     }
 
+    pub fn stored_embedding_identity(
+        &self,
+    ) -> anyhow::Result<Option<super::embeddings::EmbeddingIdentity>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM memory_meta WHERE key IN \
+             ('embedding_provider', 'embedding_model', 'embedding_dimensions')",
+        )?;
+        let mut provider = None;
+        let mut model = None;
+        let mut dimensions = None;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            let value: String = row.get(1)?;
+            match key.as_str() {
+                "embedding_provider" => provider = Some(value),
+                "embedding_model" => model = Some(value),
+                "embedding_dimensions" => dimensions = value.parse::<usize>().ok(),
+                _ => {}
+            }
+        }
+        Ok(match (provider, model, dimensions) {
+            (Some(provider), Some(model), Some(dimensions)) => {
+                Some(super::embeddings::EmbeddingIdentity {
+                    provider,
+                    model,
+                    dimensions,
+                })
+            }
+            _ => None,
+        })
+    }
+
+    /// Record `identity` in `memory_meta` without touching any vectors.
+    /// Used to adopt the current identity on stores that predate identity
+    /// tracking, and after a match check confirms nothing changed.
+    pub fn record_embedding_identity(
+        &self,
+        identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        Self::write_identity_rows(&tx, identity)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn invalidate_embeddings_for_identity_change(
+        &self,
+        new_identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let invalidated = tx.execute(
+            "UPDATE memories SET embedding = NULL WHERE embedding IS NOT NULL",
+            [],
+        )?;
+        tx.execute("DELETE FROM embedding_cache", [])?;
+        Self::write_identity_rows(&tx, new_identity)?;
+        tx.commit()?;
+        Ok(invalidated)
+    }
+
+    fn write_identity_rows(
+        conn: &Connection,
+        identity: &super::embeddings::EmbeddingIdentity,
+    ) -> anyhow::Result<()> {
+        let mut stmt =
+            conn.prepare("INSERT OR REPLACE INTO memory_meta (key, value) VALUES (?1, ?2)")?;
+        stmt.execute(params!["embedding_provider", identity.provider])?;
+        stmt.execute(params!["embedding_model", identity.model])?;
+        stmt.execute(params![
+            "embedding_dimensions",
+            identity.dimensions.to_string()
+        ])?;
+        Ok(())
+    }
+
     /// Get embedding from cache, or compute + cache it
     pub async fn get_or_compute_embedding(&self, text: &str) -> anyhow::Result<Option<Vec<f32>>> {
-        if self.embedder.dimensions() == 0 {
+        // Snapshot the embedder once so a concurrent `refresh_embedder` swap
+        // can't split this call across two providers; the guard is dropped
+        // immediately, never held across the `.await` below.
+        let embedder = self.embedder.read().clone();
+        if embedder.dimensions() == 0 {
             return Ok(None); // Noop embedder
         }
 
@@ -310,7 +672,7 @@ impl SqliteMemory {
         }
 
         // Compute embedding (async I/O)
-        let embedding = self.embedder.embed_one(text).await?;
+        let embedding = embedder.embed_one(text).await?;
         let bytes = vector::vec_to_bytes(&embedding);
 
         // Store in cache + LRU eviction (offloaded to blocking thread)
@@ -345,10 +707,42 @@ impl SqliteMemory {
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::fts5_search_scoped(conn, query, limit, None, None)
+    }
+
+    /// FTS5 BM25 search constrained to the rows a live vector-stage recall
+    /// may return for a session. Applying this predicate inside FTS keeps
+    /// excluded rows out of BM25 ranking, limiting, and normalization.
+    fn fts5_search_for_session(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::fts5_search_scoped(conn, query, limit, session_id, None)
+    }
+
+    fn fts5_search_for_session_and_agents(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        allowed_agent_ids: &[String],
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::fts5_search_scoped(conn, query, limit, session_id, Some(allowed_agent_ids))
+    }
+
+    fn fts5_search_scoped(
+        conn: &Connection,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        allowed_agent_ids: Option<&[String]>,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
         let fts_query: String = query
             .split_whitespace()
-            .map(|w| format!("\"{w}\""))
+            .map(Self::fts5_term_query)
             .collect::<Vec<_>>()
             .join(" OR ");
 
@@ -356,18 +750,55 @@ impl SqliteMemory {
             return Ok(Vec::new());
         }
 
-        let sql = "SELECT m.id, bm25(memories_fts) as score
-                   FROM memories_fts f
-                   JOIN memories m ON m.rowid = f.rowid
-                   WHERE memories_fts MATCH ?1
-                   ORDER BY score
-                   LIMIT ?2";
+        let mut sql = "SELECT m.id, bm25(memories_fts) as score
+                       FROM memories_fts f
+                       JOIN memories m ON m.rowid = f.rowid
+                       WHERE memories_fts MATCH ?1"
+            .to_string();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(fts_query)];
+        let mut param_idx = 2;
 
-        let mut stmt = conn.prepare(sql)?;
+        if let Some(sid) = session_id {
+            let category_placeholders = Self::DURABLE_GLOBAL_CATEGORIES
+                .iter()
+                .enumerate()
+                .map(|(offset, _)| format!("?{}", param_idx + 1 + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(
+                sql,
+                " AND (m.session_id = ?{param_idx} OR \
+                 (m.session_id IS NULL AND m.category IN ({category_placeholders})))"
+            );
+            param_values.push(Box::new(sid.to_string()));
+            for category in &Self::DURABLE_GLOBAL_CATEGORIES {
+                param_values.push(Box::new(Self::category_to_str(category)));
+            }
+            param_idx += 1 + Self::DURABLE_GLOBAL_CATEGORIES.len();
+        }
+        if let Some(allowed_agent_ids) = allowed_agent_ids
+            && !allowed_agent_ids.is_empty()
+        {
+            let agent_placeholders = (0..allowed_agent_ids.len())
+                .map(|offset| format!("?{}", param_idx + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(sql, " AND m.agent_id IN ({agent_placeholders})");
+            for agent_id in allowed_agent_ids {
+                param_values.push(Box::new(agent_id.clone()));
+            }
+            param_idx += allowed_agent_ids.len();
+        }
+
+        let _ = write!(sql, " ORDER BY score LIMIT ?{param_idx}");
         #[allow(clippy::cast_possible_wrap)]
         let limit_i64 = limit as i64;
+        param_values.push(Box::new(limit_i64));
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(AsRef::as_ref).collect();
 
-        let rows = stmt.query_map(params![fts_query, limit_i64], |row| {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
             let id: String = row.get(0)?;
             let score: f64 = row.get(1)?;
             // BM25 returns negative scores (lower = better), negate for ranking
@@ -382,16 +813,98 @@ impl SqliteMemory {
         Ok(results)
     }
 
+    fn fts5_term_query(term: &str) -> String {
+        if let Some(prefix) = term.strip_suffix('*')
+            && !prefix.is_empty()
+        {
+            let escaped = prefix.replace('"', "\"\"");
+            format!("\"{escaped}\"*")
+        } else {
+            let escaped = term.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        }
+    }
+
+    fn like_search_pattern(term: &str) -> String {
+        if let Some(prefix) = term.strip_suffix('*')
+            && !prefix.is_empty()
+        {
+            return format!("%{}%", Self::escape_like_pattern(prefix));
+        }
+        format!("%{}%", Self::escape_like_pattern(term))
+    }
+
+    fn is_prefix_wildcard_term(term: &str) -> bool {
+        matches!(term.strip_suffix('*'), Some(prefix) if !prefix.is_empty())
+    }
+
+    fn escape_like_pattern(term: &str) -> String {
+        let mut escaped = String::with_capacity(term.len());
+        for ch in term.chars() {
+            if matches!(ch, '%' | '_' | '\\') {
+                escaped.push('\\');
+            }
+            escaped.push(ch);
+        }
+        escaped
+    }
+
+    fn like_fallback_matches(text: &str, term: &str) -> bool {
+        let text = text.to_lowercase();
+        if let Some(prefix) = term.strip_suffix('*')
+            && !prefix.is_empty()
+        {
+            let prefix = prefix.to_lowercase();
+            return text
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .any(|token| token.starts_with(&prefix));
+        }
+        text.contains(&term.to_lowercase())
+    }
+
     /// Vector similarity search: scan embeddings and compute cosine similarity.
-    ///
     /// Optional `category` and `session_id` filters reduce full-table scans
     /// when the caller already knows the scope of relevant memories.
+    ///
+    /// A `session_id` filter still admits durable global rows (see
+    /// `Self::is_durable_global_row`): global `core`/`daily` facts must be
+    /// semantically recallable from sessions that did not write them, while
+    /// session-bound rows from other sessions stay excluded.
     pub fn vector_search(
         conn: &Connection,
         query_embedding: &[f32],
         limit: usize,
         category: Option<&str>,
         session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::vector_search_scoped(conn, query_embedding, limit, category, session_id, None)
+    }
+
+    fn vector_search_for_agents(
+        conn: &Connection,
+        query_embedding: &[f32],
+        limit: usize,
+        category: Option<&str>,
+        session_id: Option<&str>,
+        allowed_agent_ids: &[String],
+    ) -> anyhow::Result<Vec<(String, f32)>> {
+        Self::vector_search_scoped(
+            conn,
+            query_embedding,
+            limit,
+            category,
+            session_id,
+            Some(allowed_agent_ids),
+        )
+    }
+
+    fn vector_search_scoped(
+        conn: &Connection,
+        query_embedding: &[f32],
+        limit: usize,
+        category: Option<&str>,
+        session_id: Option<&str>,
+        allowed_agent_ids: Option<&[String]>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -403,8 +916,33 @@ impl SqliteMemory {
             idx += 1;
         }
         if let Some(sid) = session_id {
-            let _ = write!(sql, " AND session_id = ?{idx}");
+            let category_placeholders = Self::DURABLE_GLOBAL_CATEGORIES
+                .iter()
+                .enumerate()
+                .map(|(offset, _)| format!("?{}", idx + 1 + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(
+                sql,
+                " AND (session_id = ?{idx} OR (session_id IS NULL AND category IN ({category_placeholders})))"
+            );
             param_values.push(Box::new(sid.to_string()));
+            for category in &Self::DURABLE_GLOBAL_CATEGORIES {
+                param_values.push(Box::new(Self::category_to_str(category)));
+            }
+            idx += 1 + Self::DURABLE_GLOBAL_CATEGORIES.len();
+        }
+        if let Some(allowed_agent_ids) = allowed_agent_ids
+            && !allowed_agent_ids.is_empty()
+        {
+            let agent_placeholders = (0..allowed_agent_ids.len())
+                .map(|offset| format!("?{}", idx + offset))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(sql, " AND agent_id IN ({agent_placeholders})");
+            for agent_id in allowed_agent_ids {
+                param_values.push(Box::new(agent_id.clone()));
+            }
         }
 
         let mut stmt = conn.prepare(&sql)?;
@@ -431,10 +969,1448 @@ impl SqliteMemory {
         Ok(scored)
     }
 
-    /// Safe reindex: rebuild FTS5 + embeddings with rollback on failure
-    #[allow(dead_code)]
-    pub async fn reindex(&self) -> anyhow::Result<usize> {
-        // Step 1: Rebuild FTS5
+    /// List memories by time range (used when query is empty).
+    async fn recall_by_time_only(
+        &self,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let sid = session_id.map(String::from);
+        let since_owned = since.map(String::from);
+        let until_owned = until.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+
+            let mut sql =
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                 FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND 1=1"
+                    .to_string();
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            let mut idx = 1;
+
+            if let Some(sid) = sid.as_deref() {
+                let _ = write!(sql, " AND m.session_id = ?{idx}");
+                param_values.push(Box::new(sid.to_string()));
+                idx += 1;
+            }
+            if let Some(s) = since_ref {
+                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                param_values.push(Box::new(s.to_string()));
+                idx += 1;
+            }
+            if let Some(u) = until_ref {
+                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                param_values.push(Box::new(u.to_string()));
+                idx += 1;
+            }
+            let _ = write!(sql, " ORDER BY m.updated_at DESC LIMIT ?{idx}");
+            #[allow(clippy::cast_possible_wrap)]
+            param_values.push(Box::new(limit as i64));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(AsRef::as_ref).collect();
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok(MemoryEntry {
+                    principal_id: None,
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
+                })
+            })?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn recall_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        allowed_agent_ids: Option<Vec<String>>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let allowed_agent_ids = allowed_agent_ids.unwrap_or_default();
+        // Time-only query: list by time range when no keywords.
+        // Treat only a bare "*" as the same recent-entry request; keep
+        // real wildcard searches such as "wild*" on the keyword path.
+        if is_recent_recall_query(query) {
+            let recall_limit = if allowed_agent_ids.is_empty() {
+                limit
+            } else {
+                self.count().await?.max(limit)
+            };
+            let raw = self
+                .recall_by_time_only(recall_limit, session_id, since, until)
+                .await?;
+            if allowed_agent_ids.is_empty() {
+                return Ok(raw);
+            }
+            return Ok(raw
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .agent_id
+                        .as_deref()
+                        .is_some_and(|agent_id| allowed_agent_ids.iter().any(|id| id == agent_id))
+                })
+                .take(limit)
+                .collect());
+        }
+
+        // Compute query embedding only when needed (skip for BM25-only mode)
+        let query_embedding = if self.search_mode == SearchMode::Bm25 {
+            None
+        } else {
+            self.get_or_compute_embedding(query).await?
+        };
+
+        let conn = self.conn.clone();
+        let query = query.to_string();
+        let sid = session_id.map(String::from);
+        let since_owned = since.map(String::from);
+        let until_owned = until.map(String::from);
+        let vector_weight = self.vector_weight;
+        let keyword_weight = self.keyword_weight;
+        let search_mode = self.search_mode.clone();
+        let allowed = allowed_agent_ids;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let session_ref = sid.as_deref();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+            let agent_filter = if allowed.is_empty() {
+                None
+            } else {
+                Some(allowed.as_slice())
+            };
+            // The vector stage is live only when an embedder produced a query
+            // vector; it selects the scoped FTS variant. The BM25-only path
+            // (stock `embedding_provider = "none"` => Noop embedder, and
+            // explicit `search_mode = "bm25"`) keeps its strict session filter.
+            let vector_live = query_embedding.is_some();
+
+            // FTS5 BM25 keyword search (skip for embedding-only mode)
+            let keyword_results = if search_mode == SearchMode::Embedding {
+                Vec::new()
+            } else if let Some(agent_filter) = agent_filter {
+                if vector_live {
+                    Self::fts5_search_for_session_and_agents(
+                        &conn,
+                        &query,
+                        limit * 2,
+                        session_ref,
+                        agent_filter,
+                    )
+                    .unwrap_or_default()
+                } else {
+                    Self::fts5_search_scoped(&conn, &query, limit * 2, None, Some(agent_filter))
+                        .unwrap_or_default()
+                }
+            } else if vector_live {
+                Self::fts5_search_for_session(&conn, &query, limit * 2, session_ref)
+                    .unwrap_or_default()
+            } else {
+                Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default()
+            };
+
+            // Vector similarity search (skip for BM25-only mode)
+            let vector_results = if search_mode == SearchMode::Bm25 {
+                Vec::new()
+            } else if let Some(ref qe) = query_embedding {
+                if let Some(agent_filter) = agent_filter {
+                    Self::vector_search_for_agents(&conn, qe, limit * 2, None, session_ref, agent_filter)
+                        .unwrap_or_default()
+                } else {
+                    Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Merge results based on search mode
+            let merged = if vector_results.is_empty() {
+                // FTS-only survivors: map raw BM25 onto the [0, 1] axis
+                // (matching hybrid_merge's internal keyword normalization) so
+                // downstream relevance thresholding and the injection rerank
+                // stage see one calibrated scale, whether or not the vector
+                // stage is live. Batch-max normalization; the strict session
+                // filter still applies below.
+                crate::normalize::bm25_to_unit(&keyword_results)
+                    .into_iter()
+                    .map(|(id, score)| vector::ScoredResult {
+                        id,
+                        vector_score: None,
+                        keyword_score: Some(score),
+                        final_score: score,
+                    })
+                    .collect::<Vec<_>>()
+            } else if keyword_results.is_empty() {
+                vector_results
+                    .iter()
+                    .map(|(id, score)| vector::ScoredResult {
+                        id: id.clone(),
+                        vector_score: Some(*score),
+                        keyword_score: None,
+                        final_score: *score,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vector::hybrid_merge(
+                    &vector_results,
+                    &keyword_results,
+                    vector_weight,
+                    keyword_weight,
+                    limit,
+                )
+            };
+
+            // Fetch full entries for merged results in a single query
+            // instead of N round-trips (N+1 pattern).
+            let mut results = Vec::new();
+            if !merged.is_empty() {
+                let placeholders: String = (1..=merged.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                     FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                     WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND m.id IN ({placeholders})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
+                    .iter()
+                    .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
+                    .collect();
+                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                    id_params.iter().map(AsRef::as_ref).collect();
+                let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<f64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, i64>(10)? != 0,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                    ))
+                })?;
+
+                let mut entry_map = std::collections::HashMap::new();
+                for row in rows {
+                    let (
+                        id,
+                        key,
+                        content,
+                        cat,
+                        ts,
+                        sid,
+                        ns,
+                        imp,
+                        sup,
+                        kind,
+                        pinned,
+                        alias,
+                        aid,
+                        tenant,
+                    ) = row?;
+                    entry_map.insert(
+                        id,
+                        (
+                            key, content, cat, ts, sid, ns, imp, sup, kind, pinned, alias, aid,
+                            tenant,
+                        ),
+                    );
+                }
+
+                for scored in &merged {
+                    if let Some((
+                        key,
+                        content,
+                        cat,
+                        ts,
+                        sid,
+                        ns,
+                        imp,
+                        sup,
+                        kind,
+                        pinned,
+                        alias,
+                        aid,
+                        tenant,
+                    )) = entry_map.remove(&scored.id)
+                    {
+                        if let Some(s) = since_ref
+                            && ts.as_str() < s {
+                                continue;
+                            }
+                        if let Some(u) = until_ref
+                            && ts.as_str() > u {
+                                continue;
+                            }
+                        let entry = MemoryEntry {
+                            principal_id: None,
+                            id: scored.id.clone(),
+                            key,
+                            content,
+                            category: Self::str_to_category(&cat),
+                            timestamp: ts,
+                            session_id: sid,
+                            score: Some(f64::from(scored.final_score)),
+                            namespace: ns.unwrap_or_else(|| "default".into()),
+                            importance: imp,
+                            superseded_by: sup,
+                            kind: Self::decode_kind(kind),
+                            pinned,
+                            tenant_id: tenant,
+                            agent_alias: alias,
+                            agent_id: aid,
+                        };
+                        // Session filter for the hybrid stage. With a live
+                        // vector stage, durable global rows are exempt so
+                        // they reach recall from any session, whichever
+                        // stage (vector or keyword) surfaced them; the
+                        // BM25-only path keeps the strict legacy filter.
+                        if let Some(filter_sid) = session_ref
+                            && entry.session_id.as_deref() != Some(filter_sid)
+                            && !(vector_live
+                                && Self::is_durable_global_row(
+                                    &entry.category,
+                                    entry.session_id.as_deref(),
+                                ))
+                        {
+                            continue;
+                        }
+                        results.push(entry);
+                    }
+                }
+            }
+
+            // If hybrid returned nothing, fall back to LIKE search.
+            if results.is_empty() {
+                const MAX_LIKE_KEYWORDS: usize = 8;
+                let raw_keywords: Vec<String> = query
+                    .split_whitespace()
+                    .take(MAX_LIKE_KEYWORDS)
+                    .map(str::to_string)
+                    .collect();
+                if !raw_keywords.is_empty() {
+                    let needs_prefix_filter = raw_keywords
+                        .iter()
+                        .any(|keyword| Self::is_prefix_wildcard_term(keyword));
+                    let sql_limit = if needs_prefix_filter {
+                        limit.saturating_mul(8).min(limit.saturating_add(512))
+                    } else {
+                        limit
+                    };
+                    let patterns: Vec<String> = raw_keywords
+                        .iter()
+                        .map(|keyword| Self::like_search_pattern(keyword))
+                        .collect();
+                    let conditions: Vec<String> = patterns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| {
+                            format!(
+                                "(m.content LIKE ?{} ESCAPE '\\' OR m.key LIKE ?{} ESCAPE '\\')",
+                                i * 2 + 1,
+                                i * 2 + 2
+                            )
+                        })
+                        .collect();
+                    let where_clause = conditions.join(" OR ");
+                    let mut param_idx = patterns.len() * 2 + 1;
+                    let mut time_conditions = String::new();
+                    if since_ref.is_some() {
+                        let _ = write!(time_conditions, " AND m.created_at >= ?{param_idx}");
+                        param_idx += 1;
+                    }
+                    if until_ref.is_some() {
+                        let _ = write!(time_conditions, " AND m.created_at <= ?{param_idx}");
+                        param_idx += 1;
+                    }
+                    let mut agent_conditions = String::new();
+                    if let Some(agent_filter) = agent_filter {
+                        let agent_placeholders = (0..agent_filter.len())
+                            .map(|offset| format!("?{}", param_idx + offset))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = write!(agent_conditions, " AND m.agent_id IN ({agent_placeholders})");
+                        param_idx += agent_filter.len();
+                    }
+                    let sql = format!(
+                        "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
+                         FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
+                         WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND ({where_clause}){time_conditions}{agent_conditions}
+                         ORDER BY m.updated_at DESC
+                         LIMIT ?{param_idx}"
+                    );
+                    let mut stmt = conn.prepare(&sql)?;
+                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                    for kw in &patterns {
+                        param_values.push(Box::new(kw.clone()));
+                        param_values.push(Box::new(kw.clone()));
+                    }
+                    if let Some(s) = since_ref {
+                        param_values.push(Box::new(s.to_string()));
+                    }
+                    if let Some(u) = until_ref {
+                        param_values.push(Box::new(u.to_string()));
+                    }
+                    if let Some(agent_filter) = agent_filter {
+                        for agent_id in agent_filter {
+                            param_values.push(Box::new(agent_id.clone()));
+                        }
+                    }
+                    #[allow(clippy::cast_possible_wrap)]
+                    param_values.push(Box::new(sql_limit as i64));
+                    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                        param_values.iter().map(AsRef::as_ref).collect();
+                    let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                        Ok(MemoryEntry {
+                            principal_id: None,
+                            id: row.get(0)?,
+                            key: row.get(1)?,
+                            content: row.get(2)?,
+                            category: Self::str_to_category(&row.get::<_, String>(3)?),
+                            timestamp: row.get(4)?,
+                            session_id: row.get(5)?,
+                            score: Some(1.0),
+                            namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                            importance: row.get(7)?,
+                            superseded_by: row.get(8)?,
+                            kind: Self::decode_kind(row.get(9)?),
+                            pinned: row.get::<_, i64>(10)? != 0,
+                            tenant_id: row.get(13)?,
+                            agent_alias: row.get(11)?,
+                            agent_id: row.get(12)?,
+                        })
+                    })?;
+                    for row in rows {
+                        let entry = row?;
+                        if let Some(sid) = session_ref
+                            && entry.session_id.as_deref() != Some(sid) {
+                                continue;
+                            }
+                        if needs_prefix_filter
+                            && !raw_keywords.iter().any(|keyword| {
+                                Self::like_fallback_matches(&entry.key, keyword)
+                                    || Self::like_fallback_matches(&entry.content, keyword)
+                            })
+                        {
+                            continue;
+                        }
+                        results.push(entry);
+                        if results.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            results.truncate(limit);
+            Ok(results)
+        })
+        .await?
+    }
+
+    /// Replace the live embedder in place. Shared by the runtime
+    /// `refresh_embedder` hook (after a `config/set` provider-profile change)
+    /// and tests that need to inject a fake embedder. Existing `Arc<dyn Memory>`
+    /// holders observe the new embedder on their next embed without rebuilding
+    /// the handle.
+    pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+        *self.embedder.write() = embedder;
+        // `embedding_cache` is keyed by content hash only, so every cached
+        // vector belongs to the *previous* provider/model/dimensions. Drop the
+        // cache on swap so the next embed goes through the new embedder instead
+        // of returning a stale vector. Best-effort - a cache-clear failure must
+        // not block the swap.
+        if let Err(e) = self.conn.lock().execute("DELETE FROM embedding_cache", []) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "memory embedder refresh: failed to clear stale embedding cache"
+            );
+        }
+    }
+
+    /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
+    /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
+    /// took effect after a `config/set` provider-profile change.
+    pub fn embedder_dimensions(&self) -> usize {
+        self.embedder.read().dimensions()
+    }
+}
+
+impl SqliteMemory {
+    /// The physical-key prefix of a private-plane row: the owner, namespace
+    /// and tenant of its scope. The composite `UNIQUE (agent_id, key)` table
+    /// constraint predates the principal dimension, so private rows encode
+    /// every non-agent scope dimension in their physical key; that is what
+    /// makes a conflict mean "this scope's own row" and nothing else. The
+    /// `principal_id`, `namespace` and `tenant_id` COLUMNS remain the
+    /// authoritative predicates on every private-plane statement, and
+    /// legacy-plane statements filter `principal_id IS NULL`, so the prefix
+    /// is storage layout, not an authorization mechanism.
+    ///
+    /// The encoding is length-prefixed (`<byte-len>:<bytes>` per segment) so
+    /// the mapping from (owner, namespace, tenant, key) to physical key is
+    /// injective: no choice of colon-bearing owner/namespace/tenant/key can
+    /// produce the same string as a different tuple, and an absent tenant
+    /// (`None`, encoded as `-`) is distinct from an empty one (`Some("")`,
+    /// encoded as `0:`). Without this a colliding physical key would let one
+    /// scope's upsert silently move or overwrite another scope's row.
+    fn encode_segment(out: &mut String, seg: &str) {
+        // Length in bytes, a colon, then the raw bytes. Because the length is
+        // an unambiguous prefix, the reader knows exactly where the segment
+        // ends regardless of any colons the segment itself contains.
+        out.push_str(&seg.len().to_string());
+        out.push(':');
+        out.push_str(seg);
+    }
+
+    fn principal_physical_prefix(scope: &PrincipalScope) -> String {
+        // `p|` marks the private plane; each dimension is length-prefixed.
+        // Tenant distinguishes absent (`-`) from present (`t` + segment) so
+        // `None` and `Some("")` never collide.
+        let mut prefix = String::from("p|");
+        Self::encode_segment(&mut prefix, &scope.principal_id);
+        Self::encode_segment(&mut prefix, Self::scope_namespace(scope));
+        match scope.tenant_id.as_deref() {
+            None => prefix.push('-'),
+            Some(tenant) => {
+                prefix.push('t');
+                Self::encode_segment(&mut prefix, tenant);
+            }
+        }
+        prefix.push('|');
+        prefix
+    }
+
+    /// Physical storage key for a private-plane row.
+    fn principal_physical_key(scope: &PrincipalScope, key: &str) -> String {
+        format!("{}{key}", Self::principal_physical_prefix(scope))
+    }
+
+    /// Restore the caller-visible key from a private-plane row.
+    fn strip_principal_prefix(scope: &PrincipalScope, physical_key: &str) -> String {
+        physical_key
+            .strip_prefix(&Self::principal_physical_prefix(scope))
+            .unwrap_or(physical_key)
+            .to_string()
+    }
+
+    /// The reserved prefix of private-plane physical keys. Shared-plane
+    /// writes refuse it outright so a shared caller can never name a private
+    /// row's physical key.
+    const PRIVATE_KEY_PREFIX: &'static str = "p|";
+
+    /// The agent alias a scope resolves to (`None` = the default agent).
+    fn scope_agent_alias(scope: &PrincipalScope) -> &str {
+        scope.agent_alias.as_deref().unwrap_or("default")
+    }
+
+    /// The namespace a scope resolves to (`None` = the default namespace).
+    fn scope_namespace(scope: &PrincipalScope) -> &str {
+        scope.namespace.as_deref().unwrap_or("default")
+    }
+
+    /// SQL predicate binding every scope dimension of a private-plane row:
+    /// owner, agent, namespace and tenant, in that parameter order starting
+    /// at `first_idx`. `prefix` is the table alias (`"m."`) or `""`. Returns
+    /// the fragment (leading ` AND `) and its parameters.
+    fn scope_predicate(
+        scope: &PrincipalScope,
+        prefix: &str,
+        first_idx: usize,
+    ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+        let p = first_idx;
+        let fragment = format!(
+            " AND {prefix}principal_id = ?{p} \
+             AND {prefix}agent_id = (SELECT id FROM agents WHERE alias = ?{a} LIMIT 1) \
+             AND {prefix}namespace = ?{n} \
+             AND {prefix}tenant_id IS ?{t}",
+            a = p + 1,
+            n = p + 2,
+            t = p + 3,
+        );
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(scope.principal_id.clone()),
+            Box::new(Self::scope_agent_alias(scope).to_string()),
+            Box::new(Self::scope_namespace(scope).to_string()),
+            Box::new(scope.tenant_id.clone()),
+        ];
+        (fragment, params)
+    }
+
+    /// The private-plane SELECT column list shared by every private read.
+    const PRIVATE_COLUMNS: &'static str = "m.id, m.key, m.content, m.category, m.created_at, m.session_id, \
+         m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, \
+         a.alias, m.agent_id, m.tenant_id";
+
+    /// Map one private-plane row: owner set, key as the caller sees it.
+    fn private_row(
+        row: &rusqlite::Row<'_>,
+        scope: &PrincipalScope,
+    ) -> rusqlite::Result<MemoryEntry> {
+        let physical_key: String = row.get(1)?;
+        Ok(MemoryEntry {
+            principal_id: Some(scope.principal_id.clone()),
+            id: row.get(0)?,
+            key: Self::strip_principal_prefix(scope, &physical_key),
+            content: row.get(2)?,
+            category: Self::str_to_category(&row.get::<_, String>(3)?),
+            timestamp: row.get(4)?,
+            session_id: row.get(5)?,
+            score: None,
+            namespace: row
+                .get::<_, Option<String>>(6)?
+                .unwrap_or_else(|| "default".into()),
+            importance: row.get(7)?,
+            superseded_by: row.get(8)?,
+            kind: Self::decode_kind(row.get(9)?),
+            pinned: row.get::<_, i64>(10)? != 0,
+            tenant_id: row.get(13)?,
+            agent_alias: row.get(11)?,
+            agent_id: row.get(12)?,
+        })
+    }
+}
+
+#[async_trait]
+impl Memory for SqliteMemory {
+    fn name(&self) -> &str {
+        "sqlite"
+    }
+
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Rebuild from the freshly-resolved settings and swap in place. No
+        // provider state is duplicated into a separate cache — the endpoint/key
+        // come from the canonical config via the runtime resolver.
+        let embedder: Arc<dyn EmbeddingProvider> =
+            Arc::from(super::embeddings::create_embedding_provider(
+                model_provider,
+                api_key,
+                model,
+                dimensions,
+            ));
+        self.swap_embedder(embedder);
+    }
+
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Trait-level `store` has no agent context; route through
+        // `store_with_agent` so the row gets attributed to the default
+        // agent (the NOT NULL FK on `agent_id` rejects unattributed
+        // inserts).
+        self.store_with_agent(key, content, category, session_id, None, None, None)
+            .await
+    }
+
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_scoped(query, limit, session_id, since, until, None)
+            .await
+    }
+
+    async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                 FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.key = ?1 AND m.principal_id IS NULL",
+            )?;
+
+            let mut rows = stmt.query_map(params![key], |row| {
+                Ok(MemoryEntry {
+                    principal_id: None,
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
+                })
+            })?;
+
+            match rows.next() {
+                Some(Ok(entry)) => Ok(Some(entry)),
+                _ => Ok(None),
+            }
+        })
+        .await?
+    }
+
+    async fn get_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let agent_id = agent_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                 FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.key = ?1 AND m.agent_id = ?2 AND m.principal_id IS NULL",
+            )?;
+
+            let mut rows = stmt.query_map(params![key, agent_id], |row| {
+                Ok(MemoryEntry {
+                    principal_id: None,
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
+                })
+            })?;
+
+            match rows.next() {
+                Some(Ok(entry)) => Ok(Some(entry)),
+                _ => Ok(None),
+            }
+        })
+        .await?
+    }
+
+    async fn list(
+        &self,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        const DEFAULT_LIST_LIMIT: i64 = 1000;
+
+        let conn = self.conn.clone();
+        let category = category.cloned();
+        let sid = session_id.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let session_ref = sid.as_deref();
+            let mut results = Vec::new();
+
+            let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
+                Ok(MemoryEntry {
+                    principal_id: None,
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
+                })
+            };
+
+            if let Some(ref cat) = category {
+                let cat_str = Self::category_to_str(cat);
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
+                     FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
+                     WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND m.category = ?1 ORDER BY m.updated_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?;
+                for row in rows {
+                    let entry = row?;
+                    if let Some(sid) = session_ref
+                        && entry.session_id.as_deref() != Some(sid) {
+                            continue;
+                        }
+                    results.push(entry);
+                }
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
+                     FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
+                     WHERE m.superseded_by IS NULL AND m.principal_id IS NULL ORDER BY m.updated_at DESC LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?;
+                for row in rows {
+                    let entry = row?;
+                    if let Some(sid) = session_ref
+                        && entry.session_id.as_deref() != Some(sid) {
+                            continue;
+                        }
+                    results.push(entry);
+                }
+            }
+
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE key = ?1 AND principal_id IS NULL",
+                params![key],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let agent_id = agent_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE key = ?1 AND agent_id = ?2 AND principal_id IS NULL",
+                params![key, agent_id],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
+    async fn store_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let physical_key = Self::principal_physical_key(scope, key);
+        let principal = scope.principal_id.clone();
+        let agent_alias = Self::scope_agent_alias(scope).to_string();
+        let namespace = Self::scope_namespace(scope).to_string();
+        let tenant_id = scope.tenant_id.clone();
+        let visible_key = key.to_string();
+        let content = content.to_string();
+        let sid = session_id.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let now = Local::now().to_rfc3339();
+            let cat = Self::category_to_str(&category);
+            let id = Uuid::new_v4().to_string();
+            // The scope's agent must exist as a row: a principal permitted
+            // only a non-default agent stores under that agent from the
+            // first write, the same way the shared plane ensures aliases.
+            zeroclaw_config::schema::v2::sqlite_ensure_agent_uuid(&conn, &agent_alias)?;
+            // Every scope dimension travels in the statement that stores the
+            // row (atomic predicate). The physical key is an injective encoding
+            // of (owner, namespace, tenant, key), so a conflict on the
+            // UNIQUE(agent_id, key) constraint is this exact scope's own row.
+            // The UPDATE is nonetheless guarded on the full scope — owner AND
+            // namespace AND tenant of the existing row must match the incoming
+            // one — so that even a hypothetical key collision can never
+            // silently move or overwrite a row that belongs to a different
+            // scope dimension: the guard fails the update to zero rows and the
+            // write is refused rather than reported as stored. `IS` is used
+            // throughout so a NULL tenant compares equal to a NULL tenant.
+            let changed = conn.execute(
+                "INSERT INTO memories (
+                    id, key, content, category, created_at, updated_at,
+                    session_id, namespace, importance, agent_id, tenant_id, principal_id
+                 )
+                 VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0.5,
+                    (SELECT id FROM agents WHERE alias = ?9 LIMIT 1),
+                    ?10, ?11
+                 )
+                 ON CONFLICT(agent_id, key) DO UPDATE SET
+                    content = excluded.content,
+                    category = excluded.category,
+                    updated_at = excluded.updated_at,
+                    session_id = excluded.session_id,
+                    namespace = excluded.namespace,
+                    tenant_id = excluded.tenant_id
+                 WHERE memories.principal_id IS excluded.principal_id
+                   AND memories.namespace IS excluded.namespace
+                   AND memories.tenant_id IS excluded.tenant_id",
+                params![
+                    id,
+                    physical_key,
+                    content,
+                    cat,
+                    now,
+                    now,
+                    sid,
+                    namespace,
+                    agent_alias,
+                    tenant_id,
+                    principal
+                ],
+            )?;
+            if changed == 0 {
+                anyhow::bail!(
+                    "memory key {visible_key:?} is held by another plane under agent \
+                     {agent_alias:?}; the private plane cannot overwrite it"
+                );
+            }
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn recall_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let scope = scope.clone();
+        let query = query.to_string();
+        let sid = session_id.map(String::from);
+        let since_owned = since.map(String::from);
+        let until_owned = until.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            // Keyword/time recall over the private plane only. The
+            // embedding/rerank pipeline stays on the shared plane; private
+            // rows are operator-curated notes reached over RPC.
+            let (scope_sql, mut param_values) = Self::scope_predicate(&scope, "m.", 1);
+            let mut sql = format!(
+                "SELECT {} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.superseded_by IS NULL{scope_sql}",
+                Self::PRIVATE_COLUMNS
+            );
+            let mut idx = param_values.len() + 1;
+            let trimmed = query.trim();
+            if !(trimmed.is_empty() || trimmed == "*") {
+                let _ = write!(sql, " AND m.content LIKE ?{idx} ESCAPE '\\'");
+                let escaped = trimmed
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                param_values.push(Box::new(format!("%{escaped}%")));
+                idx += 1;
+            }
+            if let Some(sid) = sid.as_deref() {
+                let _ = write!(sql, " AND m.session_id = ?{idx}");
+                param_values.push(Box::new(sid.to_string()));
+                idx += 1;
+            }
+            if let Some(since) = since_owned.as_deref() {
+                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                param_values.push(Box::new(since.to_string()));
+                idx += 1;
+            }
+            if let Some(until) = until_owned.as_deref() {
+                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                param_values.push(Box::new(until.to_string()));
+                idx += 1;
+            }
+            let _ = write!(sql, " ORDER BY m.updated_at DESC LIMIT ?{idx}");
+            #[allow(clippy::cast_possible_wrap)]
+            param_values.push(Box::new(limit as i64));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            let rows =
+                stmt.query_map(params_ref.as_slice(), |row| Self::private_row(row, &scope))?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn list_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let scope = scope.clone();
+        let category = category.map(Self::category_to_str);
+        let sid = session_id.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            // The category predicate is applied in SQL, before the limit,
+            // and compared on the stored string so `core` and `Core` are the
+            // same category whichever spelling the caller used.
+            let (scope_sql, mut param_values) = Self::scope_predicate(&scope, "m.", 1);
+            let mut sql = format!(
+                "SELECT {} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.superseded_by IS NULL{scope_sql}",
+                Self::PRIVATE_COLUMNS
+            );
+            let mut idx = param_values.len() + 1;
+            if let Some(cat) = category {
+                let _ = write!(sql, " AND m.category = ?{idx}");
+                param_values.push(Box::new(cat));
+                idx += 1;
+            }
+            if let Some(sid) = sid {
+                let _ = write!(sql, " AND m.session_id = ?{idx}");
+                param_values.push(Box::new(sid));
+            }
+            sql.push_str(" ORDER BY m.updated_at DESC");
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            let rows =
+                stmt.query_map(params_ref.as_slice(), |row| Self::private_row(row, &scope))?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn get_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let scope = scope.clone();
+        let physical_key = Self::principal_physical_key(&scope, key);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+            let conn = conn.lock();
+            let (scope_sql, mut param_values) = Self::scope_predicate(&scope, "m.", 2);
+            let sql = format!(
+                "SELECT {} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.key = ?1{scope_sql}",
+                Self::PRIVATE_COLUMNS
+            );
+            param_values.insert(0, Box::new(physical_key));
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            let mut rows =
+                stmt.query_map(params_ref.as_slice(), |row| Self::private_row(row, &scope))?;
+            // Absence and a decoding failure are different answers.
+            match rows.next() {
+                Some(Ok(entry)) => Ok(Some(entry)),
+                Some(Err(e)) => Err(e.into()),
+                None => Ok(None),
+            }
+        })
+        .await?
+    }
+
+    async fn forget_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        key: &str,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let scope = scope.clone();
+        let physical_key = Self::principal_physical_key(&scope, key);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            // Ownership predicate and delete are one statement.
+            let (scope_sql, mut param_values) = Self::scope_predicate(&scope, "", 2);
+            let sql = format!("DELETE FROM memories WHERE key = ?1{scope_sql}");
+            param_values.insert(0, Box::new(physical_key));
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            let affected = conn.execute(&sql, params_ref.as_slice())?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
+    async fn count_for_principal(&self, scope: &PrincipalScope) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let scope = scope.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let (scope_sql, param_values) = Self::scope_predicate(&scope, "", 1);
+            let sql =
+                format!("SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL{scope_sql}");
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            let count: i64 = conn.query_row(&sql, params_ref.as_slice(), |row| row.get(0))?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(count as usize)
+        })
+        .await?
+    }
+
+    async fn export_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        filter: &ExportFilter,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let scope = scope.clone();
+        let filter = filter.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            // The scope already fixes the namespace; the filter's namespace,
+            // if any, must agree or nothing matches.
+            let (scope_sql, mut param_values) = Self::scope_predicate(&scope, "m.", 1);
+            let mut sql = format!(
+                "SELECT {} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE 1=1{scope_sql}",
+                Self::PRIVATE_COLUMNS
+            );
+            let mut idx = param_values.len() + 1;
+            if let Some(ref ns) = filter.namespace {
+                let _ = write!(sql, " AND m.namespace = ?{idx}");
+                param_values.push(Box::new(ns.clone()));
+                idx += 1;
+            }
+            if let Some(ref sid) = filter.session_id {
+                let _ = write!(sql, " AND m.session_id = ?{idx}");
+                param_values.push(Box::new(sid.clone()));
+                idx += 1;
+            }
+            if let Some(ref cat) = filter.category {
+                let _ = write!(sql, " AND m.category = ?{idx}");
+                param_values.push(Box::new(Self::category_to_str(cat)));
+                idx += 1;
+            }
+            if let Some(ref since) = filter.since {
+                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                param_values.push(Box::new(since.clone()));
+                idx += 1;
+            }
+            if let Some(ref until) = filter.until {
+                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                param_values.push(Box::new(until.clone()));
+            }
+            sql.push_str(" ORDER BY m.created_at ASC");
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            let rows =
+                stmt.query_map(params_ref.as_slice(), |row| Self::private_row(row, &scope))?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn purge_namespace_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        namespace: &str,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        // The purged namespace is the one named, within the scope's owner,
+        // agent and tenant.
+        let scope = scope.clone().with_namespace(Some(namespace.to_string()));
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let (scope_sql, param_values) = Self::scope_predicate(&scope, "", 1);
+            let sql = format!("DELETE FROM memories WHERE 1=1{scope_sql}");
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            Ok(conn.execute(&sql, params_ref.as_slice())?)
+        })
+        .await?
+    }
+
+    async fn purge_session_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        session_id: &str,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let scope = scope.clone();
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let (scope_sql, mut param_values) = Self::scope_predicate(&scope, "", 2);
+            let sql = format!("DELETE FROM memories WHERE session_id = ?1{scope_sql}");
+            param_values.insert(0, Box::new(session_id));
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            Ok(conn.execute(&sql, params_ref.as_slice())?)
+        })
+        .await?
+    }
+
+    // The legacy bulk deletes act on the SHARED plane only (`principal_id
+    // IS NULL`): a handle without principal context can never reach a
+    // private row, whatever session, namespace or agent it names. Private
+    // rows are purged through the `*_for_principal` forms, whose DELETE
+    // carries the owner.
+
+    async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let namespace = namespace.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE namespace = ?1 AND principal_id IS NULL",
+                params![namespace],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected)
+        })
+        .await?
+    }
+
+    async fn purge_session(&self, session_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE session_id = ?1 AND principal_id IS NULL",
+                params![session_id],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected)
+        })
+        .await?
+    }
+
+    async fn purge_session_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+        let agent_id = agent_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE session_id = ?1 AND agent_id = ?2 \
+                 AND principal_id IS NULL",
+                params![session_id, agent_id],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected)
+        })
+        .await?
+    }
+
+    async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let agent_alias = agent_alias.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
+                 AND principal_id IS NULL",
+                params![agent_alias],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected)
+        })
+        .await?
+    }
+
+    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            // Memory rows ride `memories.agent_id` (FK → agents.id, a stable
+            // UUID); only the human `alias` column moves, so this is a single
+            // agents-row update. An unknown `from` matches nothing → Ok(0).
+            //
+            // Collision-safety: `agents.alias` is UNIQUE, and deleting an agent
+            // purges its memories but leaves the `agents` row behind (an orphan
+            // holding the alias). A bare UPDATE onto a previously-used-then-
+            // deleted `to` alias would hit the UNIQUE constraint and fail. We
+            // hold the connection lock across the whole sequence (single writer),
+            // so: refuse if `to` still has memory rows (a genuine conflict we
+            // won't silently merge), otherwise drop the orphan `to` row and
+            // proceed. (`COUNT(*)` over a NULL subselect when no `to` row exists
+            // is 0, so the common no-collision path falls straight through.)
+            let to_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1)",
+                params![to],
+                |row| row.get(0),
+            )?;
+            if to_rows > 0 {
+                anyhow::bail!(
+                    "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
+                );
+            }
+            // Drop any orphan `to` agents row (verified above to own no memories).
+            conn.execute("DELETE FROM agents WHERE alias = ?1", params![to])?;
+            let affected = conn.execute(
+                "UPDATE agents SET alias = ?2 WHERE alias = ?1",
+                params![from, to],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected)
+        })
+        .await?
+    }
+
+    async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let agent_alias = agent_alias.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            // Mirror `rename_agent`: it moves the `agents` row (alias -> id), not
+            // the memory rows, so residue is the presence of that alias row (0 or
+            // 1). A memory-row count would miss an agent with an `agents` row but
+            // no memories - a real lag `rename_agent` would still re-point.
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agents WHERE alias = ?1",
+                params![agent_alias],
+                |row| row.get(0),
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(count as usize)
+        })
+        .await?
+    }
+
+    async fn count(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(count as usize)
+        })
+        .await?
+    }
+
+    async fn health_check(&self) -> bool {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
+            .await
+            .unwrap_or(false)
+    }
+
+    async fn reindex(&self) -> anyhow::Result<usize> {
+        // Step 1: Rebuild FTS5 (always safe, cheap)
         {
             let conn = self.conn.clone();
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -445,8 +2421,8 @@ impl SqliteMemory {
             .await??;
         }
 
-        // Step 2: Re-embed all memories that lack embeddings
-        if self.embedder.dimensions() == 0 {
+        // Step 2: Re-embed memories with NULL vectors, if embedder is configured
+        if self.embedder.read().dimensions() == 0 {
             return Ok(0);
         }
 
@@ -484,55 +2460,55 @@ impl SqliteMemory {
         Ok(count)
     }
 
-    /// List memories by time range (used when query is empty).
-    async fn recall_by_time_only(
-        &self,
-        limit: usize,
-        session_id: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
+    async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
-        let sid = session_id.map(String::from);
-        let since_owned = since.map(String::from);
-        let until_owned = until.map(String::from);
+        let filter = filter.clone();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
-            let since_ref = since_owned.as_deref();
-            let until_ref = until_owned.as_deref();
-
+            // Ordinary exports are the shared plane's. Private rows leave
+            // storage only through `export_for_principal`, owner attached.
             let mut sql =
-                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories \
-                           WHERE superseded_by IS NULL AND 1=1"
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                 FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.principal_id IS NULL"
                     .to_string();
             let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             let mut idx = 1;
 
-            if let Some(sid) = sid.as_deref() {
-                let _ = write!(sql, " AND session_id = ?{idx}");
-                param_values.push(Box::new(sid.to_string()));
+            if let Some(ref ns) = filter.namespace {
+                let _ = write!(sql, " AND m.namespace = ?{idx}");
+                param_values.push(Box::new(ns.clone()));
                 idx += 1;
             }
-            if let Some(s) = since_ref {
-                let _ = write!(sql, " AND created_at >= ?{idx}");
-                param_values.push(Box::new(s.to_string()));
+            if let Some(ref sid) = filter.session_id {
+                let _ = write!(sql, " AND m.session_id = ?{idx}");
+                param_values.push(Box::new(sid.clone()));
                 idx += 1;
             }
-            if let Some(u) = until_ref {
-                let _ = write!(sql, " AND created_at <= ?{idx}");
-                param_values.push(Box::new(u.to_string()));
+            if let Some(ref cat) = filter.category {
+                let _ = write!(sql, " AND m.category = ?{idx}");
+                param_values.push(Box::new(Self::category_to_str(cat)));
                 idx += 1;
             }
-            let _ = write!(sql, " ORDER BY updated_at DESC LIMIT ?{idx}");
-            #[allow(clippy::cast_possible_wrap)]
-            param_values.push(Box::new(limit as i64));
+            if let Some(ref since) = filter.since {
+                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                param_values.push(Box::new(since.clone()));
+                idx += 1;
+            }
+            if let Some(ref until) = filter.until {
+                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                param_values.push(Box::new(until.clone()));
+                let _ = idx;
+            }
+            sql.push_str(" ORDER BY m.created_at ASC");
 
             let mut stmt = conn.prepare(&sql)?;
             let params_ref: Vec<&dyn rusqlite::types::ToSql> =
                 param_values.iter().map(AsRef::as_ref).collect();
             let rows = stmt.query_map(params_ref.as_slice(), |row| {
                 Ok(MemoryEntry {
+                    principal_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,
@@ -543,6 +2519,11 @@ impl SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
                 })
             })?;
 
@@ -554,300 +2535,23 @@ impl SqliteMemory {
         })
         .await?
     }
-}
 
-#[async_trait]
-impl Memory for SqliteMemory {
-    fn name(&self) -> &str {
-        "sqlite"
-    }
-
-    async fn store(
-        &self,
-        key: &str,
-        content: &str,
-        category: MemoryCategory,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<()> {
-        // Compute embedding (async, before blocking work)
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
-
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
-        let key = key.to_string();
-        let content = content.to_string();
-        let sid = session_id.map(String::from);
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = conn.lock();
-            let now = Local::now().to_rfc3339();
-            let cat = Self::category_to_str(&category);
-            let id = Uuid::new_v4().to_string();
-
-            conn.execute(
-                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, namespace, importance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'default', 0.5)
-                 ON CONFLICT(key) DO UPDATE SET
-                    content = excluded.content,
-                    category = excluded.category,
-                    embedding = excluded.embedding,
-                    updated_at = excluded.updated_at,
-                    session_id = excluded.session_id",
-                params![id, key, content, cat, embedding_bytes, now, now, sid],
-            )?;
-            Ok(())
-        })
-        .await?
-    }
-
-    async fn recall(
-        &self,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        // Time-only query: list by time range when no keywords
-        if query.trim().is_empty() {
-            return self
-                .recall_by_time_only(limit, session_id, since, until)
-                .await;
-        }
-
-        // Compute query embedding only when needed (skip for BM25-only mode)
-        let query_embedding = if self.search_mode == SearchMode::Bm25 {
-            None
-        } else {
-            self.get_or_compute_embedding(query).await?
-        };
-
-        let conn = self.conn.clone();
-        let query = query.to_string();
-        let sid = session_id.map(String::from);
-        let since_owned = since.map(String::from);
-        let until_owned = until.map(String::from);
-        let vector_weight = self.vector_weight;
-        let keyword_weight = self.keyword_weight;
-        let search_mode = self.search_mode.clone();
+        let agent_alias = agent_alias.to_string();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
-            let session_ref = sid.as_deref();
-            let since_ref = since_owned.as_deref();
-            let until_ref = until_owned.as_deref();
-
-            // FTS5 BM25 keyword search (skip for embedding-only mode)
-            let keyword_results = if search_mode == SearchMode::Embedding {
-                Vec::new()
-            } else {
-                Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default()
-            };
-
-            // Vector similarity search (skip for BM25-only mode)
-            let vector_results = if search_mode == SearchMode::Bm25 {
-                Vec::new()
-            } else if let Some(ref qe) = query_embedding {
-                Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            // Merge results based on search mode
-            let merged = if vector_results.is_empty() {
-                keyword_results
-                    .iter()
-                    .map(|(id, score)| vector::ScoredResult {
-                        id: id.clone(),
-                        vector_score: None,
-                        keyword_score: Some(*score),
-                        final_score: *score,
-                    })
-                    .collect::<Vec<_>>()
-            } else if keyword_results.is_empty() {
-                vector_results
-                    .iter()
-                    .map(|(id, score)| vector::ScoredResult {
-                        id: id.clone(),
-                        vector_score: Some(*score),
-                        keyword_score: None,
-                        final_score: *score,
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                vector::hybrid_merge(
-                    &vector_results,
-                    &keyword_results,
-                    vector_weight,
-                    keyword_weight,
-                    limit,
-                )
-            };
-
-            // Fetch full entries for merged results in a single query
-            // instead of N round-trips (N+1 pattern).
-            let mut results = Vec::new();
-            if !merged.is_empty() {
-                let placeholders: String = (1..=merged.len())
-                    .map(|i| format!("?{i}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by \
-                     FROM memories WHERE superseded_by IS NULL AND id IN ({placeholders})"
-                );
-                let mut stmt = conn.prepare(&sql)?;
-                let id_params: Vec<Box<dyn rusqlite::types::ToSql>> = merged
-                    .iter()
-                    .map(|s| Box::new(s.id.clone()) as Box<dyn rusqlite::types::ToSql>)
-                    .collect();
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                    id_params.iter().map(AsRef::as_ref).collect();
-                let rows = stmt.query_map(params_ref.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<f64>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                    ))
-                })?;
-
-                let mut entry_map = std::collections::HashMap::new();
-                for row in rows {
-                    let (id, key, content, cat, ts, sid, ns, imp, sup) = row?;
-                    entry_map.insert(id, (key, content, cat, ts, sid, ns, imp, sup));
-                }
-
-                for scored in &merged {
-                    if let Some((key, content, cat, ts, sid, ns, imp, sup)) = entry_map.remove(&scored.id) {
-                        if let Some(s) = since_ref
-                            && ts.as_str() < s {
-                                continue;
-                            }
-                        if let Some(u) = until_ref
-                            && ts.as_str() > u {
-                                continue;
-                            }
-                        let entry = MemoryEntry {
-                            id: scored.id.clone(),
-                            key,
-                            content,
-                            category: Self::str_to_category(&cat),
-                            timestamp: ts,
-                            session_id: sid,
-                            score: Some(f64::from(scored.final_score)),
-                            namespace: ns.unwrap_or_else(|| "default".into()),
-                            importance: imp,
-                            superseded_by: sup,
-                        };
-                        if let Some(filter_sid) = session_ref
-                            && entry.session_id.as_deref() != Some(filter_sid) {
-                                continue;
-                            }
-                        results.push(entry);
-                    }
-                }
-            }
-
-            // If hybrid returned nothing, fall back to LIKE search.
-            if results.is_empty() {
-                const MAX_LIKE_KEYWORDS: usize = 8;
-                let keywords: Vec<String> = query
-                    .split_whitespace()
-                    .take(MAX_LIKE_KEYWORDS)
-                    .map(|w| format!("%{w}%"))
-                    .collect();
-                if !keywords.is_empty() {
-                    let conditions: Vec<String> = keywords
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| {
-                            format!("(content LIKE ?{} OR key LIKE ?{})", i * 2 + 1, i * 2 + 2)
-                        })
-                        .collect();
-                    let where_clause = conditions.join(" OR ");
-                    let mut param_idx = keywords.len() * 2 + 1;
-                    let mut time_conditions = String::new();
-                    if since_ref.is_some() {
-                        let _ = write!(time_conditions, " AND created_at >= ?{param_idx}");
-                        param_idx += 1;
-                    }
-                    if until_ref.is_some() {
-                        let _ = write!(time_conditions, " AND created_at <= ?{param_idx}");
-                        param_idx += 1;
-                    }
-                    let sql = format!(
-                        "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories
-                         WHERE superseded_by IS NULL AND ({where_clause}){time_conditions}
-                         ORDER BY updated_at DESC
-                         LIMIT ?{param_idx}"
-                    );
-                    let mut stmt = conn.prepare(&sql)?;
-                    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-                    for kw in &keywords {
-                        param_values.push(Box::new(kw.clone()));
-                        param_values.push(Box::new(kw.clone()));
-                    }
-                    if let Some(s) = since_ref {
-                        param_values.push(Box::new(s.to_string()));
-                    }
-                    if let Some(u) = until_ref {
-                        param_values.push(Box::new(u.to_string()));
-                    }
-                    #[allow(clippy::cast_possible_wrap)]
-                    param_values.push(Box::new(limit as i64));
-                    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                        param_values.iter().map(AsRef::as_ref).collect();
-                    let rows = stmt.query_map(params_ref.as_slice(), |row| {
-                        Ok(MemoryEntry {
-                            id: row.get(0)?,
-                            key: row.get(1)?,
-                            content: row.get(2)?,
-                            category: Self::str_to_category(&row.get::<_, String>(3)?),
-                            timestamp: row.get(4)?,
-                            session_id: row.get(5)?,
-                            score: Some(1.0),
-                            namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
-                            importance: row.get(7)?,
-                            superseded_by: row.get(8)?,
-                        })
-                    })?;
-                    for row in rows {
-                        let entry = row?;
-                        if let Some(sid) = session_ref
-                            && entry.session_id.as_deref() != Some(sid) {
-                                continue;
-                            }
-                        results.push(entry);
-                    }
-                }
-            }
-
-            results.truncate(limit);
-            Ok(results)
-        })
-        .await?
-    }
-
-    async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-        let conn = self.conn.clone();
-        let key = key.to_string();
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories WHERE key = ?1",
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                 FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
+                 AND m.principal_id IS NULL \
+                 ORDER BY m.created_at ASC",
             )?;
-
-            let mut rows = stmt.query_map(params![key], |row| {
+            let rows = stmt.query_map(params![agent_alias], |row| {
                 Ok(MemoryEntry {
+                    principal_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,
@@ -858,206 +2562,13 @@ impl Memory for SqliteMemory {
                     namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
                     importance: row.get(7)?,
                     superseded_by: row.get(8)?,
+                    kind: Self::decode_kind(row.get(9)?),
+                    pinned: row.get::<_, i64>(10)? != 0,
+                    tenant_id: row.get(13)?,
+                    agent_alias: row.get(11)?,
+                    agent_id: row.get(12)?,
                 })
             })?;
-
-            match rows.next() {
-                Some(Ok(entry)) => Ok(Some(entry)),
-                _ => Ok(None),
-            }
-        })
-        .await?
-    }
-
-    async fn list(
-        &self,
-        category: Option<&MemoryCategory>,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<MemoryEntry>> {
-        const DEFAULT_LIST_LIMIT: i64 = 1000;
-
-        let conn = self.conn.clone();
-        let category = category.cloned();
-        let sid = session_id.map(String::from);
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
-            let session_ref = sid.as_deref();
-            let mut results = Vec::new();
-
-            let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
-                Ok(MemoryEntry {
-                    id: row.get(0)?,
-                    key: row.get(1)?,
-                    content: row.get(2)?,
-                    category: Self::str_to_category(&row.get::<_, String>(3)?),
-                    timestamp: row.get(4)?,
-                    session_id: row.get(5)?,
-                    score: None,
-                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
-                    importance: row.get(7)?,
-                    superseded_by: row.get(8)?,
-                })
-            };
-
-            if let Some(ref cat) = category {
-                let cat_str = Self::category_to_str(cat);
-                let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories
-                     WHERE superseded_by IS NULL AND category = ?1 ORDER BY updated_at DESC LIMIT ?2",
-                )?;
-                let rows = stmt.query_map(params![cat_str, DEFAULT_LIST_LIMIT], row_mapper)?;
-                for row in rows {
-                    let entry = row?;
-                    if let Some(sid) = session_ref
-                        && entry.session_id.as_deref() != Some(sid) {
-                            continue;
-                        }
-                    results.push(entry);
-                }
-            } else {
-                let mut stmt = conn.prepare(
-                    "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by FROM memories
-                     WHERE superseded_by IS NULL ORDER BY updated_at DESC LIMIT ?1",
-                )?;
-                let rows = stmt.query_map(params![DEFAULT_LIST_LIMIT], row_mapper)?;
-                for row in rows {
-                    let entry = row?;
-                    if let Some(sid) = session_ref
-                        && entry.session_id.as_deref() != Some(sid) {
-                            continue;
-                        }
-                    results.push(entry);
-                }
-            }
-
-            Ok(results)
-        })
-        .await?
-    }
-
-    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.clone();
-        let key = key.to_string();
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-            let conn = conn.lock();
-            let affected = conn.execute("DELETE FROM memories WHERE key = ?1", params![key])?;
-            Ok(affected > 0)
-        })
-        .await?
-    }
-
-    async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.clone();
-        let namespace = namespace.to_string();
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let conn = conn.lock();
-            let affected = conn.execute(
-                "DELETE FROM memories WHERE category = ?1",
-                params![namespace],
-            )?;
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            Ok(affected)
-        })
-        .await?
-    }
-
-    async fn purge_session(&self, session_id: &str) -> anyhow::Result<usize> {
-        let conn = self.conn.clone();
-        let session_id = session_id.to_string();
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let conn = conn.lock();
-            let affected = conn.execute(
-                "DELETE FROM memories WHERE session_id = ?1",
-                params![session_id],
-            )?;
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            Ok(affected)
-        })
-        .await?
-    }
-
-    async fn count(&self) -> anyhow::Result<usize> {
-        let conn = self.conn.clone();
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
-            let conn = conn.lock();
-            let count: i64 =
-                conn.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            Ok(count as usize)
-        })
-        .await?
-    }
-
-    async fn health_check(&self) -> bool {
-        let conn = self.conn.clone();
-        tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
-            .await
-            .unwrap_or(false)
-    }
-
-    async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
-        let conn = self.conn.clone();
-        let filter = filter.clone();
-
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
-            let mut sql =
-                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by \
-                 FROM memories WHERE 1=1"
-                    .to_string();
-            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            let mut idx = 1;
-
-            if let Some(ref ns) = filter.namespace {
-                let _ = write!(sql, " AND namespace = ?{idx}");
-                param_values.push(Box::new(ns.clone()));
-                idx += 1;
-            }
-            if let Some(ref sid) = filter.session_id {
-                let _ = write!(sql, " AND session_id = ?{idx}");
-                param_values.push(Box::new(sid.clone()));
-                idx += 1;
-            }
-            if let Some(ref cat) = filter.category {
-                let _ = write!(sql, " AND category = ?{idx}");
-                param_values.push(Box::new(Self::category_to_str(cat)));
-                idx += 1;
-            }
-            if let Some(ref since) = filter.since {
-                let _ = write!(sql, " AND created_at >= ?{idx}");
-                param_values.push(Box::new(since.clone()));
-                idx += 1;
-            }
-            if let Some(ref until) = filter.until {
-                let _ = write!(sql, " AND created_at <= ?{idx}");
-                param_values.push(Box::new(until.clone()));
-                let _ = idx;
-            }
-            sql.push_str(" ORDER BY created_at ASC");
-
-            let mut stmt = conn.prepare(&sql)?;
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                param_values.iter().map(AsRef::as_ref).collect();
-            let rows = stmt.query_map(params_ref.as_slice(), |row| {
-                Ok(MemoryEntry {
-                    id: row.get(0)?,
-                    key: row.get(1)?,
-                    content: row.get(2)?,
-                    category: Self::str_to_category(&row.get::<_, String>(3)?),
-                    timestamp: row.get(4)?,
-                    session_id: row.get(5)?,
-                    score: None,
-                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
-                    importance: row.get(7)?,
-                    superseded_by: row.get(8)?,
-                })
-            })?;
-
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
@@ -1096,40 +2607,196 @@ impl Memory for SqliteMemory {
         namespace: Option<&str>,
         importance: Option<f64>,
     ) -> anyhow::Result<()> {
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+        // Same routing rule as `store`: no agent context at the trait
+        // boundary, so attribute to the default agent through
+        // `store_with_agent`.
+        self.store_row_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            StoreOptions {
+                namespace: namespace.map(str::to_string),
+                importance,
+                ..StoreOptions::default()
+            },
+            None,
+        )
+        .await
+    }
 
+    async fn store_with_options(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+    ) -> anyhow::Result<()> {
+        self.store_row_with_metadata(key, content, category, session_id, options, None)
+            .await
+    }
+
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.store_row_with_metadata(key, content, category, session_id, options, agent_id)
+            .await
+    }
+
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.store_row_with_metadata(
+            key,
+            content,
+            category,
+            session_id,
+            StoreOptions {
+                namespace: namespace.map(str::to_string),
+                importance,
+                ..StoreOptions::default()
+            },
+            agent_id,
+        )
+        .await
+    }
+
+    async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.clone();
-        let key = key.to_string();
-        let content = content.to_string();
-        let sid = session_id.map(String::from);
-        let ns = namespace.unwrap_or("default").to_string();
-        let imp = importance.unwrap_or(0.5);
-
+        let ids = superseded_ids.to_vec();
+        let new_id = new_id.to_string();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let conn = conn.lock();
-            let now = Local::now().to_rfc3339();
-            let cat = Self::category_to_str(&category);
-            let id = Uuid::new_v4().to_string();
-
-            conn.execute(
-                "INSERT INTO memories (id, key, content, category, embedding, created_at, updated_at, session_id, namespace, importance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(key) DO UPDATE SET
-                    content = excluded.content,
-                    category = excluded.category,
-                    embedding = excluded.embedding,
-                    updated_at = excluded.updated_at,
-                    session_id = excluded.session_id,
-                    namespace = excluded.namespace,
-                    importance = excluded.importance",
-                params![id, key, content, cat, embedding_bytes, now, now, sid, ns, imp],
-            )?;
-            Ok(())
+            crate::conflict::mark_superseded(&conn, &ids, &new_id)
         })
         .await?
+    }
+
+    async fn count_in_scope(
+        &self,
+        namespace: Option<&str>,
+        category: Option<&MemoryCategory>,
+    ) -> anyhow::Result<u64> {
+        let conn = self.conn.clone();
+        let namespace = namespace.map(str::to_string);
+        let category = category.map(Self::category_to_str);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let conn = conn.lock();
+            let count = match (namespace, category) {
+                (Some(ns), Some(cat)) => conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND category = ?2 AND superseded_by IS NULL",
+                    params![ns, cat],
+                    |row| row.get::<_, u64>(0),
+                )?,
+                (Some(ns), None) => conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?1 AND superseded_by IS NULL",
+                    params![ns],
+                    |row| row.get::<_, u64>(0),
+                )?,
+                (None, Some(cat)) => conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE category = ?1 AND superseded_by IS NULL",
+                    params![cat],
+                    |row| row.get::<_, u64>(0),
+                )?,
+                (None, None) => conn.query_row(
+                    "SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?,
+            };
+            Ok(count)
+        })
+        .await?
+    }
+
+    async fn stats(&self) -> anyhow::Result<MemoryStats> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryStats> {
+            let conn = conn.lock();
+            let total_rows = conn.query_row("SELECT COUNT(*) FROM memories", [], |row| {
+                row.get::<_, u64>(0)
+            })?;
+            let superseded_rows = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by IS NOT NULL",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let pinned_rows = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE pinned = 1",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let bytes = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM memories",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let mut stmt =
+                conn.prepare("SELECT category, COUNT(*) FROM memories GROUP BY category")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?;
+            let by_category = rows.collect::<Result<Vec<_>, _>>()?;
+            Ok(MemoryStats {
+                total_rows,
+                by_category,
+                superseded_rows,
+                pinned_rows,
+                bytes,
+            })
+        })
+        .await?
+    }
+
+    async fn recall_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        if allowed_agent_ids.is_empty() {
+            return self.recall(query, limit, session_id, since, until).await;
+        }
+
+        let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
+        self.recall_scoped(query, limit, session_id, since, until, Some(allowed))
+            .await
+    }
+
+    async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
+        let conn = self.conn.clone();
+        let alias = alias.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let conn = conn.lock();
+            zeroclaw_config::schema::v2::sqlite_ensure_agent_uuid(&conn, &alias)
+        })
+        .await?
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for SqliteMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Sqlite)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -1140,8 +2807,464 @@ mod tests {
 
     fn temp_sqlite() -> (TempDir, SqliteMemory) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    #[tokio::test]
+    async fn private_plane_is_isolated_per_principal_and_from_legacy() {
+        let (_tmp, mem) = temp_sqlite();
+        // Shared-plane row and two principals' private rows under one key.
+        mem.store("note", "shared", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store_for_principal(
+            &PrincipalScope::new("user:alice"),
+            "note",
+            "alice-private",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store_for_principal(
+            &PrincipalScope::new("user:bob"),
+            "note",
+            "bob-private",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Each principal reads only their own row, under the caller key.
+        let a = mem
+            .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.content, "alice-private");
+        assert_eq!(a.key, "note");
+        assert_eq!(a.principal_id.as_deref(), Some("user:alice"));
+        let b = mem
+            .get_for_principal(&PrincipalScope::new("user:bob"), "note")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.content, "bob-private");
+
+        // The legacy plane never sees private rows...
+        let shared = mem.get("note").await.unwrap().unwrap();
+        assert_eq!(shared.content, "shared");
+        let listed = mem.list(None, None).await.unwrap();
+        assert!(
+            listed.iter().all(|e| e.principal_id.is_none()),
+            "legacy list must exclude private rows: {listed:?}"
+        );
+        let recalled = mem.recall("private", 10, None, None, None).await.unwrap();
+        assert!(
+            recalled.is_empty(),
+            "legacy recall must exclude private rows: {recalled:?}"
+        );
+
+        // ...and private recall sees only the caller's plane.
+        let alices = mem
+            .recall_for_principal(
+                &PrincipalScope::new("user:alice"),
+                "private",
+                10,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(alices.len(), 1);
+        assert_eq!(alices[0].content, "alice-private");
+        let alices = mem
+            .list_for_principal(&PrincipalScope::new("user:alice"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(alices.len(), 1);
+    }
+
+    /// The `UNIQUE (agent_id, key)` constraint knows nothing about planes, so
+    /// both upsert directions are owner-guarded: a shared write can neither
+    /// name a private physical key nor update a private row, and a private
+    /// write never converts a shared row that carries its physical key.
+    #[tokio::test]
+    async fn plane_boundaries_hold_in_both_upsert_directions() {
+        let (_tmp, mem) = temp_sqlite();
+        let alice = PrincipalScope::new("user:alice");
+        mem.store_for_principal(&alice, "note", "alice-private", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Shared plane -> private row: the reserved prefix is refused before
+        // any statement runs, so the private row and its owner are untouched.
+        // The physical key is the exact injective encoding of alice's `note`.
+        let alice_physical = SqliteMemory::principal_physical_key(&alice, "note");
+        assert!(
+            alice_physical.starts_with("p|"),
+            "private keys carry the reserved marker: {alice_physical}"
+        );
+        let err = mem
+            .store(&alice_physical, "hijack", MemoryCategory::Core, None)
+            .await
+            .expect_err("a shared write cannot name a private physical key");
+        assert!(err.to_string().contains("reserved"), "{err}");
+        let row = mem
+            .get_for_principal(&alice, "note")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.content, "alice-private");
+        assert_eq!(row.principal_id.as_deref(), Some("user:alice"));
+
+        // Private plane -> shared row: a shared row that happens to carry the
+        // physical key (planted below the prefix check, as a migration or a
+        // foreign tool could) is never converted; the write is refused. The
+        // planted key is the exact injective encoding of bob's `secret` scope.
+        let bob = PrincipalScope::new("user:bob");
+        let planted_key = SqliteMemory::principal_physical_key(&bob, "secret");
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, created_at, updated_at, \
+                 namespace, importance, agent_id) VALUES ('planted', ?1, \
+                 'shared-planted', 'core', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', \
+                 'default', 0.5, (SELECT id FROM agents WHERE alias = 'default' LIMIT 1))",
+                rusqlite::params![planted_key],
+            )
+            .unwrap();
+        }
+        let err = mem
+            .store_for_principal(&bob, "secret", "bob-private", MemoryCategory::Core, None)
+            .await
+            .expect_err("a private write cannot convert a shared row");
+        assert!(err.to_string().contains("another plane"), "{err}");
+        let planted = mem.get(&planted_key).await.unwrap().unwrap();
+        assert_eq!(planted.content, "shared-planted");
+        assert!(
+            planted.principal_id.is_none(),
+            "the shared row keeps no owner"
+        );
+        assert!(
+            mem.get_for_principal(&bob, "secret")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Ordinary exports and every legacy bulk delete act on the shared plane
+    /// only; private rows leave storage through `export_for_principal` and
+    /// are purged through the owner-carrying forms.
+    #[tokio::test]
+    async fn private_rows_never_leave_through_shared_export_or_purge() {
+        let (_tmp, mem) = temp_sqlite();
+        let alice = PrincipalScope::new("user:alice");
+        let bob = PrincipalScope::new("user:bob");
+        mem.store("shared-note", "shared", MemoryCategory::Core, Some("s1"))
+            .await
+            .unwrap();
+        mem.store_for_principal(
+            &alice,
+            "note",
+            "alice-core",
+            MemoryCategory::Core,
+            Some("s1"),
+        )
+        .await
+        .unwrap();
+        mem.store_for_principal(&bob, "note", "bob-core", MemoryCategory::Core, Some("s1"))
+            .await
+            .unwrap();
+
+        let exported = mem.export(&ExportFilter::default()).await.unwrap();
+        assert!(
+            exported.iter().all(|e| e.principal_id.is_none()),
+            "ordinary export must not carry private rows: {exported:?}"
+        );
+        assert_eq!(exported.len(), 1);
+        let by_agent = mem.export_agent("default").await.unwrap();
+        assert!(by_agent.iter().all(|e| e.principal_id.is_none()));
+        let alices = mem
+            .export_for_principal(&alice, &ExportFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(alices.len(), 1);
+        assert_eq!(alices[0].key, "note");
+        assert_eq!(alices[0].principal_id.as_deref(), Some("user:alice"));
+
+        // Legacy bulk deletes touch only the shared row.
+        assert_eq!(mem.purge_session("s1").await.unwrap(), 1);
+        assert!(mem.get("shared-note").await.unwrap().is_none());
+        assert!(
+            mem.get_for_principal(&alice, "note")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(mem.get_for_principal(&bob, "note").await.unwrap().is_some());
+        assert_eq!(mem.purge_namespace("default").await.unwrap(), 0);
+        assert_eq!(mem.purge_agent("default").await.unwrap(), 0);
+        assert_eq!(mem.count_for_principal(&alice).await.unwrap(), 1);
+
+        // The owner-carrying purge removes exactly that owner's rows.
+        assert_eq!(
+            mem.purge_session_for_principal(&alice, "s1").await.unwrap(),
+            1
+        );
+        assert!(
+            mem.get_for_principal(&alice, "note")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(mem.get_for_principal(&bob, "note").await.unwrap().is_some());
+    }
+
+    /// The scope composes agent, namespace and tenant with the owner.
+    #[tokio::test]
+    async fn private_scope_composes_agent_namespace_and_tenant() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.ensure_agent_uuid("ops").await.unwrap();
+        let on_default = PrincipalScope::new("user:alice");
+        let on_ops = PrincipalScope::new("user:alice").with_agent(Some("ops".into()));
+        let in_ns = PrincipalScope::new("user:alice").with_namespace(Some("project-x".into()));
+        let for_tenant = PrincipalScope::new("user:alice").with_tenant(Some("acme".into()));
+        for (scope, content) in [
+            (&on_default, "default-agent"),
+            (&on_ops, "ops-agent"),
+            (&in_ns, "project-x"),
+            (&for_tenant, "acme"),
+        ] {
+            mem.store_for_principal(scope, "plan", content, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        for (scope, content) in [
+            (&on_default, "default-agent"),
+            (&on_ops, "ops-agent"),
+            (&in_ns, "project-x"),
+            (&for_tenant, "acme"),
+        ] {
+            assert_eq!(
+                mem.get_for_principal(scope, "plan")
+                    .await
+                    .unwrap()
+                    .map(|e| e.content),
+                Some(content.to_string()),
+                "each scope reads its own row"
+            );
+            assert_eq!(mem.count_for_principal(scope).await.unwrap(), 1);
+        }
+        // Category filtering happens in storage and normalises spellings.
+        mem.store_for_principal(&on_default, "diary", "today", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        let cores = mem
+            .list_for_principal(
+                &on_default,
+                Some(&MemoryCategory::Custom("core".into())),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cores.len(), 1, "`core` names the Core category: {cores:?}");
+        assert_eq!(cores[0].key, "plan");
+    }
+
+    #[tokio::test]
+    async fn private_forget_is_an_atomic_ownership_predicate() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("note", "shared", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store_for_principal(
+            &PrincipalScope::new("user:alice"),
+            "note",
+            "alice-private",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Bob cannot delete Alice's row; the shared row is untouchable
+        // through the private path and private rows untouchable through
+        // the legacy path.
+        assert!(
+            !mem.forget_for_principal(&PrincipalScope::new("user:bob"), "note")
+                .await
+                .unwrap()
+        );
+        assert!(
+            mem.get_for_principal(&PrincipalScope::new("user:alice"), "note")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            mem.forget("note").await.unwrap(),
+            "legacy forget takes the shared row"
+        );
+        assert!(
+            mem.get_for_principal(&PrincipalScope::new("user:alice"), "note")
+                .await
+                .unwrap()
+                .is_some(),
+            "the private row survives a legacy bare-key delete"
+        );
+        assert!(
+            mem.forget_for_principal(&PrincipalScope::new("user:alice"), "note")
+                .await
+                .unwrap()
+        );
+        assert!(
+            mem.get_for_principal(&PrincipalScope::new("user:alice"), "note")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn private_store_upserts_within_one_principal() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store_for_principal(
+            &PrincipalScope::new("user:alice"),
+            "note",
+            "v1",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store_for_principal(
+            &PrincipalScope::new("user:alice"),
+            "note",
+            "v2",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        let a = mem
+            .get_for_principal(&PrincipalScope::new("user:alice"), "note")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.content, "v2", "same-principal same-key store upserts");
+        let listed = mem
+            .list_for_principal(&PrincipalScope::new("user:alice"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    /// The physical key is an injective encoding of the full scope, so inputs
+    /// that a naive colon-join would collide are kept as independent rows:
+    /// reads, exports and deletes act on exactly one of them. Also asserts an
+    /// absent tenant (`None`) is distinct from an empty one (`Some("")`).
+    #[tokio::test]
+    async fn private_keys_are_unambiguous_across_scope_dimensions() {
+        let (_tmp, mem) = temp_sqlite();
+        let owner = "user:alice";
+
+        // A naive `p:{owner}:{ns}:{tenant}:{key}` join collides these two:
+        //   ns="a", tenant="b",  key="k"      -> p:user:alice:a:b:k
+        //   ns="a", tenant="",   key="b:k"    -> p:user:alice:a::b:k  (close)
+        //   ns="a:b", tenant="", key="k"      -> p:user:alice:a:b::k
+        // The cleanest witness: a colon in the namespace vs. a colon in the
+        // key. Under length-prefixed encoding these are provably distinct.
+        let scope_a = PrincipalScope::new(owner)
+            .with_namespace(Some("a:b".to_string()))
+            .with_tenant(None);
+        let scope_b = PrincipalScope::new(owner)
+            .with_namespace(Some("a".to_string()))
+            .with_tenant(None);
+
+        mem.store_for_principal(&scope_a, "k", "content-A", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store_for_principal(&scope_b, "b:k", "content-B", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Distinct physical keys — no silent overwrite.
+        assert_ne!(
+            SqliteMemory::principal_physical_key(&scope_a, "k"),
+            SqliteMemory::principal_physical_key(&scope_b, "b:k"),
+            "colon-bearing namespace/key must not collapse to one physical key"
+        );
+
+        // Independent reads.
+        let a = mem.get_for_principal(&scope_a, "k").await.unwrap().unwrap();
+        let b = mem
+            .get_for_principal(&scope_b, "b:k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.content, "content-A");
+        assert_eq!(b.content, "content-B");
+
+        // Deleting one leaves the other intact.
+        mem.forget_for_principal(&scope_a, "k").await.unwrap();
+        assert!(
+            mem.get_for_principal(&scope_a, "k")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let still_b = mem
+            .get_for_principal(&scope_b, "b:k")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_b.content, "content-B", "the sibling row survives");
+
+        // Absent tenant is distinct from an empty tenant.
+        let none_tenant = PrincipalScope::new(owner)
+            .with_namespace(Some("n".to_string()))
+            .with_tenant(None);
+        let empty_tenant = PrincipalScope::new(owner)
+            .with_namespace(Some("n".to_string()))
+            .with_tenant(Some(String::new()));
+        assert_ne!(
+            SqliteMemory::principal_physical_key(&none_tenant, "t"),
+            SqliteMemory::principal_physical_key(&empty_tenant, "t"),
+            "None tenant and Some(\"\") tenant must not collide"
+        );
+        mem.store_for_principal(&none_tenant, "t", "no-tenant", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store_for_principal(
+            &empty_tenant,
+            "t",
+            "empty-tenant",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mem.get_for_principal(&none_tenant, "t")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            "no-tenant"
+        );
+        assert_eq!(
+            mem.get_for_principal(&empty_tenant, "t")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            "empty-tenant"
+        );
     }
 
     #[tokio::test]
@@ -1211,6 +3334,214 @@ mod tests {
                 .iter()
                 .all(|r| r.content.to_lowercase().contains("rust"))
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_recall_for_agents_does_not_lose_allowed_rows_behind_disallowed_matches() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        let rogue = mem.ensure_agent_uuid("rogue").await.unwrap();
+
+        for idx in 0..12 {
+            mem.store_with_agent(
+                &format!("rogue-{idx}"),
+                "needle disallowed row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&rogue),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store_with_agent(
+            "alpha-allowed",
+            "needle allowed row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&alpha),
+        )
+        .await
+        .unwrap();
+
+        let results = mem
+            .recall_for_agents(&[alpha.as_str()], "needle", 1, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "alpha-allowed");
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_agent_deletes_only_that_agents_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        let rogue = mem.ensure_agent_uuid("rogue").await.unwrap();
+
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+        for idx in 0..2 {
+            mem.store_with_agent(
+                &format!("rogue-{idx}"),
+                "rogue row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&rogue),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(mem.count().await.unwrap(), 5);
+
+        // Purge by ALIAS (not UUID). The regression: purge_agent bound the
+        // alias straight into the agent_id column, matched zero rows, and
+        // returned Ok(0) — so deleting an agent silently kept its memories.
+        // The fix resolves alias → id and must delete exactly alpha's rows.
+        let purged = mem.purge_agent("alpha").await.unwrap();
+        assert_eq!(purged, 3, "purge_agent must delete exactly alpha's rows");
+        assert_eq!(mem.count().await.unwrap(), 2, "rogue's rows must survive");
+
+        // Unknown alias → NULL id subselect → deletes nothing, returns 0.
+        let purged_ghost = mem.purge_agent("ghost").await.unwrap();
+        assert_eq!(purged_ghost, 0);
+        assert_eq!(mem.count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rename_agent_repoints_rows_under_new_alias() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Rename alpha → beta: memory rows ride the UUID, so this updates exactly
+        // one `agents` row and the rows now resolve under the new alias.
+        let renamed = mem.rename_agent("alpha", "beta").await.unwrap();
+        assert_eq!(renamed, 1, "exactly one agents row re-aliased");
+
+        // The rows now resolve under `beta`, and `alpha` resolves to nothing.
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 3);
+        assert_eq!(mem.export_agent("alpha").await.unwrap().len(), 0);
+        assert_eq!(mem.count().await.unwrap(), 3, "no rows lost on rename");
+
+        // Unknown source → nothing updated.
+        assert_eq!(mem.rename_agent("ghost", "phantom").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rename_agent_reclaims_orphan_and_refuses_live_collision() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        mem.store_with_agent(
+            "a-0",
+            "alpha row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&alpha),
+        )
+        .await
+        .unwrap();
+
+        // Simulate a prior delete of `beta`: its memories were purged but the
+        // agents row survives (delete never removes it) — an orphan in the
+        // UNIQUE alias slot. A bare UPDATE alpha→beta would hit the constraint.
+        let _beta = mem.ensure_agent_uuid("beta").await.unwrap();
+        assert_eq!(mem.purge_agent("beta").await.unwrap(), 0); // no memories anyway
+        // Rename succeeds: the orphan `beta` row is dropped, alpha→beta proceeds.
+        assert_eq!(mem.rename_agent("alpha", "beta").await.unwrap(), 1);
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 1);
+        assert_eq!(mem.export_agent("alpha").await.unwrap().len(), 0);
+
+        // Now `beta` has a live memory. Renaming another agent ONTO it must
+        // refuse (we won't silently merge two agents' memories).
+        let gamma = mem.ensure_agent_uuid("gamma").await.unwrap();
+        mem.store_with_agent(
+            "g-0",
+            "gamma row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&gamma),
+        )
+        .await
+        .unwrap();
+        let err = mem.rename_agent("gamma", "beta").await.unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to merge"),
+            "expected merge-refusal, got: {err}"
+        );
+        // Nothing changed: both still resolve under their own aliases.
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 1);
+        assert_eq!(mem.export_agent("gamma").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_export_agent_returns_only_that_agents_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        let rogue = mem.ensure_agent_uuid("rogue").await.unwrap();
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store_with_agent(
+            "rogue-0",
+            "rogue row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&rogue),
+        )
+        .await
+        .unwrap();
+
+        let exported = mem.export_agent("alpha").await.unwrap();
+        assert_eq!(exported.len(), 3, "export only alpha's rows");
+        assert!(exported.iter().all(|e| e.key.starts_with("alpha-")));
+        assert_eq!(mem.export_agent("rogue").await.unwrap().len(), 1);
+        assert!(mem.export_agent("ghost").await.unwrap().is_empty());
+        // export does NOT delete.
+        assert_eq!(mem.count().await.unwrap(), 4);
     }
 
     #[tokio::test]
@@ -1316,14 +3647,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store("persist", "I survive restarts", MemoryCategory::Core, None)
                 .await
                 .unwrap();
         }
 
         // Reopen
-        let mem2 = SqliteMemory::new(tmp.path()).unwrap();
+        let mem2 = SqliteMemory::new("test", tmp.path()).unwrap();
         let entry = mem2.get("persist").await.unwrap();
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "I survive restarts");
@@ -1434,6 +3765,22 @@ mod tests {
         let results = mem.recall("   ", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "a");
+    }
+
+    #[tokio::test]
+    async fn recall_star_query_returns_recent_entries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "first memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "second memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem.recall("*", 10, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|entry| entry.key == "a"));
+        assert!(results.iter().any(|entry| entry.key == "b"));
     }
 
     // ── Embedding cache tests ────────────────────────────────────
@@ -1585,6 +3932,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
         let mem = SqliteMemory::with_embedder(
+            "test",
             tmp.path(),
             embedder,
             0.7,
@@ -1604,6 +3952,7 @@ mod tests {
     async fn open_with_timeout_store_recall_unchanged() {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::with_embedder(
+            "test",
             tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
@@ -1625,6 +3974,599 @@ mod tests {
         assert_eq!(entry.content, "value with timeout");
     }
 
+    // ── Graceful degrade on embedding failure ────────────────────
+
+    /// Embedder that advertises a real dimension but always fails to embed,
+    /// simulating a provider 404/401/outage (e.g. a wrong or revoked embedding
+    /// key — exactly the live failure that silently dropped 6 days of writes).
+    struct FailingEmbedding;
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for FailingEmbedding {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn dimensions(&self) -> usize {
+            1536
+        }
+        async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("Embedding API error 404 Not Found — \"Requested entity was not found.\"")
+        }
+    }
+
+    #[tokio::test]
+    async fn store_degrades_gracefully_when_embedding_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+
+        // A failing embedder must NOT cost us the write. The row has to persist
+        // with a NULL vector rather than the whole store aborting — that abort
+        // was the data-loss bug. `reindex` can backfill the vector later.
+        mem.store(
+            "survives",
+            "this content must be retained",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .expect("store must succeed even when the embedder fails");
+
+        assert_eq!(mem.count().await.unwrap(), 1, "row must be persisted");
+        let entry = mem.get("survives").await.unwrap().unwrap();
+        assert_eq!(entry.content, "this content must be retained");
+    }
+
+    // ── Embedder hot-swap────────────────────────────────
+
+    /// A working embedder double that returns a fixed-length vector (each
+    /// element = `fill`, so the source embedder is identifiable) and counts its
+    /// embed calls — makes a swap observable on the real read path, network-free.
+    struct StubEmbedding {
+        dims: usize,
+        fill: f32,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StubEmbedding {
+        fn new(dims: usize, fill: f32) -> Self {
+            Self {
+                dims,
+                fill,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for StubEmbedding {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls
+                .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![self.fill; self.dims]).collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_embedder_takes_effect_on_live_handle() {
+        let (_tmp, mem) = temp_sqlite(); // constructed with NoopEmbedding (dims 0)
+
+        assert!(
+            mem.get_or_compute_embedding("hello")
+                .await
+                .unwrap()
+                .is_none(),
+            "Noop embedder must short-circuit to no vector"
+        );
+
+        mem.swap_embedder(Arc::new(StubEmbedding::new(4, 0.1)));
+
+        let embedding = mem
+            .get_or_compute_embedding("hello")
+            .await
+            .unwrap()
+            .expect("swapped-in embedder must now produce a vector");
+        assert_eq!(embedding.len(), 4, "vector must come from the new embedder");
+    }
+
+    #[tokio::test]
+    async fn swap_embedder_invalidates_stale_embedding_cache() {
+        let tmp = TempDir::new().unwrap();
+        let first = Arc::new(StubEmbedding::new(4, 0.1));
+        let first_calls = Arc::clone(&first.calls);
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            first,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+
+        // Prime the cache with the first provider's vector.
+        let v1 = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(v1.unwrap(), vec![0.1_f32; 4]);
+        // Second call for identical content is served from cache (no new embed).
+        let _ = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(
+            first_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "identical content must hit the cache, not re-embed"
+        );
+
+        // Swap to a different provider (distinct fill so its output is unique).
+        let second = Arc::new(StubEmbedding::new(4, 0.9));
+        let second_calls = Arc::clone(&second.calls);
+        mem.swap_embedder(second);
+
+        // Same content again: must re-embed through the NEW provider, not return
+        // the stale cached 0.1 vector.
+        let v2 = mem.get_or_compute_embedding("same text").await.unwrap();
+        assert_eq!(
+            v2.unwrap(),
+            vec![0.9_f32; 4],
+            "post-swap embed must use the new provider, not the stale cache"
+        );
+        assert_eq!(
+            second_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cache must have been invalidated so the new provider is called"
+        );
+    }
+
+    #[test]
+    fn refresh_embedder_rebuilds_from_resolved_settings() {
+        let (_tmp, mem) = temp_sqlite(); // NoopEmbedding, dims 0
+        assert_eq!(mem.embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &mem,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            mem.embedder_dimensions(),
+            1536,
+            "refresh_embedder must install the resolved provider's embedder"
+        );
+    }
+
+    // --- Durable-global recall across sessions (vector scope) ---
+
+    /// Marker token routed to its own embedding axis by [`KeyedEmbedding`].
+    const KEYED_MARKER: &str = "orbital";
+
+    /// Deterministic content-keyed embedder: texts containing
+    /// [`KEYED_MARKER`] map to one axis, everything else to an orthogonal
+    /// axis, so vector-stage relevance is controllable without a network.
+    struct KeyedEmbedding;
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for KeyedEmbedding {
+        fn name(&self) -> &str {
+            "keyed"
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if text.contains(KEYED_MARKER) {
+                        vec![1.0, 0.0, 0.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0, 0.0, 0.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn temp_sqlite_keyed() -> (TempDir, SqliteMemory) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(KeyedEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        (tmp, mem)
+    }
+
+    /// Deterministic test embedder for a keyword-only result alongside an
+    /// unrelated weak vector-only result.
+    struct MissingModalityEmbedding;
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for MissingModalityEmbedding {
+        fn name(&self) -> &str {
+            "missing-modality"
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    if *text == "needle query-axis" {
+                        vec![1.0, 0.0]
+                    } else if text.contains("weak-vector") {
+                        vec![0.1, 0.994_987_4]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn temp_sqlite_missing_modality() -> (TempDir, SqliteMemory) {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(MissingModalityEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        (tmp, mem)
+    }
+
+    /// Repro shape from the 2026-07-09 injection-scope finding: with
+    /// embeddings live, a session-scoped recall (what per-turn injection
+    /// issues) must surface a global core fact written outside the session,
+    /// while other sessions' bound rows stay excluded.
+    #[tokio::test]
+    async fn session_scoped_recall_includes_durable_global_rows_when_vector_live() {
+        let (_tmp, mem) = temp_sqlite_keyed();
+        mem.store(
+            "vault_fact",
+            "the orbital vault passphrase is quokka-vellum",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "daily_note",
+            "orbital vault rotation happens daily",
+            MemoryCategory::Daily,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "other_chat",
+            "we discussed the orbital vault in another chat",
+            MemoryCategory::Conversation,
+            Some("other-session"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "bound_core",
+            "orbital vault detail bound to its origin session",
+            MemoryCategory::Core,
+            Some("other-session"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "custom_global",
+            "orbital vault note in a custom bucket",
+            MemoryCategory::Custom("notes".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "this_chat",
+            "current chat about the orbital vault",
+            MemoryCategory::Conversation,
+            Some("sess-1"),
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("orbital vault", 10, Some("sess-1"), None, None)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = hits.iter().map(|e| e.key.as_str()).collect();
+        assert!(
+            keys.contains(&"vault_fact"),
+            "global core row must reach session-scoped vector recall, got {keys:?}"
+        );
+        assert!(
+            keys.contains(&"daily_note"),
+            "global daily row must reach session-scoped vector recall, got {keys:?}"
+        );
+        assert!(
+            keys.contains(&"this_chat"),
+            "current-session rows must keep working, got {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"other_chat"),
+            "other sessions' conversation rows must stay excluded, got {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"bound_core"),
+            "session-bound core rows must stay session-scoped, got {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"custom_global"),
+            "custom categories are outside the durable-global carve-out, got {keys:?}"
+        );
+    }
+
+    /// The vector stage's SQL predicate itself: a session filter admits
+    /// session-NULL core/daily rows and nothing else beyond the session.
+    #[tokio::test]
+    async fn vector_search_session_filter_admits_durable_global_rows_only() {
+        let (_tmp, mem) = temp_sqlite_keyed();
+        for (key, category, session) in [
+            ("global_core", MemoryCategory::Core, None),
+            ("global_daily", MemoryCategory::Daily, None),
+            ("bound_core", MemoryCategory::Core, Some("other-session")),
+            ("session_row", MemoryCategory::Conversation, Some("sess-1")),
+            (
+                "global_custom",
+                MemoryCategory::Custom("notes".into()),
+                None,
+            ),
+        ] {
+            mem.store(key, "orbital telemetry", category, session)
+                .await
+                .unwrap();
+        }
+        let mut id_to_key = std::collections::HashMap::new();
+        for key in [
+            "global_core",
+            "global_daily",
+            "bound_core",
+            "session_row",
+            "global_custom",
+        ] {
+            let entry = mem.get(key).await.unwrap().unwrap();
+            id_to_key.insert(entry.id, key);
+        }
+        let query_embedding = mem
+            .get_or_compute_embedding("orbital telemetry")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let conn = mem.conn.lock();
+        let hits =
+            SqliteMemory::vector_search(&conn, &query_embedding, 10, None, Some("sess-1")).unwrap();
+        let mut keys: Vec<&str> = hits
+            .iter()
+            .map(|(id, _)| *id_to_key.get(id).unwrap())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["global_core", "global_daily", "session_row"],
+            "session filter must admit exactly the session's rows plus session-NULL core/daily"
+        );
+    }
+
+    /// With the stock Noop embedder (vector stage never runs), session-scoped
+    /// recall keeps the strict legacy filter (global core rows stay out) and
+    /// batch-max normalizes keyword scores onto [0, 1] so downstream relevance
+    /// thresholding and the injection rerank stage see one calibrated scale.
+    #[tokio::test]
+    async fn noop_embedder_session_recall_keeps_strict_filter_and_normalizes_scores() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "vault_fact",
+            "the orbital vault passphrase is quokka-vellum",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "this_chat",
+            "current chat about the orbital vault",
+            MemoryCategory::Conversation,
+            Some("sess-1"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "this_chat_2",
+            "second orbital note: the vault door code rotated again in the orbital bay",
+            MemoryCategory::Conversation,
+            Some("sess-1"),
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("orbital vault", 10, Some("sess-1"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "strict session filter must hold on the BM25-only path"
+        );
+        let mut keys: Vec<&str> = hits.iter().map(|e| e.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["this_chat", "this_chat_2"]);
+
+        // Multi-entry normalization: BM25-only scores are batch-max normalized
+        // onto [0, 1] (dividing each raw negated BM25 by the batch maximum) so
+        // downstream relevance thresholding and the injection rerank stage see
+        // one calibrated scale. The recall FTS batch and the probe below both
+        // request limit*2 = 20, so they share the batch maximum.
+        let raw = {
+            let conn = mem.conn.lock();
+            SqliteMemory::fts5_search(&conn, "orbital vault", 20).unwrap()
+        };
+        assert!(
+            hits.len() > 1,
+            "normalization assertion needs multiple surviving entries"
+        );
+        let max_raw = raw.iter().map(|(_, score)| *score).fold(0.0_f32, f32::max);
+        assert!(
+            max_raw > 0.0,
+            "the batch maximum BM25 magnitude must be positive"
+        );
+        for hit in &hits {
+            let (_, raw_score) = raw
+                .iter()
+                .find(|(id, _)| *id == hit.id)
+                .expect("recalled row must come from the FTS stage");
+            let got = hit.score.expect("BM25-only recall carries a score");
+            let expected = f64::from(*raw_score / max_raw);
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "BM25-only scores are batch-max normalized for {}: got {got}, expected {expected}",
+                hit.key
+            );
+            assert!(
+                (0.0..=1.0).contains(&got),
+                "normalized score is within [0, 1] for {}: {got}",
+                hit.key
+            );
+        }
+    }
+
+    /// Threshold-scale seam: when the vector stage is live but returns
+    /// nothing (query vector orthogonal to every stored row), FTS-only
+    /// survivors must be scored on the [0, 1] axis the downstream
+    /// cosine-tuned relevance floor expects, not raw BM25.
+    #[tokio::test]
+    async fn fts_only_survivors_are_normalized_when_vector_stage_is_live() {
+        let (_tmp, mem) = temp_sqlite_keyed();
+        // No KEYED_MARKER in the stored rows: their embeddings sit on the
+        // other axis, so cosine similarity with the query is 0 and the
+        // vector stage yields nothing.
+        mem.store(
+            "kw_one",
+            "vault passphrase quokka vellum",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "kw_two",
+            "vault door maintenance log",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("orbital vault passphrase", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "both rows must survive via the keyword stage"
+        );
+        let top = hits
+            .iter()
+            .map(|e| e.score.unwrap())
+            .fold(f64::MIN, f64::max);
+        assert!(
+            (top - 1.0).abs() < 1e-6,
+            "best FTS-only survivor must map to 1.0 on the unit axis, got {top}"
+        );
+        assert!(
+            hits.iter().all(|e| (0.0..=1.0).contains(&e.score.unwrap())),
+            "normalized keyword scores must stay on the [0, 1] axis"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyword_only_score_survives_a_weak_vector_only_candidate() {
+        let (_tmp, mem) = temp_sqlite_missing_modality();
+        mem.store(
+            "exact_keyword",
+            "needle exact-keyword",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let without_vector = mem
+            .recall("needle query-axis", 10, None, None, None)
+            .await
+            .unwrap();
+        let baseline = without_vector
+            .iter()
+            .find(|entry| entry.key == "exact_keyword")
+            .and_then(|entry| entry.score)
+            .expect("the FTS candidate must be recalled without vector candidates");
+        assert!((baseline - 1.0).abs() < 1e-6);
+
+        mem.store(
+            "weak_vector",
+            "weak-vector semantic-only",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let with_vector = mem
+            .recall("needle query-axis", 10, None, None, None)
+            .await
+            .unwrap();
+        let score = with_vector
+            .iter()
+            .find(|entry| entry.key == "exact_keyword")
+            .and_then(|entry| entry.score)
+            .expect("the FTS candidate must survive alongside a weak vector candidate");
+        assert!(
+            (score - baseline).abs() < 1e-6,
+            "a missing vector modality must not reduce an FTS-only score: baseline={baseline}, with_vector={score}"
+        );
+        assert!(
+            score >= 0.4,
+            "the FTS-only candidate must remain above the default relevance floor, got {score}"
+        );
+    }
+
     // ── With-embedder constructor test ───────────────────────────
 
     #[test]
@@ -1632,6 +4574,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
         let mem = SqliteMemory::with_embedder(
+            "test",
             tmp.path(),
             embedder,
             0.7,
@@ -1663,6 +4606,133 @@ mod tests {
         // FTS should still work after rebuild
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    // ── Embedding identity primitives──────────────
+
+    /// Embedder that returns a fixed vector, so store() persists real
+    /// (non-NULL) embeddings and populates the embedding cache.
+    struct FixedEmbedding(usize);
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for FixedEmbedding {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        fn dimensions(&self) -> usize {
+            self.0
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![0.5f32; self.0]).collect())
+        }
+    }
+
+    fn identity(
+        provider: &str,
+        model: &str,
+        dimensions: usize,
+    ) -> super::super::embeddings::EmbeddingIdentity {
+        super::super::embeddings::EmbeddingIdentity {
+            provider: provider.into(),
+            model: model.into(),
+            dimensions,
+        }
+    }
+
+    fn count_scalar(mem: &SqliteMemory, sql: &str) -> i64 {
+        let conn = mem.connection().lock();
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn embedding_identity_roundtrip() {
+        let (_tmp, mem) = temp_sqlite();
+        // A fresh store (and any store predating identity tracking) has none.
+        assert_eq!(mem.stored_embedding_identity().unwrap(), None);
+
+        let id = identity("openai", "text-embedding-3-small", 1536);
+        mem.record_embedding_identity(&id).unwrap();
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(id));
+    }
+
+    #[test]
+    fn embedding_identity_partial_rows_read_as_absent() {
+        let (_tmp, mem) = temp_sqlite();
+        {
+            let conn = mem.connection().lock();
+            conn.execute(
+                "INSERT INTO memory_meta (key, value) VALUES ('embedding_model', 'orphan')",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(mem.stored_embedding_identity().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn invalidate_nulls_vectors_clears_cache_and_stamps_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FixedEmbedding(4)),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+        mem.record_embedding_identity(&identity("openai", "old-model", 4))
+            .unwrap();
+
+        mem.store("a", "alpha content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "beta content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            2
+        );
+        assert_eq!(
+            count_scalar(&mem, "SELECT COUNT(*) FROM embedding_cache"),
+            2
+        );
+
+        let new_id = identity("openai", "new-model", 4);
+        let invalidated = mem
+            .invalidate_embeddings_for_identity_change(&new_id)
+            .unwrap();
+
+        assert_eq!(invalidated, 2);
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            0
+        );
+        assert_eq!(
+            count_scalar(&mem, "SELECT COUNT(*) FROM embedding_cache"),
+            0
+        );
+        assert_eq!(mem.stored_embedding_identity().unwrap(), Some(new_id));
+
+        // Content is retained, so the existing reindex path re-embeds losslessly.
+        let reembedded = mem.reindex().await.unwrap();
+        assert_eq!(reembedded, 2);
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL"
+            ),
+            2
+        );
     }
 
     // ── Recall limit test ────────────────────────────────────────
@@ -1724,8 +4794,91 @@ mod tests {
         mem.store("a1", "wildcard test content", MemoryCategory::Core, None)
             .await
             .unwrap();
+        mem.store("b1", "unrelated recent content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
         let results = mem.recall("wild*", 10, None, None, None).await.unwrap();
-        assert!(results.len() <= 10);
+        assert!(results.iter().any(|entry| entry.key == "a1"));
+        assert!(results.iter().all(|entry| entry.key != "b1"));
+    }
+
+    #[tokio::test]
+    async fn recall_prefix_wildcard_like_fallback_keeps_token_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+        mem.store("a1", "fallback wildcard token", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b1", "fallback unwild token", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem.recall("wild*", 10, None, None, None).await.unwrap();
+        assert!(results.iter().any(|entry| entry.key == "a1"));
+        assert!(results.iter().all(|entry| entry.key != "b1"));
+    }
+
+    #[tokio::test]
+    async fn recall_prefix_wildcard_like_fallback_overfetches_filtered_rows() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+        mem.store(
+            "real",
+            "fallback wildcard token",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        for i in 0..3 {
+            mem.store(
+                &format!("noise{i}"),
+                "fallback unwild token",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let conn = mem.conn.lock();
+            conn.execute(
+                "UPDATE memories SET updated_at = ?1 WHERE key = ?2",
+                rusqlite::params!["2026-05-03T00:00:00Z", "real"],
+            )
+            .unwrap();
+            for i in 0..3 {
+                conn.execute(
+                    "UPDATE memories SET updated_at = ?1 WHERE key = ?2",
+                    rusqlite::params![format!("2026-05-03T00:00:0{}Z", i + 1), format!("noise{i}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let results = mem.recall("wild*", 1, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "real");
     }
 
     #[tokio::test]
@@ -1888,13 +5041,13 @@ mod tests {
     async fn schema_idempotent_reopen() {
         let tmp = TempDir::new().unwrap();
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store("k1", "v1", MemoryCategory::Core, None)
                 .await
                 .unwrap();
         }
         // Open again — init_schema runs again on existing DB
-        let mem2 = SqliteMemory::new(tmp.path()).unwrap();
+        let mem2 = SqliteMemory::new("test", tmp.path()).unwrap();
         let entry = mem2.get("k1").await.unwrap();
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().content, "v1");
@@ -1908,9 +5061,9 @@ mod tests {
     #[tokio::test]
     async fn schema_triple_open() {
         let tmp = TempDir::new().unwrap();
-        let _m1 = SqliteMemory::new(tmp.path()).unwrap();
-        let _m2 = SqliteMemory::new(tmp.path()).unwrap();
-        let m3 = SqliteMemory::new(tmp.path()).unwrap();
+        let _m1 = SqliteMemory::new("test", tmp.path()).unwrap();
+        let _m2 = SqliteMemory::new("test", tmp.path()).unwrap();
+        let m3 = SqliteMemory::new("test", tmp.path()).unwrap();
         assert!(m3.health_check().await);
     }
 
@@ -2063,67 +5216,26 @@ mod tests {
     // ── Bulk deletion tests ───────────────────────────────────────
 
     #[tokio::test]
-    async fn sqlite_purge_namespace_removes_all_matching_entries() {
+    async fn sqlite_purge_namespace_deletes_only_all_matching_entries() {
         let (_tmp, mem) = temp_sqlite();
-        mem.store("a1", "data1", MemoryCategory::Custom("ns1".into()), None)
+
+        mem.store_with_metadata("a", "data", MemoryCategory::Core, None, Some("ns1"), None)
             .await
             .unwrap();
-        mem.store("a2", "data2", MemoryCategory::Custom("ns1".into()), None)
-            .await
-            .unwrap();
-        mem.store("b1", "data3", MemoryCategory::Custom("ns2".into()), None)
+        mem.store_with_metadata("b", "data", MemoryCategory::Core, None, Some("ns2"), None)
             .await
             .unwrap();
 
-        let count = mem.purge_namespace("ns1").await.unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(mem.count().await.unwrap(), 1);
-    }
+        let in_ns1 =
+            |entries: &[MemoryEntry]| entries.iter().filter(|e| e.namespace == "ns1").count();
 
-    #[tokio::test]
-    async fn sqlite_purge_namespace_preserves_other_namespaces() {
-        let (_tmp, mem) = temp_sqlite();
-        mem.store("a1", "data1", MemoryCategory::Custom("ns1".into()), None)
-            .await
-            .unwrap();
-        mem.store("b1", "data2", MemoryCategory::Custom("ns2".into()), None)
-            .await
-            .unwrap();
-        mem.store("c1", "data3", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-        mem.store("d1", "data4", MemoryCategory::Daily, None)
-            .await
-            .unwrap();
+        let before = mem.list(None, None).await.unwrap();
+        let deleted = mem.purge_namespace("ns1").await.unwrap();
+        let after = mem.list(None, None).await.unwrap();
 
-        let count = mem.purge_namespace("ns1").await.unwrap();
-        assert_eq!(count, 1);
-        assert_eq!(mem.count().await.unwrap(), 3);
-
-        let remaining = mem.list(None, None).await.unwrap();
-        assert!(
-            remaining
-                .iter()
-                .all(|e| e.category != MemoryCategory::Custom("ns1".into()))
-        );
-    }
-
-    #[tokio::test]
-    async fn sqlite_purge_namespace_returns_count() {
-        let (_tmp, mem) = temp_sqlite();
-        for i in 0..5 {
-            mem.store(
-                &format!("k{i}"),
-                "data",
-                MemoryCategory::Custom("target".into()),
-                None,
-            )
-            .await
-            .unwrap();
-        }
-
-        let count = mem.purge_namespace("target").await.unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(in_ns1(&after), 0);
+        assert_eq!(after.len() - in_ns1(&after), before.len() - in_ns1(&before));
+        assert_eq!(deleted, in_ns1(&before));
     }
 
     #[tokio::test]
@@ -2185,18 +5297,6 @@ mod tests {
 
         let count = mem.purge_session("target-sess").await.unwrap();
         assert_eq!(count, 3);
-    }
-
-    #[tokio::test]
-    async fn sqlite_purge_namespace_empty_namespace_is_noop() {
-        let (_tmp, mem) = temp_sqlite();
-        mem.store("a", "data", MemoryCategory::Core, None)
-            .await
-            .unwrap();
-
-        let count = mem.purge_namespace("").await.unwrap();
-        assert_eq!(count, 0);
-        assert_eq!(mem.count().await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -2321,7 +5421,7 @@ mod tests {
 
         // First open: creates schema + migration
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store("k1", "before reopen", MemoryCategory::Core, Some("sess-x"))
                 .await
                 .unwrap();
@@ -2329,7 +5429,7 @@ mod tests {
 
         // Second open: migration runs again but is idempotent
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             let results = mem
                 .recall("reopen", 10, Some("sess-x"), None, None)
                 .await
@@ -2338,6 +5438,360 @@ mod tests {
             assert_eq!(results[0].key, "k1");
             assert_eq!(results[0].session_id.as_deref(), Some("sess-x"));
         }
+    }
+
+    #[tokio::test]
+    async fn count_in_scope_counts_only_active_rows() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "core_alpha",
+            "core alpha",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                namespace: Some("alpha".to_string()),
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "daily_alpha",
+            "daily alpha",
+            MemoryCategory::Daily,
+            None,
+            StoreOptions {
+                namespace: Some("alpha".to_string()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "core_beta",
+            "core beta",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                namespace: Some("beta".to_string()),
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let beta = mem
+            .get("core_beta")
+            .await
+            .unwrap()
+            .expect("core_beta should exist before supersede");
+        mem.supersede(&[beta.id], "core_alpha").await.unwrap();
+
+        assert_eq!(mem.count_in_scope(Some("alpha"), None).await.unwrap(), 2);
+        assert_eq!(mem.count_in_scope(Some("beta"), None).await.unwrap(), 0);
+        assert_eq!(
+            mem.count_in_scope(None, Some(&MemoryCategory::Core))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            mem.count_in_scope(None, Some(&MemoryCategory::Daily))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(mem.count_in_scope(None, None).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn stats_reports_memory_store_telemetry() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "core_alpha",
+            "core alpha",
+            MemoryCategory::Core,
+            None,
+            StoreOptions {
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        mem.store("daily_alpha", "daily alpha", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store("core_beta", "core beta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let beta = mem
+            .get("core_beta")
+            .await
+            .unwrap()
+            .expect("core_beta should exist before supersede");
+        mem.supersede(&[beta.id], "core_alpha").await.unwrap();
+
+        let stats = mem.stats().await.unwrap();
+        assert_eq!(stats.total_rows, 3);
+        assert_eq!(stats.superseded_rows, 1);
+        assert_eq!(stats.pinned_rows, 1);
+        assert_eq!(
+            stats.bytes,
+            "core alpha".len() as u64 + "daily alpha".len() as u64 + "core beta".len() as u64
+        );
+
+        let by_category: std::collections::HashMap<_, _> = stats.by_category.into_iter().collect();
+        assert_eq!(by_category.get("core"), Some(&2));
+        assert_eq!(by_category.get("daily"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn store_with_options_round_trips_memory_kind() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "decision",
+            "Use staged rollout",
+            MemoryCategory::Core,
+            None,
+            StoreOptions::default().with_kind(super::super::traits::MemoryKind::Semantic(
+                super::super::traits::SemanticSubtype::Decision,
+            )),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem
+            .get("decision")
+            .await
+            .unwrap()
+            .expect("kind-tagged row should be readable");
+        assert_eq!(
+            entry.kind,
+            Some(super::super::traits::MemoryKind::Semantic(
+                super::super::traits::SemanticSubtype::Decision
+            ))
+        );
+
+        let recalled = mem.recall("rollout", 5, None, None, None).await.unwrap();
+        assert_eq!(
+            recalled.first().and_then(|entry| entry.kind.clone()),
+            Some(super::super::traits::MemoryKind::Semantic(
+                super::super::traits::SemanticSubtype::Decision
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_round_trips_through_get_list_recall_and_export() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "pinned_readback",
+            "pinned readback marker",
+            MemoryCategory::Core,
+            Some("session-pinned"),
+            StoreOptions {
+                pinned: true,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let entry = mem
+            .get("pinned_readback")
+            .await
+            .unwrap()
+            .expect("pinned row should be readable");
+        assert!(entry.pinned);
+
+        let listed = mem
+            .list(Some(&MemoryCategory::Core), Some("session-pinned"))
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.key == "pinned_readback" && entry.pinned)
+        );
+
+        let recalled = mem
+            .recall("readback", 10, Some("session-pinned"), None, None)
+            .await
+            .unwrap();
+        assert!(
+            recalled
+                .iter()
+                .any(|entry| entry.key == "pinned_readback" && entry.pinned)
+        );
+
+        let exported = mem.export(&ExportFilter::default()).await.unwrap();
+        assert!(
+            exported
+                .iter()
+                .any(|entry| entry.key == "pinned_readback" && entry.pinned)
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_id_round_trips_through_get_list_recall_and_export() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "tenant_scoped",
+            "tenant scoped marker",
+            MemoryCategory::Core,
+            Some("session-tenant"),
+            StoreOptions::default().with_tenant_id("acme"),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem
+            .get("tenant_scoped")
+            .await
+            .unwrap()
+            .expect("tenant-scoped row should be readable");
+        assert_eq!(entry.tenant_id.as_deref(), Some("acme"));
+
+        let listed = mem
+            .list(Some(&MemoryCategory::Core), Some("session-tenant"))
+            .await
+            .unwrap();
+        assert!(listed.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
+
+        let recalled = mem
+            .recall("marker", 10, Some("session-tenant"), None, None)
+            .await
+            .unwrap();
+        assert!(recalled.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
+
+        let exported = mem.export(&ExportFilter::default()).await.unwrap();
+        assert!(exported.iter().any(
+            |entry| entry.key == "tenant_scoped" && entry.tenant_id.as_deref() == Some("acme")
+        ));
+    }
+
+    #[tokio::test]
+    async fn supersede_soft_hides_losers_but_keeps_them_reversible() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_options(
+            "old_fact",
+            "the office is in Denver",
+            MemoryCategory::Core,
+            Some("s"),
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        mem.store_with_options(
+            "new_fact",
+            "the office moved to Austin",
+            MemoryCategory::Core,
+            Some("s"),
+            StoreOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let old = mem.get("old_fact").await.unwrap().expect("old row present");
+        let new = mem.get("new_fact").await.unwrap().expect("new row present");
+
+        mem.supersede(std::slice::from_ref(&old.id), &new.id)
+            .await
+            .unwrap();
+
+        // Recall hides the superseded loser but still surfaces the winner.
+        let recalled = mem
+            .recall("office", 10, Some("s"), None, None)
+            .await
+            .unwrap();
+        assert!(
+            recalled.iter().all(|e| e.key != "old_fact"),
+            "superseded row must not surface in recall"
+        );
+        assert!(
+            recalled.iter().any(|e| e.key == "new_fact"),
+            "the superseding row still recalls"
+        );
+
+        // Soft-hide, not hard delete: the row persists with a supersede marker.
+        let hidden = mem
+            .get("old_fact")
+            .await
+            .unwrap()
+            .expect("supersede is reversible, the row still exists");
+        assert_eq!(
+            hidden.superseded_by.as_deref(),
+            Some(new.id.as_str()),
+            "the loser records who superseded it"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_migration_tolerates_concurrent_initialization() {
+        let tmp = TempDir::new().unwrap();
+
+        // Seed an "old" DB that is missing the newer columns, so migrations have
+        // real work to do when multiple initializers race.
+        let db_path = tmp.path().join("memory").join("brain.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS memories (
+                    id          TEXT PRIMARY KEY,
+                    key         TEXT NOT NULL UNIQUE,
+                    content     TEXT NOT NULL,
+                    category    TEXT NOT NULL DEFAULT 'core',
+                    embedding   BLOB,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+
+        let workers = 12usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let dir = tmp.path().to_path_buf();
+            let barrier = barrier.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                barrier.wait();
+                SqliteMemory::new("test", &dir)
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // Ensure all expected columns exist after the concurrent migration.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut cols = std::collections::HashSet::<String>::new();
+        while let Some(row) = rows.next().unwrap() {
+            cols.insert(row.get::<_, String>(1).unwrap());
+        }
+
+        assert!(cols.contains("session_id"));
+        assert!(cols.contains("namespace"));
+        assert!(cols.contains("importance"));
+        assert!(cols.contains("superseded_by"));
     }
 
     // ── §4.1 Concurrent write contention tests ──────────────
@@ -2350,7 +5804,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..10 {
             let mem = std::sync::Arc::clone(&mem);
-            handles.push(tokio::spawn(async move {
+            handles.push(zeroclaw_spawn::spawn!(async move {
                 mem.store(
                     &format!("concurrent_key_{i}"),
                     &format!("value_{i}"),
@@ -2388,7 +5842,7 @@ mod tests {
         // Concurrent reads
         for _ in 0..5 {
             let mem = std::sync::Arc::clone(&mem);
-            handles.push(tokio::spawn(async move {
+            handles.push(zeroclaw_spawn::spawn!(async move {
                 let _ = mem.get("shared_key").await.unwrap();
             }));
         }
@@ -2396,7 +5850,7 @@ mod tests {
         // Concurrent writes
         for i in 0..5 {
             let mem = std::sync::Arc::clone(&mem);
-            handles.push(tokio::spawn(async move {
+            handles.push(zeroclaw_spawn::spawn!(async move {
                 mem.store(
                     &format!("key_{i}"),
                     &format!("val_{i}"),
@@ -2510,7 +5964,7 @@ mod tests {
     #[tokio::test]
     async fn export_with_time_range() {
         let (_tmp, mem) = temp_sqlite();
-        // Store entries — created_at is set to Local::now() by store()
+        // Store entries — created_at is set to Local::now() by store
         mem.store("a", "old data", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -2680,6 +6134,7 @@ mod tests {
     async fn search_mode_bm25_only() {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::with_embedder(
+            "test",
             tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
@@ -2714,6 +6169,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // NoopEmbedding returns None, so embedding-only mode will fall back to LIKE
         let mem = SqliteMemory::with_embedder(
+            "test",
             tmp.path(),
             Arc::new(super::super::embeddings::NoopEmbedding),
             0.7,
@@ -2745,7 +6201,7 @@ mod tests {
     #[tokio::test]
     async fn search_mode_hybrid_default() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         // Default search mode should be Hybrid
         assert_eq!(mem.search_mode, SearchMode::Hybrid);
 
@@ -2760,5 +6216,268 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "Hybrid mode should find results");
+    }
+
+    #[tokio::test]
+    async fn get_returns_alias_text_in_agent_alias_and_uuid_in_agent_id() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha_uuid = mem.ensure_agent_uuid("clamps").await.unwrap();
+        mem.store_with_agent(
+            "row1",
+            "v",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&alpha_uuid),
+        )
+        .await
+        .unwrap();
+
+        let entry = mem.get("row1").await.unwrap().expect("row1 must exist");
+        assert_eq!(
+            entry.agent_alias.as_deref(),
+            Some("clamps"),
+            "agent_alias must carry the human-readable alias, not the UUID"
+        );
+        assert_eq!(
+            entry.agent_id.as_deref(),
+            Some(alpha_uuid.as_str()),
+            "agent_id must carry the raw UUID FK so scoping equality works"
+        );
+        assert_ne!(
+            entry.agent_alias, entry.agent_id,
+            "alias and id must differ on a SQL backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_returns_alias_text_for_every_row() {
+        let (_tmp, mem) = temp_sqlite();
+        let a = mem.ensure_agent_uuid("clamps").await.unwrap();
+        let b = mem.ensure_agent_uuid("glados").await.unwrap();
+        for (key, owner) in [("r1", &a), ("r2", &b)] {
+            mem.store_with_agent(
+                key,
+                "v",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(owner),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut rows = mem.list(None, None).await.unwrap();
+        rows.sort_by(|x, y| x.key.cmp(&y.key));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].agent_alias.as_deref(), Some("clamps"));
+        assert_eq!(rows[1].agent_alias.as_deref(), Some("glados"));
+        assert!(
+            rows.iter().all(|r| r.agent_id.is_some()),
+            "every row should carry agent_id"
+        );
+    }
+
+    // ── session_id migration ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn migrates_legacy_session_ids_to_sanitized_form() {
+        let tmp = TempDir::new().unwrap();
+        let raw_sid = "slack_C123_1.2_user one";
+        let sanitized = sanitize_session_key(raw_sid);
+        assert_ne!(
+            raw_sid, sanitized,
+            "test only meaningful when sanitization changes the value"
+        );
+
+        {
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            mem.store(
+                "legacy_key",
+                "stored before sanitize fix",
+                MemoryCategory::Conversation,
+                Some(raw_sid),
+            )
+            .await
+            .unwrap();
+            let pre = mem.list(None, Some(raw_sid)).await.unwrap();
+            assert_eq!(pre.len(), 1, "raw session_id should match before migration");
+        }
+
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+
+        let by_sanitized = mem.list(None, Some(&sanitized)).await.unwrap();
+        assert_eq!(
+            by_sanitized.len(),
+            1,
+            "row must be discoverable via sanitized session_id"
+        );
+        assert_eq!(by_sanitized[0].key, "legacy_key");
+
+        let by_raw = mem.list(None, Some(raw_sid)).await.unwrap();
+        assert!(
+            by_raw.is_empty(),
+            "raw form must no longer match after migration"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_id_migration_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let sanitized = sanitize_session_key("slack_C123_1.2_user");
+
+        {
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            mem.store("k", "v", MemoryCategory::Core, Some(&sanitized))
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..3 {
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            let entries = mem.list(None, Some(&sanitized)).await.unwrap();
+            assert_eq!(entries.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_id_migration_leaves_null_rows_untouched() {
+        let tmp = TempDir::new().unwrap();
+
+        {
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+            mem.store("global", "no session", MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let entry = mem.get("global").await.unwrap().expect("row should exist");
+        assert!(entry.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_timestamp_loading_is_rfc3339_round_trippable() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "ts-key-1",
+            "content one",
+            MemoryCategory::Core,
+            Some("sess-7694"),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        mem.store(
+            "ts-key-2",
+            "content two",
+            MemoryCategory::Core,
+            Some("sess-7694"),
+        )
+        .await
+        .unwrap();
+
+        let entries = mem.list(None, Some("sess-7694")).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            // RFC 3339 / ISO 8601 with timezone designator and millisecond
+            // precision — chrono's default serialization. Anything else
+            // would mean the schema or row mapper silently changed.
+            let parsed =
+                chrono::DateTime::parse_from_rfc3339(&entry.timestamp).unwrap_or_else(|err| {
+                    panic!(
+                        "entry {:?} returned non-RFC3339 timestamp {:?}: {err}",
+                        entry.key, entry.timestamp
+                    )
+                });
+            // Round-trip must preserve the original instant.
+            assert_eq!(parsed.to_rfc3339(), entry.timestamp);
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_session_metadata_ordering_is_stable_descending() {
+        let (_tmp, mem) = temp_sqlite();
+        let keys = ["ord-a", "ord-b", "ord-c", "ord-d"];
+        for key in keys {
+            mem.store(key, "body", MemoryCategory::Core, Some("sess-order"))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // First read: capture the ordering.
+        let first = mem.list(None, Some("sess-order")).await.unwrap();
+        assert_eq!(first.len(), keys.len());
+        let first_order: Vec<&str> = first.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            first_order,
+            vec!["ord-d", "ord-c", "ord-b", "ord-a"],
+            "list() must order rows by updated_at DESC (newest first)"
+        );
+
+        // Second read with no writes in between: order must be identical.
+        let second = mem.list(None, Some("sess-order")).await.unwrap();
+        let second_order: Vec<&str> = second.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            first_order, second_order,
+            "ordering must be stable across reads"
+        );
+
+        // And every row must carry the session metadata we asked for.
+        for entry in &first {
+            assert_eq!(entry.session_id.as_deref(), Some("sess-order"));
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_session_metadata_ordering_ties_are_deterministic() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("tie-x", "x", MemoryCategory::Core, Some("sess-tie"))
+            .await
+            .unwrap();
+        mem.store("tie-y", "y", MemoryCategory::Core, Some("sess-tie"))
+            .await
+            .unwrap();
+
+        let tied_ts = "2026-06-19T00:00:00.000000000+00:00";
+        {
+            let conn = mem.connection().lock();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1, updated_at = ?1 \
+                 WHERE key IN (?2, ?3)",
+                rusqlite::params![tied_ts, "tie-x", "tie-y"],
+            )
+            .unwrap();
+        }
+
+        let first = mem.list(None, Some("sess-tie")).await.unwrap();
+        assert_eq!(first.len(), 2);
+
+        // Lock in that a tie really occurred. Without this, the test
+        // degrades into a generic "stable order" check and the
+        // function name overstates what it covers.
+        assert_eq!(
+            first[0].timestamp, first[1].timestamp,
+            "expected both rows to share the forced updated_at"
+        );
+        assert_eq!(first[0].timestamp, tied_ts);
+
+        // Capture the order once.
+        let snapshot: Vec<String> = first.iter().map(|e| e.key.clone()).collect();
+
+        // Five more reads must all agree with the snapshot. If ordering
+        // were non-deterministic at a tied timestamp, this would flake.
+        for _ in 0..5 {
+            let again = mem.list(None, Some("sess-tie")).await.unwrap();
+            let again_keys: Vec<String> = again.iter().map(|e| e.key.clone()).collect();
+            assert_eq!(
+                again_keys, snapshot,
+                "list() must yield a deterministic order across reads"
+            );
+        }
     }
 }

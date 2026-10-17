@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -11,7 +12,16 @@ pub struct RedditChannel {
     client_secret: String,
     refresh_token: String,
     username: String,
-    subreddit: Option<String>,
+    /// Empty = accept items from any subreddit the bot has access to.
+    /// This is a source filter layered on top of sender authorization, never
+    /// a substitute for it.
+    subreddits: Vec<String>,
+    /// The alias key under `[channels.reddit.<alias>]` this handle is
+    /// bound to. Used for attribution and peer-group resolution.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// The resolver reads live configuration and is not cached.
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     auth: Mutex<RedditAuth>,
 }
 
@@ -66,18 +76,22 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 impl RedditChannel {
     pub fn new(
+        alias: impl Into<String>,
         client_id: String,
         client_secret: String,
         refresh_token: String,
         username: String,
-        subreddit: Option<String>,
+        subreddits: Vec<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         Self {
             client_id,
             client_secret,
             refresh_token,
             username,
-            subreddit,
+            subreddits,
+            alias: alias.into(),
+            peer_resolver,
             auth: Mutex::new(RedditAuth {
                 access_token: String::new(),
                 expires_at: Instant::now(),
@@ -87,6 +101,25 @@ impl RedditChannel {
 
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_runtime_proxy_client("channel.reddit")
+    }
+
+    /// Strip the `u/` prefix an operator is likely to paste, so a peer entry
+    /// written the way Reddit displays it still names the account.
+    fn normalize_identity(value: &str) -> &str {
+        let v = value.trim().trim_start_matches('@');
+        v.strip_prefix("/u/")
+            .or_else(|| v.strip_prefix("u/"))
+            .unwrap_or(v)
+    }
+
+    /// Reddit usernames are unique case-insensitively, and this file already
+    /// compares the bot's own name that way, so a peer entry differing only in
+    /// case names the same account and matching it admits no one new.
+    fn is_user_allowed(&self, user_id: &str) -> bool {
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed_by(&peers, user_id, |entry, user| {
+            Self::normalize_identity(entry).eq_ignore_ascii_case(Self::normalize_identity(user))
+        })
     }
 
     /// Refresh the OAuth2 access token using the refresh token.
@@ -109,7 +142,7 @@ impl RedditChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Reddit token refresh failed ({status}): {body}");
+            bail!("token refresh failed ({status}): {body}");
         }
 
         let token_resp: RedditTokenResponse = resp.json().await?;
@@ -152,7 +185,13 @@ impl RedditChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            tracing::warn!("Reddit inbox fetch failed ({status}): {body}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"status": status.to_string(), "body": body})),
+                "inbox fetch failed"
+            );
             return Ok(Vec::new());
         }
 
@@ -178,7 +217,12 @@ impl RedditChannel {
             .await?;
 
         if !resp.status().is_success() {
-            tracing::warn!("Reddit mark_read failed: {}", resp.status());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("mark_read failed: {}", resp.status())
+            );
         }
         Ok(())
     }
@@ -194,10 +238,28 @@ impl RedditChannel {
             return None;
         }
 
-        // If a subreddit filter is set, skip items from other subreddits
-        if let Some(ref sub) = self.subreddit
+        // The inbox mixes mentions, comment replies and DMs, and none of them
+        // are consent to be driven. An empty peer group denies everyone; `"*"`
+        // is the explicit opt-in for a public bot.
+        if !self.is_user_allowed(author) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"author": author})),
+                "ignoring inbox item from unauthorized sender"
+            );
+            return None;
+        }
+
+        // If a subreddit allowlist is set, skip items from other subreddits.
+        // Items without a subreddit (e.g. DMs) carry no subreddit to filter on
+        // and are already covered by the sender check above.
+        if !self.subreddits.is_empty()
             && let Some(ref item_sub) = item.subreddit
-            && !item_sub.eq_ignore_ascii_case(sub)
+            && !self
+                .subreddits
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(item_sub))
         {
             return None;
         }
@@ -222,11 +284,24 @@ impl RedditChannel {
             reply_target,
             content: body.to_string(),
             channel: "reddit".to_string(),
+            channel_alias: None,
             timestamp,
             thread_ts: item.parent_id.clone(),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
+
+            ..Default::default()
         })
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for RedditChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Reddit)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -264,7 +339,7 @@ impl Channel for RedditChannel {
                     .text()
                     .await
                     .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-                bail!("Reddit comment reply failed ({status}): {body}");
+                bail!("comment reply failed ({status}): {body}");
             }
         } else {
             // Direct message
@@ -290,7 +365,7 @@ impl Channel for RedditChannel {
                     .text()
                     .await
                     .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-                bail!("Reddit DM failed ({status}): {body}");
+                bail!("DM failed ({status}): {body}");
             }
         }
 
@@ -301,13 +376,22 @@ impl Channel for RedditChannel {
         // Initial auth
         self.refresh_access_token().await?;
 
-        tracing::info!(
-            "Reddit channel listening as u/{} {}...",
-            self.username,
-            self.subreddit
-                .as_ref()
-                .map(|s| format!("in r/{s}"))
-                .unwrap_or_default()
+        let scope = if self.subreddits.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "in {}",
+                self.subreddits
+                    .iter()
+                    .map(|s| format!("r/{s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("channel listening as u/{} {}...", self.username, scope)
         );
 
         loop {
@@ -316,7 +400,13 @@ impl Channel for RedditChannel {
             let items = match self.fetch_inbox().await {
                 Ok(items) => items,
                 Err(e) => {
-                    tracing::warn!("Reddit poll error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "poll error"
+                    );
                     continue;
                 }
             };
@@ -334,7 +424,13 @@ impl Channel for RedditChannel {
             }
 
             if let Err(e) = self.mark_read(&read_ids).await {
-                tracing::warn!("Reddit mark_read error: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "mark_read error"
+                );
             }
         }
     }
@@ -342,30 +438,62 @@ impl Channel for RedditChannel {
     async fn health_check(&self) -> bool {
         self.get_access_token().await.is_ok()
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator endpoint in the Reddit API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The senders the shared fixtures use. Tests that care about the
+    /// authorization boundary itself build their own peer set.
+    fn default_peers() -> Vec<String> {
+        vec!["user1".to_string(), "user2".to_string()]
+    }
+
     fn make_channel() -> RedditChannel {
-        RedditChannel::new(
-            "client_id".into(),
-            "client_secret".into(),
-            "refresh_token".into(),
-            "testbot".into(),
-            None,
-        )
+        make_channel_with(Vec::new(), default_peers())
     }
 
     fn make_channel_with_sub(sub: &str) -> RedditChannel {
+        make_channel_with(vec![sub.into()], default_peers())
+    }
+
+    fn make_channel_with(subreddits: Vec<String>, peers: Vec<String>) -> RedditChannel {
         RedditChannel::new(
+            "testbot",
             "client_id".into(),
             "client_secret".into(),
             "refresh_token".into(),
             "testbot".into(),
-            Some(sub.into()),
+            subreddits,
+            Arc::new(move || peers.clone()),
         )
+    }
+
+    /// An inbox item from `author`, shaped as a DM (no subreddit, no parent).
+    fn dm_from(author: &str) -> RedditItemData {
+        RedditItemData {
+            name: Some("t4_dm".into()),
+            author: Some(author.into()),
+            body: Some("private message".into()),
+            subject: Some("Hello".into()),
+            parent_id: None,
+            link_id: None,
+            subreddit: None,
+            created_utc: Some(1_700_000_100.0),
+            new: Some(true),
+            message_type: None,
+            context: None,
+        }
     }
 
     #[test]
@@ -490,6 +618,251 @@ mod tests {
         };
 
         assert!(ch.parse_item(&matching_item).is_some());
+    }
+
+    #[test]
+    fn drops_comment_reply_from_unauthorized_sender() {
+        let ch = make_channel();
+        let item = RedditItemData {
+            name: Some("t1_abc123".into()),
+            author: Some("intruder".into()),
+            body: Some("hello bot".into()),
+            subject: None,
+            parent_id: Some("t1_parent1".into()),
+            link_id: Some("t3_post1".into()),
+            subreddit: Some("rust".into()),
+            created_utc: Some(1_700_000_000.0),
+            new: Some(true),
+            message_type: Some("comment_reply".into()),
+            context: None,
+        };
+
+        assert!(ch.parse_item(&item).is_none());
+    }
+
+    #[test]
+    fn drops_dm_from_unauthorized_sender() {
+        // The previous behaviour accepted any DM outright, because a DM has no
+        // subreddit for the only filter on the path to act on.
+        let ch = make_channel();
+
+        assert!(ch.parse_item(&dm_from("intruder")).is_none());
+    }
+
+    #[test]
+    fn empty_peer_group_denies_everyone() {
+        let ch = make_channel_with(Vec::new(), Vec::new());
+
+        assert!(ch.parse_item(&dm_from("user1")).is_none());
+    }
+
+    #[test]
+    fn wildcard_peer_allows_a_public_bot() {
+        let ch = make_channel_with(Vec::new(), vec!["*".to_string()]);
+
+        let msg = ch.parse_item(&dm_from("anyone")).unwrap();
+        assert_eq!(msg.sender, "anyone");
+    }
+
+    #[test]
+    fn ignored_peer_is_denied_under_a_wildcard_grant() {
+        // The list shape `Config::channel_external_peers` produces when one
+        // matching group grants `["*"]` and another ignores a sender.
+        let ch = make_channel_with(Vec::new(), vec!["*".to_string(), "!alice".to_string()]);
+
+        assert!(
+            ch.parse_item(&dm_from("alice")).is_none(),
+            "an ignored sender must not ride the wildcard"
+        );
+        assert_eq!(
+            ch.parse_item(&dm_from("bob"))
+                .expect("an unignored sender still rides the wildcard")
+                .sender,
+            "bob"
+        );
+    }
+
+    /// Resolve peers the way the daemon does, from config, so the test covers
+    /// the config-to-adapter boundary rather than a hand-built vector.
+    fn peers_from_config(toml_src: &str, alias: &str) -> Vec<String> {
+        let config: zeroclaw_config::schema::Config =
+            toml::from_str(toml_src).expect("peer-group config should parse");
+
+        config.channel_external_peers("reddit", alias)
+    }
+
+    #[test]
+    fn ignore_denies_a_grant_written_with_the_display_prefix() {
+        // Reddit reads `u/alice` and `alice` as one account. Resolving the deny
+        // by comparing raw strings kept the grant and dropped the `ignore`, and
+        // this gate then authorized the sender the operator had ignored.
+        let ch = make_channel_with(
+            Vec::new(),
+            peers_from_config(
+                r#"
+                [peer_groups.reddit_ops]
+                channel = "reddit.ops"
+                external_peers = ["u/alice"]
+                ignore = ["alice"]
+                "#,
+                "ops",
+            ),
+        );
+
+        assert!(
+            ch.parse_item(&dm_from("alice")).is_none(),
+            "a deny naming the account must survive the resolver"
+        );
+    }
+
+    #[test]
+    fn ignore_written_with_the_display_prefix_denies_a_bare_grant() {
+        // The inverse spelling, so neither side of the comparison is privileged.
+        let ch = make_channel_with(
+            Vec::new(),
+            peers_from_config(
+                r#"
+                [peer_groups.reddit_ops]
+                channel = "reddit.ops"
+                external_peers = ["alice"]
+                ignore = ["u/alice"]
+                "#,
+                "ops",
+            ),
+        );
+
+        assert!(ch.parse_item(&dm_from("alice")).is_none());
+    }
+
+    #[test]
+    fn config_wildcard_with_ignore_denies_only_the_ignored_sender() {
+        let peers = peers_from_config(
+            r#"
+            [peer_groups.reddit_all]
+            channel = "reddit"
+            external_peers = ["*"]
+
+            [peer_groups.reddit_ops]
+            channel = "reddit.ops"
+            ignore = ["alice"]
+            "#,
+            "ops",
+        );
+        let ch = make_channel_with(Vec::new(), peers);
+
+        assert!(ch.parse_item(&dm_from("alice")).is_none());
+        assert_eq!(
+            ch.parse_item(&dm_from("bob"))
+                .expect("an unignored sender still rides the wildcard")
+                .sender,
+            "bob"
+        );
+    }
+
+    #[test]
+    fn config_ignoring_the_wildcard_denies_everyone() {
+        let ch = make_channel_with(
+            Vec::new(),
+            peers_from_config(
+                r#"
+                [peer_groups.reddit_all]
+                channel = "reddit"
+                external_peers = ["*"]
+                ignore = ["*"]
+                "#,
+                "ops",
+            ),
+        );
+
+        assert!(ch.parse_item(&dm_from("alice")).is_none());
+        assert!(ch.parse_item(&dm_from("bob")).is_none());
+    }
+
+    #[test]
+    fn ignored_peer_is_denied_regardless_of_username_case() {
+        // Reddit usernames are unique case-insensitively, so a deny written in
+        // one case has to cover the account in any case.
+        let ch = make_channel_with(Vec::new(), vec!["*".to_string(), "!Alice".to_string()]);
+
+        assert!(ch.parse_item(&dm_from("alice")).is_none());
+        assert!(ch.parse_item(&dm_from("ALICE")).is_none());
+    }
+
+    #[test]
+    fn peer_match_ignores_username_case() {
+        // Reddit usernames are unique case-insensitively, so `User1` and
+        // `user1` are the same account rather than two.
+        let ch = make_channel_with(Vec::new(), vec!["User1".to_string()]);
+
+        let msg = ch.parse_item(&dm_from("user1")).unwrap();
+        assert_eq!(msg.sender, "user1");
+    }
+
+    #[test]
+    fn subreddit_filter_does_not_substitute_for_sender_authorization() {
+        // An allowed subreddit is not enough on its own: the sender still has
+        // to be a peer.
+        let ch = make_channel_with(vec!["rust".to_string()], default_peers());
+        let mut item = dm_from("intruder");
+        item.subreddit = Some("rust".into());
+
+        assert!(ch.parse_item(&item).is_none());
+
+        let mut allowed = dm_from("user1");
+        allowed.subreddit = Some("rust".into());
+        assert!(ch.parse_item(&allowed).is_some());
+    }
+
+    #[test]
+    fn authorized_sender_still_filtered_by_subreddit() {
+        // And the converse: being a peer does not bypass the source filter.
+        let ch = make_channel_with(vec!["rust".to_string()], default_peers());
+        let mut item = dm_from("user1");
+        item.subreddit = Some("python".into());
+
+        assert!(ch.parse_item(&item).is_none());
+    }
+
+    #[test]
+    fn peer_entry_may_carry_a_u_prefix() {
+        // An operator pasting the name as Reddit displays it should not be
+        // silently denied.
+        for entry in ["u/user1", "/u/user1", "@user1", " user1 "] {
+            let ch = make_channel_with(Vec::new(), vec![entry.to_string()]);
+            assert!(
+                ch.parse_item(&dm_from("user1")).is_some(),
+                "peer entry {entry:?} should name u/user1"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_normalization_does_not_admit_a_different_account() {
+        let ch = make_channel_with(Vec::new(), vec!["u/user1".to_string()]);
+
+        assert!(ch.parse_item(&dm_from("user2")).is_none());
+        assert!(ch.parse_item(&dm_from("uuser1")).is_none());
+    }
+
+    #[test]
+    fn peers_are_resolved_per_message_not_cached() {
+        let peers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ch = {
+            let peers = peers.clone();
+            RedditChannel::new(
+                "testbot",
+                "client_id".into(),
+                "client_secret".into(),
+                "refresh_token".into(),
+                "testbot".into(),
+                Vec::new(),
+                Arc::new(move || peers.lock().clone()),
+            )
+        };
+
+        assert!(ch.parse_item(&dm_from("user1")).is_none());
+        peers.lock().push("user1".to_string());
+        assert!(ch.parse_item(&dm_from("user1")).is_some());
     }
 
     #[test]

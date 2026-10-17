@@ -3,8 +3,8 @@ use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use zeroclaw_api::channel::{Channel, SendMessage};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::channel::{Channel, PollRequest, SendMessage};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -28,6 +28,33 @@ const VOTE_EMOJIS: &[&str] = &[
 const MIN_OPTIONS: usize = 2;
 const MAX_OPTIONS: usize = 10;
 const DEFAULT_DURATION_MINUTES: u64 = 60;
+
+/// Honest failure for a channel whose structured UI declined/cancelled (or is
+/// unavailable) AND whose `send` does not actually deliver.
+///
+/// Both conditions matter. `request_choice` returning `Ok(None)` is overloaded:
+/// it means "no native UI, use your fallback" for ordinary channels, but on
+/// `RpcApprovalChannel` / `WsApprovalChannel` it also covers decline/cancel and
+/// missing form capability. Those channels' `send` returns `Ok(())` without
+/// rendering anything, so the formatted-text fallback would report
+/// "Poll created" for a poll the user never saw.
+fn structured_only_poll_result(channel_name: &str, multi_select: bool) -> ToolResult {
+    let kind = if multi_select {
+        "multi-select"
+    } else {
+        "single-select"
+    };
+    ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(format!(
+            "Channel '{channel_name}' did not complete the {kind} poll (user cancelled/declined, \
+             or the structured UI is unavailable), and it cannot deliver the formatted-text \
+             fallback. No poll was shown to the user. Retry, or run the poll on a channel that \
+             supports text delivery."
+        )),
+    }
+}
 
 pub struct PollTool {
     security: Arc<SecurityPolicy>,
@@ -98,10 +125,11 @@ fn validate_options(args: &serde_json::Value) -> Result<Vec<String>, String> {
     Ok(options)
 }
 
-/// Returns true for channel names that support native polls (Telegram, Discord).
-fn supports_native_poll(channel_name: &str) -> bool {
-    let lower = channel_name.to_ascii_lowercase();
-    lower.contains("telegram") || lower.contains("discord")
+fn duration_minutes_or_default(args: &serde_json::Value) -> u64 {
+    args.get("duration_minutes")
+        .and_then(|v| v.as_u64())
+        .filter(|duration| *duration > 0)
+        .unwrap_or(DEFAULT_DURATION_MINUTES)
 }
 
 #[async_trait]
@@ -111,7 +139,8 @@ impl Tool for PollTool {
     }
 
     fn description(&self) -> &str {
-        "Create a poll in a messaging channel. For Telegram/Discord uses native polls; for other channels formats as a numbered text message with emoji reactions for voting."
+        "Create a poll in a messaging channel. Channels that support native polls get a native poll card; the rest get a numbered text message with emoji reactions for voting. \
+On ACP channels that advertise elicitation.form, the tool blocks until the user picks and returns a JSON-encoded result string with keys `question`, `answer` (or `answers` for multi-select), and `channel`; otherwise it returns a human-readable confirmation string."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -139,6 +168,7 @@ impl Tool for PollTool {
                 },
                 "duration_minutes": {
                     "type": "integer",
+                    "minimum": 1,
                     "description": "Poll duration in minutes (default: 60)"
                 },
                 "multi_select": {
@@ -158,7 +188,7 @@ impl Tool for PollTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Action blocked: {e}")),
             });
         }
@@ -169,7 +199,16 @@ impl Tool for PollTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'question' parameter"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "question"})),
+                    "poll: missing question parameter"
+                );
+                anyhow::Error::msg("Missing 'question' parameter")
+            })?
             .to_string();
 
         let options = match validate_options(&args) {
@@ -177,16 +216,13 @@ impl Tool for PollTool {
             Err(msg) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(msg),
                 });
             }
         };
 
-        let duration_minutes = args
-            .get("duration_minutes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_DURATION_MINUTES);
+        let duration_minutes = duration_minutes_or_default(&args);
 
         let multi_select = args
             .get("multi_select")
@@ -209,17 +245,33 @@ impl Tool for PollTool {
             let channels = self.channels.read();
             if let Some(ref name) = requested_channel {
                 let ch = channels.get(name.as_str()).cloned().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Channel '{}' not found. Available: {}",
-                        name,
-                        channels.keys().cloned().collect::<Vec<_>>().join(", ")
-                    )
+                    let available = channels.keys().cloned().collect::<Vec<_>>().join(", ");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "channel_requested": name,
+                                "available": &available,
+                            })),
+                        "poll: requested channel not found"
+                    );
+                    anyhow::Error::msg(format!(
+                        "Channel '{name}' not found. Available: {available}"
+                    ))
                 })?;
                 (name.clone(), ch)
             } else {
                 // Fall back to first available channel
                 let (name, ch) = channels.iter().next().ok_or_else(|| {
-                    anyhow::anyhow!("No channels available. Configure at least one channel.")
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"missing": "channels"})),
+                        "poll: no channels configured"
+                    );
+                    anyhow::Error::msg("No channels available. Configure at least one channel.")
                 })?;
                 (name.clone(), ch.clone())
             }
@@ -227,11 +279,108 @@ impl Tool for PollTool {
 
         let recipient_id = recipient.unwrap_or_default();
 
-        // For channels with native poll support, we still send a formatted message.
-        // The Channel trait does not expose a create_poll method, so all channels
-        // receive a text-formatted poll. Native Telegram/Discord poll APIs would
-        // require a trait extension; for now we note the intent in the output.
-        let is_native = supports_native_poll(&channel_name);
+        let interactive_timeout =
+            std::time::Duration::from_secs(duration_minutes.saturating_mul(60));
+
+        if multi_select {
+            match channel
+                .request_multi_choice(&question, &options, 1, options.len(), interactive_timeout)
+                .await
+            {
+                Ok(Some(answers)) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: json!({
+                            "question": question,
+                            "answers": answers,
+                            "channel": channel_name,
+                        })
+                        .to_string()
+                        .into(),
+                        error: None,
+                    });
+                }
+                Ok(None) if channel.supports_outbound_send() => {
+                    /* fall through to text-poll fallback */
+                }
+                Ok(None) => {
+                    return Ok(structured_only_poll_result(&channel_name, true));
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Interactive poll failed: {e}")),
+                    });
+                }
+            }
+        } else {
+            match channel
+                .request_choice(&question, &options, interactive_timeout)
+                .await
+            {
+                Ok(Some(answer)) => {
+                    return Ok(ToolResult {
+                        success: true,
+                        output: json!({
+                            "question": question,
+                            "answer": answer,
+                            "channel": channel_name,
+                        })
+                        .to_string()
+                        .into(),
+                        error: None,
+                    });
+                }
+                Ok(None) if channel.supports_outbound_send() => {
+                    /* fall through to text-poll fallback */
+                }
+                Ok(None) => {
+                    return Ok(structured_only_poll_result(&channel_name, false));
+                }
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Interactive poll failed: {e}")),
+                    });
+                }
+            }
+        }
+
+        if channel.supports_native_polls() {
+            let selectable_count = if multi_select {
+                u32::try_from(options.len()).unwrap_or(1)
+            } else {
+                1
+            };
+            let poll = PollRequest::new(&recipient_id, &question, options.clone())
+                .with_selectable_count(selectable_count);
+            return Ok(match channel.send_poll(&poll).await {
+                Ok(()) => ToolResult {
+                    success: true,
+                    output: format!(
+                        "Native poll created on '{channel_name}':\n\
+                         Question: {question}\n\
+                         Options: {}\n\
+                         Multi-select: {multi_select}",
+                        options.join(", ")
+                    )
+                    .into(),
+                    error: None,
+                },
+                // The channel said it posts native polls, so a failure here is
+                // a real one: reporting it beats a text poll the caller did
+                // not ask for.
+                Err(e) => ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!(
+                        "Failed to create native poll on channel '{channel_name}': {e}"
+                    )),
+                },
+            });
+        }
 
         let poll_text = format_text_poll(&question, &options, duration_minutes, multi_select);
 
@@ -239,28 +388,23 @@ impl Tool for PollTool {
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Failed to send poll to channel '{channel_name}': {e}"
                 )),
             });
         }
 
-        let native_note = if is_native {
-            " (native poll API available — text fallback used; trait extension needed for native support)"
-        } else {
-            ""
-        };
-
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Poll created on '{channel_name}'{native_note}:\n\
+                "Poll created on '{channel_name}':\n\
                  Question: {question}\n\
                  Options: {}\n\
                  Duration: {duration_minutes} min | Multi-select: {multi_select}",
                 options.join(", ")
-            ),
+            )
+            .into(),
             error: None,
         })
     }
@@ -282,6 +426,17 @@ mod tests {
                 name: name.to_string(),
                 sent: Arc::new(RwLock::new(Vec::new())),
             }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StubChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
         }
     }
 
@@ -387,6 +542,47 @@ mod tests {
     }
 
     #[test]
+    fn duration_minutes_zero_uses_default() {
+        assert_eq!(
+            duration_minutes_or_default(&json!({ "duration_minutes": 0 })),
+            DEFAULT_DURATION_MINUTES
+        );
+        assert_eq!(
+            duration_minutes_or_default(&json!({ "duration_minutes": 15 })),
+            15
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_zero_duration_uses_default_in_sent_text_and_output() {
+        let security = Arc::new(SecurityPolicy::default());
+        let stub = Arc::new(StubChannel::new("slack"));
+        let sent = Arc::clone(&stub.sent);
+        let channel: Arc<dyn Channel> = stub;
+        let channels = make_channel_map(vec![channel]);
+        let tool = PollTool::new(security, channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Lunch?",
+                "options": ["Pizza", "Sushi"],
+                "channel": "slack",
+                "recipient": "general",
+                "duration_minutes": 0
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(result.output.contains("Duration: 60 min"));
+
+        let sent = sent.read();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("Poll closes in 60 min"));
+        assert!(!sent[0].contains("Poll closes in 0 min"));
+    }
+
+    #[test]
     fn format_text_poll_includes_emoji_per_option() {
         let options: Vec<String> = (1..=5).map(|i| format!("Option {i}")).collect();
         let text = format_text_poll("Q?", &options, 10, false);
@@ -460,14 +656,576 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn supports_native_poll_recognizes_telegram_and_discord() {
-        assert!(supports_native_poll("telegram"));
-        assert!(supports_native_poll("Telegram"));
-        assert!(supports_native_poll("my_telegram_bot"));
-        assert!(supports_native_poll("discord"));
-        assert!(supports_native_poll("Discord"));
-        assert!(!supports_native_poll("slack"));
-        assert!(!supports_native_poll("whatsapp"));
+    /// Channel that posts native polls, recording what it was asked for.
+    struct NativePollChannel {
+        name: String,
+        polls: Arc<RwLock<Vec<PollRequest>>>,
+        sent: Arc<RwLock<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl NativePollChannel {
+        fn new(name: &str, fail: bool) -> Self {
+            Self {
+                name: name.to_string(),
+                polls: Arc::new(RwLock::new(Vec::new())),
+                sent: Arc::new(RwLock::new(Vec::new())),
+                fail,
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NativePollChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for NativePollChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn supports_native_polls(&self) -> bool {
+            true
+        }
+
+        async fn send_poll(&self, poll: &PollRequest) -> anyhow::Result<()> {
+            if self.fail {
+                anyhow::bail!("poll rejected by the platform");
+            }
+            self.polls.write().push(poll.clone());
+            Ok(())
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.write().push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_channel_gets_a_poll_instead_of_a_text_message() {
+        let channel = Arc::new(NativePollChannel::new("whatsapp", false));
+        let tool = PollTool::new(
+            Arc::new(SecurityPolicy::default()),
+            make_channel_map(vec![channel.clone()]),
+        );
+
+        let result = tool
+            .execute(json!({
+                "question": "Which tasting slot?",
+                "options": ["Friday", "Saturday"],
+                "channel": "whatsapp",
+                "recipient": "15550001111",
+            }))
+            .await
+            .expect("tool runs");
+
+        assert!(result.success, "{result:?}");
+        let polls = channel.polls.read();
+        assert_eq!(polls.len(), 1);
+        assert_eq!(polls[0].question, "Which tasting slot?");
+        assert_eq!(polls[0].options, vec!["Friday", "Saturday"]);
+        assert_eq!(polls[0].recipient, "15550001111");
+        assert_eq!(polls[0].selectable_count, 1, "single-select by default");
+        assert!(
+            channel.sent.read().is_empty(),
+            "the text fallback must not also go out"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_select_lets_a_voter_pick_every_option() {
+        let channel = Arc::new(NativePollChannel::new("whatsapp", false));
+        let tool = PollTool::new(
+            Arc::new(SecurityPolicy::default()),
+            make_channel_map(vec![channel.clone()]),
+        );
+
+        tool.execute(json!({
+            "question": "Which wines?",
+            "options": ["Malbec", "Cabernet", "Syrah"],
+            "channel": "whatsapp",
+            "recipient": "15550001111",
+            "multi_select": true,
+        }))
+        .await
+        .expect("tool runs");
+
+        assert_eq!(channel.polls.read()[0].selectable_count, 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_native_poll_is_reported_not_replaced_by_text() {
+        let channel = Arc::new(NativePollChannel::new("whatsapp", true));
+        let tool = PollTool::new(
+            Arc::new(SecurityPolicy::default()),
+            make_channel_map(vec![channel.clone()]),
+        );
+
+        let result = tool
+            .execute(json!({
+                "question": "Which tasting slot?",
+                "options": ["Friday", "Saturday"],
+                "channel": "whatsapp",
+                "recipient": "15550001111",
+            }))
+            .await
+            .expect("tool runs");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("poll rejected by the platform")),
+            "{result:?}"
+        );
+        assert!(channel.sent.read().is_empty());
+    }
+
+    // ── Task 7: ACP elicitation routing tests ──
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Mock channel that simulates an ACP client with `elicitation.form`:
+    /// `request_choice` / `request_multi_choice` return a canned `Some(_)`
+    /// answer, and `send` increments a counter so tests can assert it was
+    /// never invoked (i.e. the formatted-text fallback path was skipped).
+    struct ElicitationCapableChannel {
+        channel_name: String,
+        single_answer: Option<String>,
+        multi_answer: Option<Vec<String>>,
+        send_calls: Arc<AtomicUsize>,
+    }
+
+    impl ElicitationCapableChannel {
+        fn single_returns(name: &str, answer: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                single_answer: Some(answer.to_string()),
+                multi_answer: None,
+                send_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn multi_returns(name: &str, answers: Vec<String>) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                single_answer: None,
+                multi_answer: Some(answers),
+                send_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn send_call_count(&self) -> usize {
+            self.send_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ElicitationCapableChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ElicitationCapableChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_choice(
+            &self,
+            _question: &str,
+            _choices: &[String],
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(self.single_answer.clone())
+        }
+
+        async fn request_multi_choice(
+            &self,
+            _question: &str,
+            _choices: &[String],
+            _min_items: usize,
+            _max_items: usize,
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<Vec<String>>> {
+            Ok(self.multi_answer.clone())
+        }
+    }
+
+    /// Mock channel that simulates ANY non-ACP channel (or a legacy ACP client
+    /// without `elicitation.form`): it inherits the default trait impls of
+    /// `request_choice` and `request_multi_choice`, both of which return
+    /// `Ok(None)`. `send` records that the formatted-text fallback fired.
+    struct FallbackOnlyChannel {
+        channel_name: String,
+        send_calls: Arc<AtomicUsize>,
+    }
+
+    impl FallbackOnlyChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                send_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn send_call_count(&self) -> usize {
+            self.send_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for FallbackOnlyChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for FallbackOnlyChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        // request_choice and request_multi_choice intentionally NOT overridden:
+        // both inherit the default Ok(None) trait impl.
+    }
+
+    #[tokio::test]
+    async fn execute_uses_request_choice_when_channel_supports_single() {
+        let stub = Arc::new(ElicitationCapableChannel::single_returns("acp", "Option B"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channel: Arc<dyn Channel> = stub;
+        let channels = make_channel_map(vec![channel]);
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = PollTool::new(security, channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Pick one",
+                "options": ["Option A", "Option B", "Option C"],
+                "channel": "acp",
+                "multi_select": false,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let out: serde_json::Value = serde_json::from_str(&result.output)
+            .expect("output must be JSON when elicitation hits");
+        assert_eq!(out["answer"], "Option B");
+        assert_eq!(out["question"], "Pick one");
+        assert_eq!(out["channel"], "acp");
+        assert_eq!(
+            stub_for_assert.send_call_count(),
+            0,
+            "must not fall back to formatted-text send when elicitation returned a result"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_uses_request_multi_choice_when_channel_supports_multi() {
+        let stub = Arc::new(ElicitationCapableChannel::multi_returns(
+            "acp",
+            vec!["Red".to_string(), "Blue".to_string()],
+        ));
+        let stub_for_assert = Arc::clone(&stub);
+        let channel: Arc<dyn Channel> = stub;
+        let channels = make_channel_map(vec![channel]);
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = PollTool::new(security, channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Pick colors",
+                "options": ["Red", "Green", "Blue"],
+                "channel": "acp",
+                "multi_select": true,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let out: serde_json::Value = serde_json::from_str(&result.output)
+            .expect("output must be JSON when elicitation hits");
+        assert_eq!(out["answers"], json!(["Red", "Blue"]));
+        assert_eq!(out["question"], "Pick colors");
+        assert_eq!(out["channel"], "acp");
+        assert_eq!(
+            stub_for_assert.send_call_count(),
+            0,
+            "must not fall back to formatted-text send when elicitation returned a result"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_falls_back_to_formatted_text_when_channel_returns_none() {
+        let stub = Arc::new(FallbackOnlyChannel::new("slack"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channel: Arc<dyn Channel> = stub;
+        let channels = make_channel_map(vec![channel]);
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = PollTool::new(security, channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Pick one",
+                "options": ["A", "B"],
+                "channel": "slack",
+                "multi_select": false,
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        assert_eq!(
+            stub_for_assert.send_call_count(),
+            1,
+            "formatted-text fallback must fire when channel returns Ok(None)"
+        );
+        // Existing pre-task-7 success path renders a string like
+        // "Poll created on '...':\nQuestion: ...". Match that shape.
+        assert!(
+            result.output.contains("Poll created on"),
+            "unexpected fallback output: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_huge_duration_does_not_panic() {
+        // duration_minutes * 60 used to overflow u64 for very large inputs.
+        // saturating_mul keeps the value at u64::MAX, which Duration::from_secs
+        // accepts. We don't care what timeout the channel sees — only that the
+        // tool returns rather than panicking.
+        let stub = Arc::new(FallbackOnlyChannel::new("noop"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channel: Arc<dyn Channel> = stub;
+        let channels = make_channel_map(vec![channel]);
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = PollTool::new(security, channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Pick one",
+                "options": ["A", "B"],
+                "channel": "noop",
+                "multi_select": false,
+                "duration_minutes": u64::MAX,
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        // Took the fallback path (no overflow during interactive_timeout calc).
+        assert_eq!(stub_for_assert.send_call_count(), 1);
+    }
+
+    /// Mirrors `RpcApprovalChannel` / `WsApprovalChannel`: structured choice
+    /// yields `Ok(None)` (declined/cancelled, or no `elicitation.form`
+    /// capability) and `send` returns `Ok(())` while rendering NOTHING.
+    struct StructuredOnlyNoDeliveryChannel {
+        channel_name: String,
+        send_calls: Arc<AtomicUsize>,
+    }
+
+    impl StructuredOnlyNoDeliveryChannel {
+        fn new(name: &str) -> Self {
+            Self {
+                channel_name: name.to_string(),
+                send_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn send_call_count(&self) -> usize {
+            self.send_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StructuredOnlyNoDeliveryChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for StructuredOnlyNoDeliveryChannel {
+        fn name(&self) -> &str {
+            &self.channel_name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("listen not supported")
+        }
+
+        fn supports_outbound_send(&self) -> bool {
+            false
+        }
+
+        fn supports_free_form_ask(&self) -> bool {
+            false
+        }
+        // request_choice / request_multi_choice inherit the default Ok(None).
+    }
+
+    #[tokio::test]
+    async fn single_select_poll_cannot_report_false_success_on_structured_only_channel() {
+        // Regression: Ok(None) from request_choice fell through to the
+        // formatted-text fallback. On RPC/WS back-channels `send` is a silent
+        // no-op, so poll reported "Poll created" while the user saw nothing.
+        let stub = Arc::new(StructuredOnlyNoDeliveryChannel::new("rpc"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channels = make_channel_map(vec![stub as Arc<dyn Channel>]);
+        let tool = PollTool::new(Arc::new(SecurityPolicy::default()), channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Ship it?",
+                "options": ["Yes", "No"],
+                "channel": "rpc",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "must not report success for an undelivered poll; output: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("Poll created"),
+            "must not claim the poll was created: {}",
+            result.output
+        );
+        let err = result.error.unwrap_or_default();
+        assert!(err.contains("rpc"), "error should name the channel: {err}");
+        assert_eq!(
+            stub_for_assert.send_call_count(),
+            0,
+            "must not attempt a text fallback that cannot be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_select_poll_cannot_report_false_success_on_structured_only_channel() {
+        // Same false-success path via request_multi_choice.
+        let stub = Arc::new(StructuredOnlyNoDeliveryChannel::new("ws"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channels = make_channel_map(vec![stub as Arc<dyn Channel>]);
+        let tool = PollTool::new(Arc::new(SecurityPolicy::default()), channels);
+
+        let result = tool
+            .execute(json!({
+                "question": "Pick releases",
+                "options": ["A", "B", "C"],
+                "multi_select": true,
+                "channel": "ws",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "must not report success for an undelivered multi-select poll; output: {}",
+            result.output
+        );
+        assert!(!result.output.contains("Poll created"));
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("multi-select"),
+            "error should identify the poll kind: {err}"
+        );
+        assert_eq!(stub_for_assert.send_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deliverable_channel_still_takes_text_fallback_on_none() {
+        // Guard against over-correction: ordinary channels that return
+        // Ok(None) (no native structured UI) MUST still get the text poll.
+        let stub = Arc::new(FallbackOnlyChannel::new("telegram"));
+        let stub_for_assert = Arc::clone(&stub);
+        let channels = make_channel_map(vec![stub as Arc<dyn Channel>]);
+        let tool = PollTool::new(Arc::new(SecurityPolicy::default()), channels);
+
+        for multi in [false, true] {
+            let result = tool
+                .execute(json!({
+                    "question": "Lunch?",
+                    "options": ["Pizza", "Sushi"],
+                    "multi_select": multi,
+                    "channel": "telegram",
+                }))
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "deliverable channel must keep the fallback (multi={multi}): {:?}",
+                result.error
+            );
+            assert!(result.output.contains("Poll created"));
+        }
+        assert_eq!(stub_for_assert.send_call_count(), 2);
     }
 }

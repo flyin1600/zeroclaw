@@ -1,37 +1,35 @@
 //! Serial peripheral — STM32 and similar boards over USB CDC/serial.
-//!
-//! Protocol: newline-delimited JSON.
-//! Request:  {"id":"1","cmd":"gpio_write","args":{"pin":13,"value":1}}
-//! Response: {"id":"1","ok":true,"result":"done"}
 
 use crate::peripherals::Peripheral;
+#[cfg(unix)]
+use crate::util::should_open_serial_nonexclusive;
+use crate::util::{is_serial_path_allowed, serial_open_baud, serial_path_allowlist_hint};
 use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
 use zeroclaw_config::schema::PeripheralBoardConfig;
 
-/// Allowed serial path patterns (security: deny arbitrary paths).
-const ALLOWED_PATH_PREFIXES: &[&str] = &[
-    "/dev/ttyACM",
-    "/dev/ttyUSB",
-    "/dev/tty.usbmodem",
-    "/dev/cu.usbmodem",
-    "/dev/tty.usbserial",
-    "/dev/cu.usbserial", // Arduino Uno (FTDI), clones
-    "COM",               // Windows
-];
+tool_attribution!(GpioReadTool, ToolKind::Plugin);
+tool_attribution!(GpioWriteTool, ToolKind::Plugin);
 
-fn is_path_allowed(path: &str) -> bool {
-    ALLOWED_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
-}
+/// Timeout for serial request/response (seconds).
+const SERIAL_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum malformed or non-matching response frames skipped per request.
+const MAX_SKIPPED_RESPONSE_FRAMES: usize = 16;
 
 /// JSON request/response over serial.
-async fn send_request(port: &mut SerialStream, cmd: &str, args: Value) -> anyhow::Result<Value> {
+async fn send_request<S>(port: &mut S, cmd: &str, args: Value) -> anyhow::Result<Value>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     static ID: AtomicU64 = AtomicU64::new(0);
     let id = ID.fetch_add(1, Ordering::Relaxed);
     let id_str = id.to_string();
@@ -46,21 +44,31 @@ async fn send_request(port: &mut SerialStream, cmd: &str, args: Value) -> anyhow
     port.write_all(line.as_bytes()).await?;
     port.flush().await?;
 
-    let mut buf = Vec::new();
-    let mut b = [0u8; 1];
-    while port.read_exact(&mut b).await.is_ok() {
-        if b[0] == b'\n' {
-            break;
+    let mut skipped_frames = 0;
+    loop {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            port.read_exact(&mut byte).await?;
+            if byte[0] == b'\n' {
+                break;
+            }
+            buf.push(byte[0]);
         }
-        buf.push(b[0]);
+
+        if let Ok(resp) = serde_json::from_slice::<Value>(&buf)
+            && resp.get("id").and_then(Value::as_str) == Some(id_str.as_str())
+        {
+            return Ok(resp);
+        }
+
+        if skipped_frames == MAX_SKIPPED_RESPONSE_FRAMES {
+            anyhow::bail!(
+                "Serial response skip limit exceeded (maximum {MAX_SKIPPED_RESPONSE_FRAMES} frames)"
+            );
+        }
+        skipped_frames += 1;
     }
-    let line_str = String::from_utf8_lossy(&buf);
-    let resp: Value = serde_json::from_str(line_str.trim())?;
-    let resp_id = resp["id"].as_str().unwrap_or("");
-    if resp_id != id_str {
-        anyhow::bail!("Response id mismatch: expected {}, got {}", id_str, resp_id);
-    }
-    Ok(resp)
 }
 
 /// Shared serial transport for tools. Pub(crate) for capabilities tool.
@@ -68,19 +76,30 @@ pub struct SerialTransport {
     port: Mutex<SerialStream>,
 }
 
-/// Timeout for serial request/response (seconds).
-const SERIAL_TIMEOUT_SECS: u64 = 5;
-
 impl SerialTransport {
-    async fn request(&self, cmd: &str, args: Value) -> anyhow::Result<ToolResult> {
+    pub(crate) async fn request(&self, cmd: &str, args: Value) -> anyhow::Result<ToolResult> {
         let mut port = self.port.lock().await;
+        // One timeout covers the request and every skipped frame, so stale or
+        // malformed input cannot restart the deadline.
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(SERIAL_TIMEOUT_SECS),
-            send_request(&mut port, cmd, args),
+            send_request(&mut *port, cmd, args),
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!("Serial request timed out after {}s", SERIAL_TIMEOUT_SECS)
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "command": cmd,
+                        "timeout_secs": SERIAL_TIMEOUT_SECS,
+                    })),
+                "serial peripheral request timed out"
+            );
+            anyhow::Error::msg(format!(
+                "Serial request timed out after {SERIAL_TIMEOUT_SECS}s"
+            ))
         })??;
 
         let ok = resp["ok"].as_bool().unwrap_or(false);
@@ -92,7 +111,7 @@ impl SerialTransport {
 
         Ok(ToolResult {
             success: ok,
-            output: result,
+            output: result.into(),
             error,
         })
     }
@@ -114,21 +133,46 @@ impl SerialPeripheral {
     /// Create and connect to a serial peripheral.
     #[allow(clippy::unused_async)]
     pub async fn connect(config: &PeripheralBoardConfig) -> anyhow::Result<Self> {
-        let path = config
-            .path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Serial peripheral requires path"))?;
+        let path = config.path.as_deref().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"board": config.board})),
+                "serial peripheral connect refused: config missing 'path'"
+            );
+            anyhow::Error::msg("Serial peripheral requires path")
+        })?;
 
-        if !is_path_allowed(path) {
+        if !is_serial_path_allowed(path) {
             anyhow::bail!(
-                "Serial path not allowed: {}. Allowed: /dev/ttyACM*, /dev/ttyUSB*, /dev/tty.usbmodem*, /dev/cu.usbmodem*",
-                path
+                "Serial path not allowed: {}. Allowed: {}",
+                path,
+                serial_path_allowlist_hint()
             );
         }
 
-        let port = tokio_serial::new(path, config.baud)
-            .open_native_async()
-            .map_err(|e| anyhow::anyhow!("Failed to open {}: {}", path, e))?;
+        let builder = tokio_serial::new(path, serial_open_baud(path, config.baud));
+        #[cfg(unix)]
+        let builder = if should_open_serial_nonexclusive(path) {
+            builder.exclusive(false)
+        } else {
+            builder
+        };
+        let port = builder.open_native_async().map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path,
+                        "baud": config.baud,
+                        "error": format!("{}", e),
+                    })),
+                "serial peripheral open failed"
+            );
+            anyhow::Error::msg(format!("Failed to open {path}: {e}"))
+        })?;
 
         let name = format!("{}-{}", config.board, path.replace('/', "_"));
         let transport = Arc::new(SerialTransport {
@@ -217,10 +261,16 @@ impl Tool for GpioReadTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_read", "param": "pin"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })?;
         self.transport
             .request("gpio_read", json!({ "pin": pin }))
             .await
@@ -260,16 +310,196 @@ impl Tool for GpioWriteTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
-        let value = args
-            .get("value")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'value' parameter"))?;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_write", "param": "pin"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })?;
+        let value = args.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_write", "param": "value"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'value' parameter")
+        })?;
         self.transport
             .request("gpio_write", json!({ "pin": pin, "value": value }))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::DuplexStream;
+    use tokio::time::{Duration, sleep, timeout};
+
+    async fn read_frame(port: &mut DuplexStream) -> Vec<u8> {
+        let mut frame = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            port.read_exact(&mut byte)
+                .await
+                .expect("device should receive a complete frame");
+            if byte[0] == b'\n' {
+                return frame;
+            }
+            frame.push(byte[0]);
+        }
+    }
+
+    async fn read_request_id(port: &mut DuplexStream) -> String {
+        let frame = read_frame(port).await;
+        let request: Value =
+            serde_json::from_slice(&frame).expect("host request should be valid JSON");
+        request
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("host request should contain a string id")
+            .to_owned()
+    }
+
+    async fn write_frame(port: &mut DuplexStream, frame: &[u8]) {
+        port.write_all(frame)
+            .await
+            .expect("device should write response frame");
+        port.write_all(b"\n")
+            .await
+            .expect("device should terminate response frame");
+        port.flush()
+            .await
+            .expect("device should flush response frame");
+    }
+
+    async fn write_json_frame(port: &mut DuplexStream, frame: Value) {
+        let frame = serde_json::to_vec(&frame).expect("response should serialize");
+        write_frame(port, &frame).await;
+    }
+
+    #[tokio::test]
+    async fn wrong_id_then_matching_response_succeeds() {
+        let (mut host, mut device) = tokio::io::duplex(4096);
+
+        let host_request = send_request(&mut host, "ping", json!({}));
+        let device_response = async {
+            let request_id = read_request_id(&mut device).await;
+            write_json_frame(
+                &mut device,
+                json!({"id": "unexpected", "ok": true, "result": "stale"}),
+            )
+            .await;
+            write_json_frame(
+                &mut device,
+                json!({"id": request_id, "ok": true, "result": "current"}),
+            )
+            .await;
+        };
+
+        let (response, ()) = tokio::join!(host_request, device_response);
+        let response = response.expect("matching response should succeed");
+        assert_eq!(response["result"], "current");
+    }
+
+    #[tokio::test]
+    async fn malformed_frame_then_matching_response_succeeds() {
+        let (mut host, mut device) = tokio::io::duplex(4096);
+
+        let host_request = send_request(&mut host, "ping", json!({}));
+        let device_response = async {
+            let request_id = read_request_id(&mut device).await;
+            write_frame(&mut device, b"not-json").await;
+            write_json_frame(
+                &mut device,
+                json!({"id": request_id, "ok": true, "result": "current"}),
+            )
+            .await;
+        };
+
+        let (response, ()) = tokio::join!(host_request, device_response);
+        let response = response.expect("matching response should succeed");
+        assert_eq!(response["result"], "current");
+    }
+
+    #[tokio::test]
+    async fn unsolicited_frame_flood_does_not_extend_deadline_and_stream_recovers() {
+        let (mut host, mut device) = tokio::io::duplex(4096);
+
+        let host_requests = async {
+            let first = timeout(
+                Duration::from_millis(200),
+                send_request(&mut host, "first", json!({})),
+            )
+            .await;
+            assert!(
+                first.is_err(),
+                "unsolicited frames must not extend the original request deadline"
+            );
+
+            let second = timeout(
+                Duration::from_secs(2),
+                send_request(&mut host, "second", json!({})),
+            )
+            .await
+            .expect("subsequent request should finish")
+            .expect("subsequent request should recover on the same stream");
+            assert_eq!(second["result"], "recovered");
+        };
+
+        let device_responses = async {
+            let _first_request_id = read_request_id(&mut device).await;
+            for sequence in 0..5 {
+                write_json_frame(
+                    &mut device,
+                    json!({
+                        "id": format!("unsolicited-{sequence}"),
+                        "ok": true,
+                        "result": "stale"
+                    }),
+                )
+                .await;
+                sleep(Duration::from_millis(60)).await;
+            }
+
+            let second_request_id = read_request_id(&mut device).await;
+            write_json_frame(
+                &mut device,
+                json!({"id": second_request_id, "ok": true, "result": "recovered"}),
+            )
+            .await;
+        };
+
+        tokio::join!(host_requests, device_responses);
+    }
+
+    #[tokio::test]
+    async fn unsolicited_frame_skip_limit_is_bounded() {
+        let (mut host, mut device) = tokio::io::duplex(4096);
+
+        let host_request = send_request(&mut host, "ping", json!({}));
+        let device_response = async {
+            let _request_id = read_request_id(&mut device).await;
+            for sequence in 0..=MAX_SKIPPED_RESPONSE_FRAMES {
+                write_json_frame(
+                    &mut device,
+                    json!({"id": format!("unsolicited-{sequence}"), "ok": true}),
+                )
+                .await;
+            }
+        };
+
+        let (response, ()) = tokio::join!(host_request, device_response);
+        let error = response.expect_err("skip limit should reject an unsolicited-frame flood");
+        assert!(
+            error.to_string().contains("skip limit exceeded"),
+            "unexpected error: {error:#}"
+        );
     }
 }

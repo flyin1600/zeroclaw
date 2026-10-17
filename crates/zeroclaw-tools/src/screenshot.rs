@@ -1,19 +1,16 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Maximum time to wait for a screenshot command to complete.
 const SCREENSHOT_TIMEOUT_SECS: u64 = 15;
-/// Maximum base64 payload size to return (2 MB of base64 ≈ 1.5 MB image).
-const MAX_BASE64_BYTES: usize = 2_097_152;
 
 /// Tool for capturing screenshots using platform-native commands.
-///
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
 pub struct ScreenshotTool {
@@ -75,7 +72,7 @@ impl ScreenshotTool {
         if safe_name.contains(SHELL_UNSAFE) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Filename contains characters unsafe for shell execution".into()),
             });
         }
@@ -86,7 +83,7 @@ impl ScreenshotTool {
         let Some(mut cmd_args) = Self::screenshot_command(&output_str) else {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Screenshot not supported on this platform".into()),
             });
         };
@@ -118,7 +115,7 @@ impl ScreenshotTool {
                     if stderr.contains("NO_SCREENSHOT_TOOL") {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "No screenshot tool found. Install gnome-screenshot, scrot, or ImageMagick."
                                     .into(),
@@ -127,21 +124,21 @@ impl ScreenshotTool {
                     }
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Screenshot command failed: {stderr}")),
                     });
                 }
 
-                Self::read_and_encode(&output_path).await
+                Self::describe_saved_file(&output_path).await
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to execute screenshot command: {e}")),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Screenshot timed out after {SCREENSHOT_TIMEOUT_SECS}s"
                 )),
@@ -149,66 +146,29 @@ impl ScreenshotTool {
         }
     }
 
-    /// Read the screenshot file and return base64-encoded result.
-    async fn read_and_encode(output_path: &std::path::Path) -> anyhow::Result<ToolResult> {
-        // Check file size before reading to prevent OOM on large screenshots
-        const MAX_RAW_BYTES: u64 = 1_572_864; // ~1.5 MB (base64 expands ~33%)
-        if let Ok(meta) = tokio::fs::metadata(output_path).await
-            && meta.len() > MAX_RAW_BYTES
-        {
-            return Ok(ToolResult {
+    /// Read the saved screenshot file and describe it for the tool result.
+    ///
+    /// The saved file is declared as an image attachment; the text carries
+    /// the path and size only.
+    async fn describe_saved_file(output_path: &std::path::Path) -> anyhow::Result<ToolResult> {
+        match tokio::fs::read(output_path).await {
+            Ok(bytes) => Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "Screenshot saved to: {}\nSize: {} bytes (too large to base64-encode inline)",
+                    "Screenshot saved to: {}\nSize: {} bytes",
                     output_path.display(),
-                    meta.len(),
-                ),
+                    bytes.len(),
+                )
+                .into(),
                 error: None,
-            });
-        }
-
-        match tokio::fs::read(output_path).await {
-            Ok(bytes) => {
-                use base64::Engine;
-                let size = bytes.len();
-                let mut encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                let truncated = if encoded.len() > MAX_BASE64_BYTES {
-                    let mut boundary = MAX_BASE64_BYTES.min(encoded.len());
-                    while boundary > 0 && !encoded.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
-                    encoded.truncate(boundary);
-                    true
-                } else {
-                    false
-                };
-
-                let mut output_msg = format!(
-                    "Screenshot saved to: {}\nSize: {size} bytes\nBase64 length: {}",
-                    output_path.display(),
-                    encoded.len(),
-                );
-                if truncated {
-                    output_msg.push_str(" (truncated)");
-                }
-                let mime = match output_path.extension().and_then(|e| e.to_str()) {
-                    Some("jpg" | "jpeg") => "image/jpeg",
-                    Some("bmp") => "image/bmp",
-                    Some("gif") => "image/gif",
-                    Some("webp") => "image/webp",
-                    _ => "image/png",
-                };
-                let _ = write!(output_msg, "\ndata:{mime};base64,{encoded}");
-
-                Ok(ToolResult {
-                    success: true,
-                    output: output_msg,
-                    error: None,
-                })
             }
+            .with_attachment(RenderedMarker {
+                target: output_path.display().to_string(),
+                kind: MarkerKind::Image,
+            })),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: format!("Screenshot saved to: {}", output_path.display()),
+                output: format!("Screenshot saved to: {}", output_path.display()).into(),
                 error: Some(format!("Failed to read screenshot file: {e}")),
             }),
         }
@@ -222,7 +182,7 @@ impl Tool for ScreenshotTool {
     }
 
     fn description(&self) -> &str {
-        "Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data."
+        "Capture a screenshot of the current screen. Returns the saved file path."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -245,7 +205,7 @@ impl Tool for ScreenshotTool {
         if !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -276,8 +236,26 @@ mod tests {
     #[test]
     fn screenshot_tool_description() {
         let tool = ScreenshotTool::new(test_security());
-        assert!(!tool.description().is_empty());
-        assert!(tool.description().contains("screenshot"));
+        let description = tool.description();
+        assert!(description.contains("screenshot"));
+        assert!(description.contains("Returns the saved file path"));
+        assert!(!description.contains("base64"));
+    }
+
+    #[tokio::test]
+    async fn screenshot_describe_saved_file_reports_path_and_size_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("minimal.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let result = ScreenshotTool::describe_saved_file(&path).await.unwrap();
+
+        assert!(result.success);
+        let text = result.output.as_str();
+        assert!(text.contains("Screenshot saved to:"), "text: {text}");
+        assert!(text.contains("Size: 8 bytes"), "text: {text}");
+        assert!(!text.contains("data:"), "text: {text}");
+        assert!(!text.contains("base64"), "text: {text}");
     }
 
     #[test]
@@ -317,12 +295,53 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn screenshot_command_contains_output_path() {
         let cmd = ScreenshotTool::screenshot_command("/tmp/my_screenshot.png").unwrap();
         let joined = cmd.join(" ");
         assert!(
             joined.contains("/tmp/my_screenshot.png"),
             "Command should contain the output path"
+        );
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn screenshot_command_is_unsupported_on_other_platforms() {
+        assert!(ScreenshotTool::screenshot_command("screenshot.png").is_none());
+    }
+
+    #[tokio::test]
+    async fn describe_saved_file_declares_the_saved_png_as_attachment() {
+        // The saved screenshot is a produced image: the tool must declare it
+        // (exactly one image attachment) while leaving the text unchanged,
+        // because nothing downstream scans the text for the path anymore.
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("shot.png");
+        std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+
+        let result = ScreenshotTool::describe_saved_file(&image)
+            .await
+            .expect("describe_saved_file succeeds on a small PNG");
+
+        assert!(result.success);
+        assert_eq!(result.output.attachments().len(), 1);
+        assert_eq!(result.output.attachments()[0].kind, MarkerKind::Image);
+        assert_eq!(
+            result.output.attachments()[0].target,
+            image.display().to_string()
+        );
+        assert!(
+            result
+                .output
+                .as_str()
+                .contains(&format!("Screenshot saved to: {}", image.display())),
+            "the text still names the saved path: {}",
+            result.output.as_str()
+        );
+        assert!(
+            !result.output.as_str().contains("[IMAGE:"),
+            "the declaration never rides the text as marker syntax"
         );
     }
 }

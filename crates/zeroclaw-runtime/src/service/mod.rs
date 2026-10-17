@@ -1,12 +1,1692 @@
 use anyhow::{Context, Result, bail};
+#[cfg(windows)]
+use process_wrap::tokio::{ChildWrapper, CommandWrap, CommandWrapper, JobObject, KillOnDrop};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::collections::VecDeque;
 use std::fs;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::process::Stdio;
 use std::str::FromStr;
-use zeroclaw_config::schema::Config;
+#[cfg(any(windows, all(test, target_os = "linux")))]
+use std::sync::mpsc;
+#[cfg(windows)]
+use std::sync::mpsc::Receiver;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::sync::mpsc::SyncSender;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::sync::{Arc, Condvar, Mutex};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use tokio::io::{AsyncRead, AsyncReadExt};
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, not(unix))))]
+use tokio::process::Child;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+use tokio::process::Command as TokioCommand;
+use zeroclaw_config::schema::{Config, resolve_runtime_dirs};
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const SERVICE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const SERVICE_LOG_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(any(target_os = "linux", test))]
+const OPENRC_STDOUT_LOG: &str = "/var/log/zeroclaw/access.log";
+#[cfg(any(target_os = "linux", test))]
+const OPENRC_STDERR_LOG: &str = "/var/log/zeroclaw/error.log";
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const DESKTOP_READINESS_FRAME_MAX_BYTES: usize = 4096;
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "macos", test))]
+const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct LaunchdCapturePaths {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launchd_capture_paths(config_dir: &Path) -> LaunchdCapturePaths {
+    let logs = config_dir.join("logs");
+    LaunchdCapturePaths {
+        stdout: logs.join("daemon.stdout.log"),
+        stderr: logs.join("daemon.stderr.log"),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct BoundedServiceLog {
+    file: fs::File,
+    len: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl BoundedServiceLog {
+    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create log directory {}", parent.display()))?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("Failed to open service log {}", path.display()))?;
+        let mut log = Self {
+            len: file.metadata()?.len(),
+            file,
+        };
+        if log.len > SERVICE_LOG_MAX_BYTES {
+            log.retain_tail(SERVICE_LOG_MAX_BYTES)?;
+        }
+        Ok(log)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+    fn open_desktop(path: &Path) -> Result<Self> {
+        let file = open_private_desktop_file(path)?;
+        let mut log = Self {
+            len: file.metadata()?.len(),
+            file,
+        };
+        if log.len > SERVICE_LOG_MAX_BYTES {
+            log.retain_tail(SERVICE_LOG_MAX_BYTES)?;
+        }
+        Ok(log)
+    }
+
+    fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        if chunk.len() as u64 >= SERVICE_LOG_MAX_BYTES {
+            let start = chunk.len() - SERVICE_LOG_MAX_BYTES as usize;
+            return self.rewrite(&chunk[start..]);
+        }
+        if self.len + chunk.len() as u64 > SERVICE_LOG_MAX_BYTES {
+            let headroom = SERVICE_LOG_MAX_BYTES - chunk.len() as u64;
+            self.retain_tail(SERVICE_LOG_COMPACT_BYTES.min(headroom))?;
+        }
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(chunk)?;
+        self.len += chunk.len() as u64;
+        Ok(())
+    }
+
+    fn retain_tail(&mut self, keep: u64) -> Result<()> {
+        let keep = keep.min(self.len);
+        let mut tail = vec![0; keep as usize];
+        self.file.seek(SeekFrom::End(-(keep as i64)))?;
+        self.file.read_exact(&mut tail)?;
+        self.rewrite(&tail)
+    }
+
+    fn rewrite(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(bytes)?;
+        self.file.set_len(bytes.len() as u64)?;
+        self.file.flush()?;
+        self.len = bytes.len() as u64;
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_private_desktop_directory(path: &Path) -> Result<cap_std::fs::Dir> {
+    let logs_path = path
+        .parent()
+        .context("desktop log path has no parent directory")?;
+    let config_root = logs_path
+        .parent()
+        .context("desktop log path has no config root")?;
+    let root = open_or_create_private_desktop_root(config_root)?;
+    let logs_name = logs_path
+        .file_name()
+        .context("desktop log path has no logs directory name")?;
+    open_or_create_private_desktop_subdir(&root, Path::new(logs_name), logs_path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_or_create_private_desktop_root(path: &Path) -> Result<cap_std::fs::Dir> {
+    use std::path::Component;
+
+    // macOS exposes these root-owned compatibility aliases as symlinks. Resolve
+    // only the fixed system aliases before the no-follow component walk; user-
+    // controlled symlinks below them must still be rejected.
+    #[cfg(target_os = "macos")]
+    let path = ["var", "tmp", "etc"]
+        .into_iter()
+        .find_map(|alias| {
+            path.strip_prefix(Path::new("/").join(alias))
+                .ok()
+                .map(|suffix| Path::new("/private").join(alias).join(suffix))
+        })
+        .unwrap_or_else(|| path.to_path_buf());
+    #[cfg(target_os = "macos")]
+    let path = path.as_path();
+
+    if !path.is_absolute() {
+        bail!("desktop config root is not absolute: {}", path.display());
+    }
+    let mut anchor = PathBuf::new();
+    let mut names = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => anchor.push(prefix.as_os_str()),
+            Component::RootDir => anchor.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(name) => names.push(PathBuf::from(name)),
+            Component::ParentDir => {
+                bail!(
+                    "desktop config root contains an unresolved parent component: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if anchor.as_os_str().is_empty() || names.is_empty() {
+        bail!(
+            "desktop config root has no directory name: {}",
+            path.display()
+        );
+    }
+
+    let mut directory = open_private_desktop_anchor(&anchor).with_context(|| {
+        format!(
+            "Failed to bind desktop config filesystem root {}",
+            anchor.display()
+        )
+    })?;
+    let mut current_path = anchor;
+    let mut creating_private_chain = false;
+    let final_index = names.len() - 1;
+    for (index, name) in names.into_iter().enumerate() {
+        current_path.push(&name);
+        if creating_private_chain || index == final_index {
+            directory = open_or_create_private_desktop_subdir(&directory, &name, &current_path)?;
+            continue;
+        }
+        match open_private_desktop_subdir(&directory, &name, false) {
+            Ok(next) => directory = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                creating_private_chain = true;
+                directory =
+                    open_or_create_private_desktop_subdir(&directory, &name, &current_path)?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to bind desktop config ancestor {}",
+                        current_path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(directory)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_private_desktop_anchor(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        options.access_mode(GENERIC_READ);
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "desktop config ancestor is not a directory: {}",
+            path.display()
+        )));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "desktop config ancestor is a reparse point: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(cap_std::fs::Dir::from_std_file(file))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_or_create_private_desktop_subdir(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    full_path: &Path,
+) -> Result<cap_std::fs::Dir> {
+    #[cfg(unix)]
+    use cap_std::fs::DirBuilderExt;
+    use cap_std::fs::{Dir, DirBuilder};
+
+    match parent.symlink_metadata(name) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "desktop private directory is not a directory: {}",
+                    full_path.display()
+                );
+            }
+            #[cfg(windows)]
+            if cap_std::fs::MetadataExt::file_attributes(&metadata) & 0x0000_0400 != 0 {
+                bail!(
+                    "desktop private directory is a reparse point: {}",
+                    full_path.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let builder = DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                let mut builder = builder;
+                builder.mode(0o700);
+                builder
+            };
+            parent.create_dir_with(name, &builder).with_context(|| {
+                format!(
+                    "Failed to create private desktop directory {}",
+                    full_path.display()
+                )
+            })?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to inspect private desktop directory {}",
+                    full_path.display()
+                )
+            });
+        }
+    }
+
+    let directory = open_private_desktop_subdir(parent, name, true).with_context(|| {
+        format!(
+            "Failed to bind private desktop directory {}",
+            full_path.display()
+        )
+    })?;
+    let std_file = directory.into_std_file();
+    let metadata = std_file.metadata().with_context(|| {
+        format!(
+            "Failed to inspect private desktop directory {}",
+            full_path.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        bail!(
+            "desktop private path is not a directory: {}",
+            full_path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = unsafe { libc::geteuid() };
+        if metadata.uid() != owner {
+            bail!(
+                "desktop private directory {} is owned by uid {}, not the current user",
+                full_path.display(),
+                metadata.uid()
+            );
+        }
+        if metadata.mode() & 0o077 != 0 {
+            std_file
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .with_context(|| {
+                    format!(
+                        "Failed to restrict private desktop directory {}",
+                        full_path.display()
+                    )
+                })?;
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            bail!(
+                "desktop private directory is a reparse point: {}",
+                full_path.display()
+            );
+        }
+        enforce_windows_private_acl(&std_file, full_path, true)?;
+    }
+    Ok(Dir::from_std_file(std_file))
+}
+
+#[cfg(any(unix, windows))]
+fn open_private_desktop_subdir(
+    parent: &cap_std::fs::Dir,
+    name: &Path,
+    _require_write_dac: bool,
+) -> std::io::Result<cap_std::fs::Dir> {
+    use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt};
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        // GENERIC_READ preserves directory traversal/read-control access; WRITE_DAC is
+        // required only when SetSecurityInfo will harden this private directory.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        options.access_mode(GENERIC_READ | if _require_write_dac { WRITE_DAC } else { 0 });
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+    let file = parent.open_with(name, &options)?.into_std();
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "desktop directory entry is not a directory: {}",
+            name.display()
+        )));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "desktop directory entry is a reparse point: {}",
+                name.display()
+            )));
+        }
+    }
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(windows)]
+#[link(name = "advapi32")]
+#[allow(non_snake_case)]
+unsafe extern "system" {
+    fn GetSecurityInfo(
+        handle: *mut std::ffi::c_void,
+        object_type: u32,
+        security_info: u32,
+        owner: *mut *mut std::ffi::c_void,
+        group: *mut *mut std::ffi::c_void,
+        dacl: *mut *mut std::ffi::c_void,
+        sacl: *mut *mut std::ffi::c_void,
+        security_descriptor: *mut *mut std::ffi::c_void,
+    ) -> u32;
+    fn SetSecurityInfo(
+        handle: *mut std::ffi::c_void,
+        object_type: u32,
+        security_info: u32,
+        owner: *mut std::ffi::c_void,
+        group: *mut std::ffi::c_void,
+        dacl: *const std::ffi::c_void,
+        sacl: *const std::ffi::c_void,
+    ) -> u32;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+#[allow(non_snake_case)]
+unsafe extern "system" {
+    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[cfg(any(windows, test))]
+fn windows_owner_sid_matches(owner: &[u8], current_user: &[u8]) -> bool {
+    !owner.is_empty() && owner == current_user
+}
+
+#[cfg(any(windows, test))]
+fn windows_acl_ace_flags(is_directory: bool) -> u32 {
+    if is_directory { 0x1 | 0x2 } else { 0 }
+}
+
+#[cfg(windows)]
+fn enforce_windows_private_acl(file: &fs::File, path: &Path, is_directory: bool) -> Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        ACE_FLAGS, ACL, ACL_REVISION, AddAccessAllowedAceEx, GetLengthSid, GetTokenInformation,
+        InitializeAcl, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).with_context(|| {
+            format!(
+                "Failed to open the current user token for {}",
+                path.display()
+            )
+        })?;
+    }
+
+    let result = (|| {
+        let mut token_bytes = 0u32;
+        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut token_bytes) };
+        if token_bytes == 0 {
+            bail!(
+                "Failed to determine the current user SID for {}",
+                path.display()
+            );
+        }
+        let words = (token_bytes as usize).div_ceil(size_of::<u64>());
+        let mut token_storage = vec![0u64; words];
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(token_storage.as_mut_ptr().cast()),
+                token_bytes,
+                &mut token_bytes,
+            )
+            .with_context(|| {
+                format!("Failed to read the current user SID for {}", path.display())
+            })?;
+        }
+        let token_user = unsafe { &*token_storage.as_ptr().cast::<TOKEN_USER>() };
+        let current_sid_handle = token_user.User.Sid;
+        let current_sid_len = unsafe { GetLengthSid(current_sid_handle) } as usize;
+        if current_sid_len == 0 {
+            bail!("Current user SID is invalid for {}", path.display());
+        }
+        let current_sid_bytes = unsafe {
+            std::slice::from_raw_parts(current_sid_handle.0.cast::<u8>(), current_sid_len)
+        };
+
+        let mut owner_sid = std::ptr::null_mut();
+        let mut security_descriptor = std::ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                1,
+                1,
+                &mut owner_sid,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut security_descriptor,
+            )
+        };
+        if status != 0 {
+            if !security_descriptor.is_null() {
+                unsafe {
+                    let _ = LocalFree(security_descriptor);
+                }
+            }
+            bail!(
+                "Failed to query the owner SID for {} (Windows error {})",
+                path.display(),
+                status
+            );
+        }
+        let owner_result = (|| {
+            if owner_sid.is_null() {
+                bail!("{} has no owner SID", path.display());
+            }
+            let owner_sid_len = unsafe { GetLengthSid(PSID(owner_sid)) } as usize;
+            if owner_sid_len == 0 {
+                bail!("{} has an invalid owner SID", path.display());
+            }
+            let owner_sid =
+                unsafe { std::slice::from_raw_parts(owner_sid.cast::<u8>(), owner_sid_len) };
+            if !windows_owner_sid_matches(owner_sid, current_sid_bytes) {
+                bail!(
+                    "{} is not owned by the current Windows user; refusing ACL hardening",
+                    path.display()
+                );
+            }
+            let acl_size = (size_of::<ACL>() + 8 + current_sid_len).next_multiple_of(4);
+            let acl_words = acl_size.div_ceil(size_of::<u32>());
+            let mut acl_storage = vec![0u32; acl_words];
+            let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+            unsafe {
+                InitializeAcl(acl, acl_size as u32, ACL_REVISION).with_context(|| {
+                    format!("Failed to initialize a private ACL for {}", path.display())
+                })?;
+                AddAccessAllowedAceEx(
+                    acl,
+                    ACL_REVISION,
+                    ACE_FLAGS(windows_acl_ace_flags(is_directory)),
+                    0x001F_01FF,
+                    current_sid_handle,
+                )
+                .with_context(|| {
+                    format!("Failed to add the current-user ACE for {}", path.display())
+                })?;
+            }
+            let status = unsafe {
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    1,
+                    0x0000_0004 | 0x8000_0000,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    acl.cast(),
+                    std::ptr::null(),
+                )
+            };
+            if status != 0 {
+                bail!(
+                    "Failed to apply a private ACL to {} (Windows error {})",
+                    path.display(),
+                    status
+                );
+            }
+            Ok(())
+        })();
+        if !security_descriptor.is_null() {
+            unsafe {
+                let _ = LocalFree(security_descriptor);
+            }
+        }
+        owner_result
+    })();
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn open_private_desktop_file(path: &Path) -> Result<fs::File> {
+    use cap_std::fs::{OpenOptions, OpenOptionsExt};
+
+    let name = path
+        .file_name()
+        .context("desktop log path has no file name")?;
+    let directory = open_private_desktop_directory(path)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    {
+        // GENERIC_READ/GENERIC_WRITE preserve log I/O; WRITE_DAC is required for
+        // SetSecurityInfo to apply the private DACL on this handle.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        options.access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC);
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
+
+    let file = directory
+        .open_with(Path::new(name), &options)
+        .with_context(|| format!("Failed to open desktop log {}", path.display()))?
+        .into_std();
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Failed to inspect desktop log {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("desktop log is not a regular file: {}", path.display());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let owner = unsafe { libc::geteuid() };
+        if metadata.uid() != owner {
+            bail!(
+                "desktop log {} is owned by uid {}, not the current user",
+                path.display(),
+                metadata.uid()
+            );
+        }
+        if metadata.mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("Failed to restrict desktop log {}", path.display()))?;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x0000_0400 != 0 {
+            bail!("desktop log is a reparse point: {}", path.display());
+        }
+        enforce_windows_private_acl(&file, path, false)?;
+    }
+
+    Ok(file)
+}
+
+async fn desktop_config_dir() -> Result<PathBuf> {
+    let (config_dir, _) = resolve_runtime_dirs().await?;
+    normalize_desktop_config_dir(config_dir)
+}
+
+fn normalize_desktop_config_dir(config_dir: PathBuf) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = if config_dir.is_absolute() {
+        config_dir
+    } else {
+        std::env::current_dir()?.join(config_dir)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+async fn desktop_log_path() -> Result<PathBuf> {
+    Ok(desktop_config_dir()
+        .await?
+        .join("logs/zeroclaw-desktop-daemon.log"))
+}
+
+fn desktop_handshake_frame(prefix: &str, message: Option<&str>) -> String {
+    let mut line = prefix.to_string();
+    if let Some(message) = message {
+        line.push(' ');
+        line.push_str(&message.replace("\r\n", " ").replace(['\r', '\n'], " "));
+    }
+    let max_content_bytes = DESKTOP_READINESS_FRAME_MAX_BYTES - 1;
+    if line.len() > max_content_bytes {
+        let mut truncate_at = max_content_bytes - 3;
+        while !line.is_char_boundary(truncate_at) {
+            truncate_at -= 1;
+        }
+        line.truncate(truncate_at);
+        line.push_str("...");
+    }
+    line.push('\n');
+    line
+}
+
+fn desktop_error_frame(error: &anyhow::Error) -> String {
+    desktop_handshake_frame("ERROR", Some(&format!("{error:#}")))
+}
+
+fn emit_desktop_frame(frame: &str) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = std::io::Write::write_all(&mut stdout, frame.as_bytes());
+    let _ = std::io::Write::flush(&mut stdout);
+}
+
+fn emit_desktop_handshake(prefix: &str, message: Option<&str>) {
+    let line = desktop_handshake_frame(prefix, message);
+    emit_desktop_frame(&line);
+}
+
+fn emit_desktop_error(error: &anyhow::Error) {
+    let frame = desktop_error_frame(error);
+    emit_desktop_frame(&frame);
+}
+
+fn handle_desktop_preflight<T>(
+    result: Result<T>,
+    emit_error: impl FnOnce(&anyhow::Error),
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            emit_error(&error);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn drain_bounded_service_log<R: Read>(mut input: R, path: &Path) -> Result<()> {
+    let mut log = match BoundedServiceLog::open(path) {
+        Ok(log) => Some(log),
+        Err(error) => {
+            let mut buffer = [0_u8; 16 * 1024];
+            while input.read(&mut buffer)? != 0 {}
+            return Err(error);
+        }
+    };
+    let mut first_write_error = None;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .context("Failed to read service log input")?;
+        if read == 0 {
+            break;
+        }
+        if let Some(writer) = log.as_mut()
+            && let Err(error) = writer.write_chunk(&buffer[..read])
+        {
+            first_write_error = Some(error.context(format!(
+                "Failed to write bounded service log {}",
+                path.display()
+            )));
+            log = None;
+        }
+    }
+    if let Some(error) = first_write_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn run_openrc_log_writer(stderr: bool) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stderr;
+        bail!("the OpenRC log writer is only supported on Linux")
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        drain_bounded_service_log(std::io::stdin().lock(), openrc_log_path(stderr))
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn openrc_log_path(stderr: bool) -> &'static Path {
+    Path::new(if stderr {
+        OPENRC_STDERR_LOG
+    } else {
+        OPENRC_STDOUT_LOG
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct PendingServiceLog {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct ServiceLogSinkInner {
+    pending: Mutex<PendingServiceLog>,
+    ready: Condvar,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+#[derive(Clone)]
+struct ServiceLogSink(Arc<ServiceLogSinkInner>);
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl ServiceLogSink {
+    fn push(&self, mut chunk: Vec<u8>) {
+        if chunk.len() > SERVICE_LOG_PENDING_BYTES {
+            chunk = chunk.split_off(chunk.len() - SERVICE_LOG_PENDING_BYTES);
+        }
+        let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.closed {
+            return;
+        }
+        while pending.bytes + chunk.len() > SERVICE_LOG_PENDING_BYTES {
+            let Some(discarded) = pending.chunks.pop_front() else {
+                break;
+            };
+            pending.bytes -= discarded.len();
+        }
+        pending.bytes += chunk.len();
+        pending.chunks.push_back(chunk);
+        self.0.ready.notify_one();
+    }
+
+    fn close(&self) {
+        let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.closed = true;
+        self.0.ready.notify_one();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct ServiceLogWriters {
+    stdout: ServiceLogSink,
+    stderr: ServiceLogSink,
+    tasks: Vec<JoinHandle<()>>,
+    failure_sender: Option<SyncSender<String>>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl ServiceLogWriters {
+    #[cfg(any(target_os = "macos", test))]
+    fn open_split(stdout_path: &Path, stderr_path: &Path) -> Result<Self> {
+        let stdout_log = BoundedServiceLog::open(stdout_path)?;
+        let stderr_log = BoundedServiceLog::open(stderr_path)?;
+        let (stdout, stdout_task) =
+            spawn_service_log_writer(stdout_path.to_path_buf(), stdout_log, "launchd", None);
+        let (stderr, stderr_task) =
+            spawn_service_log_writer(stderr_path.to_path_buf(), stderr_log, "launchd", None);
+        Ok(Self {
+            stdout,
+            stderr,
+            tasks: vec![stdout_task, stderr_task],
+            failure_sender: None,
+        })
+    }
+
+    #[cfg(windows)]
+    fn open_windows_split(
+        stdout_path: &Path,
+        stderr_path: &Path,
+    ) -> Result<(Self, Receiver<String>)> {
+        let stdout_log = BoundedServiceLog::open_desktop(stdout_path)?;
+        let stderr_log = BoundedServiceLog::open_desktop(stderr_path)?;
+        let (failure_sender, failures) = mpsc::sync_channel(1);
+        let (stdout, stdout_task) = spawn_service_log_writer(
+            stdout_path.to_path_buf(),
+            stdout_log,
+            "Windows service",
+            Some(failure_sender.clone()),
+        );
+        let (stderr, stderr_task) = spawn_service_log_writer(
+            stderr_path.to_path_buf(),
+            stderr_log,
+            "Windows service",
+            Some(failure_sender.clone()),
+        );
+        Ok((
+            Self {
+                stdout,
+                stderr,
+                tasks: vec![stdout_task, stderr_task],
+                failure_sender: Some(failure_sender),
+            },
+            failures,
+        ))
+    }
+
+    fn open_combined(path: &Path) -> Result<Self> {
+        let log = BoundedServiceLog::open_desktop(path)?;
+        let (sink, task) = spawn_service_log_writer(path.to_path_buf(), log, "desktop", None);
+        Ok(Self {
+            stdout: sink.clone(),
+            stderr: sink,
+            tasks: vec![task],
+            failure_sender: None,
+        })
+    }
+
+    async fn finish(mut self) {
+        self.stdout.close();
+        self.stderr.close();
+        let deadline = Instant::now() + SERVICE_LOG_WRITER_DRAIN_TIMEOUT;
+        for task in self.tasks.drain(..) {
+            while !task.is_finished() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if task.is_finished() {
+                if task.join().is_err() {
+                    report_service_capture_failure(
+                        &self.failure_sender,
+                        "service log writer panicked".into(),
+                    );
+                }
+            } else {
+                report_service_capture_failure(
+                    &self.failure_sender,
+                    "service log writer timed out".into(),
+                );
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl Drop for ServiceLogWriters {
+    fn drop(&mut self) {
+        self.stdout.close();
+        self.stderr.close();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn spawn_service_log_writer(
+    path: PathBuf,
+    mut log: BoundedServiceLog,
+    failure_label: &'static str,
+    failure_sender: Option<SyncSender<String>>,
+) -> (ServiceLogSink, JoinHandle<()>) {
+    let inner = Arc::new(ServiceLogSinkInner {
+        pending: Mutex::new(PendingServiceLog {
+            chunks: VecDeque::new(),
+            bytes: 0,
+            closed: false,
+        }),
+        ready: Condvar::new(),
+    });
+    let sink = ServiceLogSink(Arc::clone(&inner));
+    let task = std::thread::spawn(move || {
+        let mut writable = true;
+        loop {
+            let chunk = {
+                let mut pending = inner.pending.lock().unwrap_or_else(|e| e.into_inner());
+                while pending.chunks.is_empty() && !pending.closed {
+                    pending = inner.ready.wait(pending).unwrap_or_else(|e| e.into_inner());
+                }
+                let chunk = pending.chunks.pop_front();
+                if let Some(ref chunk) = chunk {
+                    pending.bytes -= chunk.len();
+                } else if pending.closed {
+                    break;
+                }
+                chunk
+            };
+            let Some(chunk) = chunk else {
+                continue;
+            };
+            if writable && let Err(error) = log.write_chunk(&chunk) {
+                report_service_capture_failure(
+                    &failure_sender,
+                    format!(
+                        "{failure_label} log write failed for {}: {error:#}",
+                        path.display()
+                    ),
+                );
+                eprintln!(
+                    "{failure_label} log write failed for {}; continuing without capture: {error:#}",
+                    path.display()
+                );
+                writable = false;
+            }
+        }
+    });
+    (sink, task)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn report_service_capture_failure(sender: &Option<SyncSender<String>>, error: String) {
+    if let Some(sender) = sender {
+        let _ = sender.try_send(error);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn drain_service_pipe<R>(
+    mut pipe: R,
+    sink: ServiceLogSink,
+    failure_label: &'static str,
+    failure_sender: Option<SyncSender<String>>,
+) where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0; 16 * 1024];
+    loop {
+        match pipe.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => sink.push(buffer[..read].to_vec()),
+            Err(error) => {
+                report_service_capture_failure(
+                    &failure_sender,
+                    format!("{failure_label} log pipe read failed: {error}"),
+                );
+                sink.push(format!("{failure_label} log pipe read failed: {error}\n").into_bytes());
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn drain_launchd_pipe<R>(pipe: R, sink: ServiceLogSink)
+where
+    R: AsyncRead + Unpin,
+{
+    drain_service_pipe(pipe, sink, "launchd", None).await;
+}
+
+pub async fn run_launchd_daemon(config_dir: &Path) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = config_dir;
+        bail!("the launchd daemon runner is only supported on macOS")
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let paths = launchd_capture_paths(config_dir);
+        run_with_launchd_capture(paths, || {
+            let executable = std::env::current_exe()
+                .context("Failed to resolve the launchd daemon executable")?;
+            let mut command = TokioCommand::new(executable);
+            command.arg("--config-dir").arg(config_dir).arg("daemon");
+            Ok(command)
+        })
+        .await
+    }
+}
+
+#[cfg(windows)]
+struct WindowsServiceJob(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl WindowsServiceJob {
+    fn attach_current() -> Result<Self> {
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        // A null security attribute makes this unnamed handle non-inheritable.
+        let job = Self(
+            unsafe { CreateJobObjectW(None, None) }
+                .context("Failed to create the Windows service containment job")?,
+        );
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+            .context("Failed to enable Windows service kill-on-close containment")?;
+            AssignProcessToJobObject(job.0, GetCurrentProcess())
+                .context("Failed to place the Windows service runner in its containment job")?;
+        }
+        Ok(job)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsServiceJob {
+    fn drop(&mut self) {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Run the per-user Task Scheduler action with bounded stdout and stderr capture.
+pub async fn run_windows_daemon(config_dir: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let _ = config_dir;
+        bail!("the Windows task runner is only supported on Windows")
+    }
+
+    #[cfg(windows)]
+    {
+        let config_dir = normalize_desktop_config_dir(config_dir.to_path_buf())?;
+        let logs_dir = config_dir.join("logs");
+        let stdout_path = logs_dir.join("daemon.stdout.log");
+        let stderr_path = logs_dir.join("daemon.stderr.log");
+        let (writers, mut failures) =
+            ServiceLogWriters::open_windows_split(&stdout_path, &stderr_path)?;
+        let containment = match WindowsServiceJob::attach_current() {
+            Ok(job) => job,
+            Err(error) => {
+                writers
+                    .stderr
+                    .push(format!("Windows service capture failed: {error:#}\n").into_bytes());
+                writers.finish().await;
+                return Err(error);
+            }
+        };
+        let result = async {
+            let executable = std::env::current_exe()
+                .context("Failed to resolve the Windows service daemon executable")?;
+            let mut command = TokioCommand::new(executable);
+            command.arg("--config-dir").arg(&config_dir).arg("daemon");
+            supervise_windows_service_child(command, &writers, &mut failures).await
+        }
+        .await;
+        if let Err(error) = &result {
+            let diagnostic = format!("Windows service capture failed: {error:#}\n").into_bytes();
+            writers.stdout.push(diagnostic.clone());
+            writers.stderr.push(diagnostic);
+        }
+        writers.finish().await;
+        let result = match (result, failures.try_recv()) {
+            (Ok(()), Ok(error)) => Err(anyhow::anyhow!("Windows service capture failed: {error}")),
+            (result, _) => result,
+        };
+        // Closing a kill-on-close job while its runner is still executing would
+        // terminate this process before its exit status reaches Task Scheduler.
+        // Keep the handle until process teardown; Windows closes it on exit.
+        std::mem::forget(containment);
+        result
+    }
+}
+
+#[cfg(windows)]
+async fn supervise_windows_service_child(
+    mut command: TokioCommand,
+    writers: &ServiceLogWriters,
+    failures: &mut Receiver<String>,
+) -> Result<()> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut command = CommandWrap::from(command);
+    command
+        .wrap(KillOnDrop)
+        .wrap(WindowsSpawnFailureGuard)
+        .wrap(JobObject);
+    let mut child = command
+        .spawn()
+        .context("Failed to start the Windows service daemon child")?;
+    let stdout = child
+        .stdout()
+        .take()
+        .context("Windows service daemon stdout pipe unavailable")?;
+    let stderr = child
+        .stderr()
+        .take()
+        .context("Windows service daemon stderr pipe unavailable")?;
+    let stdout_sink = writers.stdout.clone();
+    let stderr_sink = writers.stderr.clone();
+    let stdout_failure_sender = writers.failure_sender.clone();
+    let stderr_failure_sender = writers.failure_sender.clone();
+    let stdout_task = zeroclaw_spawn::spawn!(drain_service_pipe(
+        stdout,
+        stdout_sink,
+        "Windows service",
+        stdout_failure_sender
+    ));
+    let stderr_task = zeroclaw_spawn::spawn!(drain_service_pipe(
+        stderr,
+        stderr_sink,
+        "Windows service",
+        stderr_failure_sender
+    ));
+    let outcome = loop {
+        if let Ok(error) = failures.try_recv() {
+            break Err(anyhow::anyhow!("Windows service capture failed: {error}"));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                break Err(error).context("Failed to poll the Windows service daemon child");
+            }
+        }
+        if writers.tasks.iter().any(JoinHandle::is_finished) {
+            break Err(anyhow::anyhow!(
+                "Windows service log writer stopped unexpectedly"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // process-wrap's wait() includes descendants. Terminate the inner job
+    // before waiting for pipe EOF, including on a capture failure.
+    let kill_result = child
+        .start_kill()
+        .context("Failed to terminate Windows service daemon descendants");
+    let reap_result = tokio::time::timeout(DESKTOP_PIPE_DRAIN_TIMEOUT, child.wait())
+        .await
+        .context("Timed out reaping Windows service daemon descendants")
+        .and_then(|result| result.context("Failed to reap Windows service daemon descendants"));
+    finish_service_pipes(stdout_task, stderr_task, DESKTOP_PIPE_DRAIN_TIMEOUT).await;
+    let status = outcome?;
+    kill_result?;
+    reap_result?;
+    if let Ok(error) = failures.try_recv() {
+        bail!("Windows service capture failed: {error}");
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("Windows service daemon child exited with status {status}")
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn run_with_launchd_capture<F>(paths: LaunchdCapturePaths, make_command: F) -> Result<()>
+where
+    F: FnOnce() -> Result<TokioCommand>,
+{
+    let writers = ServiceLogWriters::open_split(&paths.stdout, &paths.stderr)?;
+    let result = async {
+        let command = make_command()?;
+        supervise_launchd_child(command, &writers).await
+    }
+    .await;
+    if let Err(error) = &result {
+        writers
+            .stderr
+            .push(format!("launchd capture failed: {error:#}\n").into_bytes());
+    }
+    writers.finish().await;
+    result
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn supervise_launchd_child(
+    mut command: TokioCommand,
+    writers: &ServiceLogWriters,
+) -> Result<()> {
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    let mut signals = ServiceSignals::new()?;
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().context("Failed to start daemon child")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("daemon stdout pipe unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("daemon stderr pipe unavailable")?;
+    let stdout_sink = writers.stdout.clone();
+    let stderr_sink = writers.stderr.clone();
+    let stdout_task = zeroclaw_spawn::spawn!(drain_launchd_pipe(stdout, stdout_sink));
+    let stderr_task = zeroclaw_spawn::spawn!(drain_launchd_pipe(stderr, stderr_sink));
+
+    #[cfg(any(target_os = "macos", all(test, unix)))]
+    let outcome = wait_for_service_child(&mut child, &mut signals).await;
+    #[cfg(all(test, not(unix)))]
+    let outcome = wait_for_service_child(&mut child).await;
+    finish_service_pipes(stdout_task, stderr_task, LAUNCHD_PIPE_DRAIN_TIMEOUT).await;
+    let status = outcome?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("daemon child exited with status {status}")
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub async fn run_desktop_daemon(port: u16) -> Result<()> {
+    let path = handle_desktop_preflight(desktop_log_path().await, emit_desktop_error)?;
+    let executable = handle_desktop_preflight(
+        std::env::current_exe().context("Failed to resolve the desktop daemon executable"),
+        emit_desktop_error,
+    )?;
+    run_desktop_capture_with_executable(path, executable, port).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub async fn run_desktop_daemon(port: u16) -> Result<()> {
+    let _ = port;
+    bail!("the desktop daemon runner is unsupported on this platform")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn run_with_desktop_capture<F>(path: PathBuf, make_command: F) -> Result<()>
+where
+    F: FnMut() -> Result<TokioCommand>,
+{
+    let writers = match ServiceLogWriters::open_combined(&path) {
+        Ok(writers) => writers,
+        Err(error) => {
+            emit_desktop_handshake("ERROR", Some(&format!("{error:#}")));
+            return Err(error);
+        }
+    };
+    let mut make_command = make_command;
+    let logs_dir = path
+        .parent()
+        .context("desktop log path has no logs directory")?
+        .to_path_buf();
+    let result =
+        async { supervise_desktop_child(&mut make_command, &writers, &logs_dir).await }.await;
+    if let Err(error) = &result {
+        writers
+            .stderr
+            .push(format!("desktop capture failed: {error:#}\n").into_bytes());
+        emit_desktop_handshake("ERROR", Some(&format!("{error:#}")));
+    }
+    writers.finish().await;
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn run_desktop_capture_with_executable(
+    path: PathBuf,
+    executable: PathBuf,
+    port: u16,
+) -> Result<()> {
+    run_with_desktop_capture(path, move || {
+        let mut command = TokioCommand::new(&executable);
+        command.arg("daemon").arg("-p").arg(port.to_string());
+        Ok(command)
+    })
+    .await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn prepare_desktop_restart_marker(logs_dir: &Path) -> Result<PathBuf> {
+    let marker = logs_dir.join(format!(
+        ".zeroclaw-desktop-restart-{}.marker",
+        uuid::Uuid::new_v4()
+    ));
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "Failed to remove stale desktop restart marker {}",
+                    marker.display()
+                )
+            });
+        }
+    }
+    Ok(marker)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn consume_desktop_restart_marker(marker: &Path) -> Result<bool> {
+    match fs::symlink_metadata(marker) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!(
+                    "desktop restart marker is not a regular file: {}",
+                    marker.display()
+                );
+            }
+            fs::remove_file(marker).with_context(|| {
+                format!(
+                    "Failed to remove desktop restart marker {}",
+                    marker.display()
+                )
+            })?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to inspect desktop restart marker {}",
+                marker.display()
+            )
+        }),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn supervise_desktop_child(
+    make_command: &mut impl FnMut() -> Result<TokioCommand>,
+    writers: &ServiceLogWriters,
+    logs_dir: &Path,
+) -> Result<()> {
+    #[cfg(unix)]
+    let mut signals = ServiceSignals::new()?;
+    let mut first_generation = true;
+    loop {
+        let marker_path = prepare_desktop_restart_marker(logs_dir)?;
+        let mut command = make_command()?;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env(crate::restart::DESKTOP_SUPERVISED_ENV, "1")
+            .env(crate::restart::DESKTOP_RESTART_MARKER_ENV, &marker_path)
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        let mut child = {
+            let mut command = CommandWrap::from(command);
+            command
+                .wrap(KillOnDrop)
+                .wrap(WindowsSpawnFailureGuard)
+                .wrap(JobObject);
+            command
+                .spawn()
+                .context("Failed to start desktop daemon child in its supervisor job")?
+        };
+        #[cfg(not(windows))]
+        let mut child = command
+            .spawn()
+            .context("Failed to start desktop daemon child")?;
+        #[cfg(windows)]
+        let stdout = child
+            .stdout()
+            .take()
+            .context("desktop daemon stdout pipe unavailable")?;
+        #[cfg(not(windows))]
+        let stdout = child
+            .stdout
+            .take()
+            .context("desktop daemon stdout pipe unavailable")?;
+        #[cfg(windows)]
+        let stderr = child
+            .stderr()
+            .take()
+            .context("desktop daemon stderr pipe unavailable")?;
+        #[cfg(not(windows))]
+        let stderr = child
+            .stderr
+            .take()
+            .context("desktop daemon stderr pipe unavailable")?;
+        let stdout_sink = writers.stdout.clone();
+        let stderr_sink = writers.stderr.clone();
+        let stdout_task =
+            zeroclaw_spawn::spawn!(drain_service_pipe(stdout, stdout_sink, "desktop", None));
+        let stderr_task =
+            zeroclaw_spawn::spawn!(drain_service_pipe(stderr, stderr_sink, "desktop", None));
+        if first_generation {
+            emit_desktop_handshake("READY", None);
+            first_generation = false;
+        }
+        #[cfg(unix)]
+        let outcome = wait_for_service_child(&mut child, &mut signals).await;
+        #[cfg(not(unix))]
+        let outcome = child
+            .wait()
+            .await
+            .context("Failed to wait for desktop daemon child");
+        finish_service_pipes(stdout_task, stderr_task, DESKTOP_PIPE_DRAIN_TIMEOUT).await;
+        let status = outcome?;
+        let marked_restart = consume_desktop_restart_marker(&marker_path)?;
+        if status.code() == Some(crate::restart::DESKTOP_RESTART_EXIT_CODE) && marked_restart {
+            continue;
+        }
+        if status.success() {
+            return Ok(());
+        }
+        bail!("daemon child exited with status {status}");
+    }
+}
+
+/// Reaps a suspended Windows child if a later command wrapper cannot finish setup.
+///
+/// `JobObject` assigns the process before resuming it, so this guard runs before
+/// a failed assignment is returned and the child cannot have spawned descendants.
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsSpawnFailureGuard;
+
+#[cfg(windows)]
+impl CommandWrapper for WindowsSpawnFailureGuard {
+    fn wrap_child(
+        &mut self,
+        child: Box<dyn ChildWrapper>,
+        _core: &CommandWrap,
+    ) -> std::io::Result<Box<dyn ChildWrapper>> {
+        Ok(Box::new(WindowsSpawnFailureChild { child: Some(child) }))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsSpawnFailureChild {
+    child: Option<Box<dyn ChildWrapper>>,
+}
+
+#[cfg(windows)]
+impl ChildWrapper for WindowsSpawnFailureChild {
+    fn inner(&self) -> &dyn ChildWrapper {
+        self.child.as_deref().expect("guard child must be present")
+    }
+
+    fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+        self.child
+            .as_deref_mut()
+            .expect("guard child must be present")
+    }
+
+    fn into_inner(mut self: Box<Self>) -> Box<dyn ChildWrapper> {
+        self.child.take().expect("guard child must be present")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSpawnFailureChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_deref_mut() else {
+            return;
+        };
+        let Some(raw_handle) = child.inner_child().raw_handle() else {
+            return;
+        };
+        let _ = child.start_kill();
+        let handle = windows::Win32::Foundation::HANDLE(raw_handle as _);
+        // A suspended pre-assignment child has no descendants. Waiting here
+        // closes the only gap between spawn and durable Job Object ownership.
+        let _ = unsafe { windows::Win32::System::Threading::WaitForSingleObject(handle, 5_000) };
+        let _ = child.try_wait();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn finish_service_pipes(
+    mut stdout: tokio::task::JoinHandle<()>,
+    mut stderr: tokio::task::JoinHandle<()>,
+    timeout: Duration,
+) {
+    if tokio::time::timeout(timeout, async {
+        let _ = tokio::join!(&mut stdout, &mut stderr);
+    })
+    .await
+    .is_err()
+    {
+        stdout.abort();
+        stderr.abort();
+        let _ = tokio::join!(stdout, stderr);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+struct ServiceSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+impl ServiceSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+async fn wait_for_service_child(
+    child: &mut Child,
+    signals: &mut ServiceSignals,
+) -> Result<std::process::ExitStatus> {
+    let forwarded = tokio::select! {
+        status = child.wait() => return status.context("Failed to wait for daemon child"),
+        _ = signals.interrupt.recv() => libc::SIGINT,
+        _ = signals.terminate.recv() => libc::SIGTERM,
+    };
+    stop_service_child(child, forwarded).await
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+async fn stop_service_child(
+    child: &mut Child,
+    signal: libc::c_int,
+) -> Result<std::process::ExitStatus> {
+    if let Err(error) = forward_service_signal(child, signal)
+        && error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            != Some(libc::ESRCH)
+    {
+        return Err(error);
+    }
+
+    match tokio::time::timeout(SERVICE_STOP_TIMEOUT, child.wait()).await {
+        Ok(status) => status.context("Failed to wait for stopped daemon child"),
+        Err(_) => {
+            if let Some(status) = child
+                .try_wait()
+                .context("Failed to inspect daemon child after stop timeout")?
+            {
+                return Ok(status);
+            }
+            child
+                .kill()
+                .await
+                .context("Failed to kill daemon child after stop timeout")?;
+            child
+                .wait()
+                .await
+                .context("Failed to reap daemon child after forced stop")
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+fn forward_service_signal(child: &Child, signal: libc::c_int) -> Result<()> {
+    let pid = child.id().context("daemon child PID unavailable")?;
+    // SAFETY: `pid` belongs to the child owned by this runner, and the caller
+    // passes only the SIGINT or SIGTERM value received by the supervisor.
+    if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("Failed to forward service stop signal")
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+async fn wait_for_service_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+    child
+        .wait()
+        .await
+        .context("Failed to wait for daemon child")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SystemdUserLinger {
+    Enabled,
+    Disabled { user: String },
+    Unknown,
+}
 
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,12 +1717,6 @@ impl FromStr for InitSystem {
 }
 
 impl InitSystem {
-    /// Resolve auto-detection to a concrete init system
-    ///
-    /// Detection order (deny-by-default):
-    /// 1. `/run/systemd/system` exists → Systemd
-    /// 2. `/run/openrc` exists AND OpenRC binary present → OpenRC
-    /// 3. else → Error (unknown init system)
     #[cfg(target_os = "linux")]
     pub fn resolve(self) -> Result<Self> {
         match self {
@@ -61,13 +1735,12 @@ impl InitSystem {
 }
 
 /// Detect the active init system on Linux
-///
 /// Checks for systemd and OpenRC in order, returning the first match.
 /// Returns an error if neither is detected.
 #[cfg(target_os = "linux")]
 fn detect_init_system() -> Result<InitSystem> {
     // Check for systemd first (most common on modern Linux)
-    if Path::new("/run/systemd/system").exists() {
+    if linux_systemd_runtime_present() {
         return Ok(InitSystem::Systemd);
     }
 
@@ -85,18 +1758,100 @@ fn detect_init_system() -> Result<InitSystem> {
     );
 }
 
+pub(crate) fn linux_systemd_runtime_present() -> bool {
+    cfg!(target_os = "linux") && Path::new("/run/systemd/system").exists()
+}
+
 fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
+fn linux_service_base(config: &Config) -> String {
+    let Some(dir_name) = config
+        .config_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return "zeroclaw".to_string();
+    };
+    let base = dir_name.strip_prefix('.').unwrap_or(dir_name);
+    if base == "zeroclaw" {
+        return base.to_string();
+    }
+    if let Some(suffix) = base.strip_prefix("zeroclaw-")
+        && !suffix.is_empty()
+    {
+        return base.to_string();
+    }
+    "zeroclaw".to_string()
+}
+
+fn linux_systemd_unit(config: &Config) -> String {
+    format!("{}.service", linux_service_base(config))
+}
+
+fn linux_openrc_service(config: &Config) -> String {
+    linux_service_base(config)
+}
+
+fn ensure_linux_default_install_scope(config: &Config, action: &str) -> Result<()> {
+    let service = linux_service_base(config);
+    if service == "zeroclaw" {
+        return Ok(());
+    }
+
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| config.config_path.display().to_string());
+    bail!(
+        "Linux service {action} only manages the default zeroclaw service. \
+         Config directory {config_dir} maps to named service {service}; \
+         provide that unit manually, then use service status/start/stop/restart/logs to manage it."
+    );
+}
+
+fn linux_systemd_action_args(config: &Config, action: &str) -> Vec<String> {
+    vec![
+        "--user".to_string(),
+        action.to_string(),
+        linux_systemd_unit(config),
+    ]
+}
+
+fn linux_openrc_action_args(config: &Config, action: &str) -> Vec<String> {
+    vec![linux_openrc_service(config), action.to_string()]
+}
+
+fn linux_journalctl_args(config: &Config, lines: usize, follow: bool) -> Vec<String> {
+    let mut args = vec![
+        "--user".to_string(),
+        "-u".to_string(),
+        linux_systemd_unit(config),
+        "-n".to_string(),
+        lines.to_string(),
+        "--no-pager".to_string(),
+    ];
+    if follow {
+        args.push("-f".to_string());
+    }
+    args
+}
+
+fn linux_openrc_log_dir(config: &Config) -> PathBuf {
+    Path::new("/var/log").join(linux_openrc_service(config))
+}
+
 /// Returns whether the ZeroClaw daemon service is currently running.
-pub fn is_running() -> bool {
+pub fn is_running(config: &Config) -> bool {
     if cfg!(target_os = "macos") {
         run_capture(Command::new("launchctl").arg("list"))
             .map(|out| out.lines().any(|l| l.contains(SERVICE_LABEL)))
             .unwrap_or(false)
     } else if cfg!(target_os = "linux") {
-        is_running_linux()
+        is_running_linux(config)
     } else if cfg!(target_os = "windows") {
         run_capture(Command::new("schtasks").args([
             "/Query",
@@ -112,15 +1867,15 @@ pub fn is_running() -> bool {
     }
 }
 
-fn is_running_linux() -> bool {
+fn is_running_linux(config: &Config) -> bool {
     // Try systemd first, then OpenRC — mirrors detect_init_system() order
-    if run_capture(Command::new("systemctl").args(["--user", "is-active", "zeroclaw.service"]))
+    if run_capture(Command::new("systemctl").args(linux_systemd_action_args(config, "is-active")))
         .map(|out| out.trim() == "active")
         .unwrap_or(false)
     {
         return true;
     }
-    run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
+    run_capture(Command::new("rc-service").args(linux_openrc_action_args(config, "status")))
         .map(|out| out.contains("started"))
         .unwrap_or(false)
 }
@@ -144,7 +1899,7 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
         // The plist may reference this path for WorkingDirectory and log files.
         let exe = std::env::current_exe().ok();
         if let Some(ref exe_path) = exe
-            && let Some(var_dir) = detect_homebrew_var_dir(exe_path)
+            && let Some(var_dir) = homebrew_var_dir_from_exe(exe_path)
         {
             let _ = fs::create_dir_all(&var_dir);
         }
@@ -155,7 +1910,7 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        start_linux(resolved)
+        start_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         run_checked(Command::new("schtasks").args(["/Run", "/TN", windows_task_name()]))?;
@@ -167,16 +1922,21 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn start_linux(init_system: InitSystem) -> Result<()> {
+fn start_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
+            run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "start")),
+            )?;
+            warn_if_systemd_user_linger_disabled();
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "start"]))?;
+            run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "start")),
+            )?;
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service start"),
     }
     println!("✅ Service started");
     Ok(())
@@ -196,7 +1956,7 @@ pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        stop_linux(resolved)
+        stop_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
@@ -209,16 +1969,19 @@ pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn stop_linux(init_system: InitSystem) -> Result<()> {
+fn stop_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
+            let _ = run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "stop")),
+            );
         }
         InitSystem::Openrc => {
-            let _ = run_checked(Command::new("rc-service").args(["zeroclaw", "stop"]));
+            let _ = run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "stop")),
+            );
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service stop"),
     }
     println!("✅ Service stopped");
     Ok(())
@@ -234,7 +1997,7 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
 
     if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        return restart_linux(resolved);
+        return restart_linux(config, resolved);
     }
 
     if cfg!(target_os = "windows") {
@@ -247,16 +2010,20 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn restart_linux(init_system: InitSystem) -> Result<()> {
+fn restart_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "zeroclaw.service"]))?;
+            run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "restart")),
+            )?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "restart"]))?;
+            run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "restart")),
+            )?;
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service restart"),
     }
     println!("✅ Service restarted");
     Ok(())
@@ -274,7 +2041,7 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
                 "❌ not loaded"
             }
         );
-        println!("Unit: {}", macos_service_file()?.display());
+        println!("Unit: {}", macos_service_file()?.display().to_string());
         return Ok(());
     }
 
@@ -286,11 +2053,8 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
-        let out =
-            run_capture(Command::new("schtasks").args(["/Query", "/TN", task_name, "/FO", "LIST"]));
-        match out {
-            Ok(text) => {
-                let running = text.contains("Running");
+        match windows_task_running(task_name) {
+            Ok(Some(running)) => {
                 println!(
                     "Service: {}",
                     if running {
@@ -301,9 +2065,10 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
                 );
                 println!("Task: {}", task_name);
             }
-            Err(_) => {
+            Ok(None) => {
                 println!("Service: ❌ not installed");
             }
+            Err(error) => return Err(error),
         }
         return Ok(());
     }
@@ -314,22 +2079,25 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
 fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let out = run_capture(Command::new("systemctl").args([
-                "--user",
-                "is-active",
-                "zeroclaw.service",
-            ]))
+            let out = run_capture(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "is-active")),
+            )
             .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: {}", linux_service_file(config)?.display());
+            println!(
+                "Unit: {}",
+                linux_systemd_unit_file(config)?.display().to_string()
+            );
         }
         InitSystem::Openrc => {
-            let out = run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
-                .unwrap_or_else(|_| "unknown".into());
+            let out = run_capture(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "status")),
+            )
+            .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: /etc/init.d/zeroclaw");
+            println!("Unit: /etc/init.d/{}", linux_openrc_service(config));
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service status"),
     }
     Ok(())
 }
@@ -349,10 +2117,8 @@ pub fn logs(config: &Config, init_system: InitSystem, lines: usize, follow: bool
 }
 
 fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
-    // Try the launchd log files first (StandardOutPath / StandardErrorPath from the plist).
-    // These are the most reliable source since they capture all daemon output.
     let exe = std::env::current_exe().ok();
-    let homebrew_var_dir = exe.as_ref().and_then(|e| detect_homebrew_var_dir(e));
+    let homebrew_var_dir = exe.as_ref().and_then(|e| homebrew_var_dir_from_exe(e));
     let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
         var_dir.join("logs")
     } else {
@@ -366,54 +2132,25 @@ fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
     let stderr_log = logs_dir.join("daemon.stderr.log");
     let stdout_log = logs_dir.join("daemon.stdout.log");
 
-    // Prefer stderr log (most informative), fall back to stdout
-    let log_file = if stderr_log.exists() {
-        stderr_log
-    } else if stdout_log.exists() {
-        stdout_log
+    let targets = if follow {
+        follow_log_targets(&stdout_log, &stderr_log)
     } else {
+        service_log_targets(&stdout_log, &stderr_log)
+    };
+    if targets.is_empty() {
         bail!(
             "No log files found in {}. Is the service installed?",
             logs_dir.display()
         );
-    };
-
-    if follow {
-        let status = Command::new("tail")
-            .args(["-n", &lines.to_string(), "-f"])
-            .arg(&log_file)
-            .status()
-            .context("Failed to run tail")?;
-        if !status.success() {
-            bail!("tail exited with non-zero status");
-        }
-    } else {
-        let status = Command::new("tail")
-            .args(["-n", &lines.to_string()])
-            .arg(&log_file)
-            .status()
-            .context("Failed to run tail")?;
-        if !status.success() {
-            bail!("tail exited with non-zero status");
-        }
     }
-    Ok(())
+    report_empty_capture(&targets, &logs_dir, follow);
+    tail_files(&targets, lines, follow)
 }
 
 fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bool) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let mut args = vec![
-                "--user".to_string(),
-                "-u".to_string(),
-                "zeroclaw.service".to_string(),
-                "-n".to_string(),
-                lines.to_string(),
-                "--no-pager".to_string(),
-            ];
-            if follow {
-                args.push("-f".to_string());
-            }
+            let args = linux_journalctl_args(config, lines, follow);
             let status = Command::new("journalctl")
                 .args(&args)
                 .status()
@@ -423,21 +2160,25 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
             }
         }
         InitSystem::Openrc => {
-            // OpenRC logs go to /var/log/zeroclaw/error.log (as configured in the init script)
-            let log_file = Path::new("/var/log/zeroclaw/error.log");
-            if !log_file.exists() {
-                // Fall back to access log
-                let access_log = Path::new("/var/log/zeroclaw/access.log");
-                if !access_log.exists() {
-                    bail!("No log files found at /var/log/zeroclaw/. Is the service installed?");
-                }
-                return tail_file(access_log, lines, follow);
+            let log_dir = linux_openrc_log_dir(config);
+            let access_log = log_dir.join("access.log");
+            let error_log = log_dir.join("error.log");
+            let targets = if follow {
+                follow_log_targets(&access_log, &error_log)
+            } else {
+                service_log_targets(&access_log, &error_log)
+            };
+            if targets.is_empty() {
+                bail!(
+                    "No log files found at {}. Is the service installed?",
+                    log_dir.display()
+                );
             }
-            tail_file(log_file, lines, follow)?;
+            report_empty_capture(&targets, &log_dir, follow);
+            tail_files(&targets, lines, follow)?;
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before reading logs"),
     }
-    let _ = config;
     Ok(())
 }
 
@@ -451,57 +2192,199 @@ fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
     let stderr_log = logs_dir.join("daemon.stderr.log");
     let stdout_log = logs_dir.join("daemon.stdout.log");
 
-    let log_file = if stderr_log.exists() {
-        stderr_log
-    } else if stdout_log.exists() {
-        stdout_log
-    } else {
+    let targets = service_log_targets(&stdout_log, &stderr_log);
+    let Some((primary, rest)) = targets.split_first() else {
         bail!(
             "No log files found in {}. Is the service installed?",
             logs_dir.display()
         );
     };
+    report_empty_capture(&targets, &logs_dir, follow);
+    let label_each = !rest.is_empty();
 
-    if follow {
-        // Windows: use PowerShell Get-Content -Wait for tail -f equivalent
-        let status = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    "Get-Content -Path '{}' -Tail {} -Wait",
-                    log_file.display(),
-                    lines
-                ),
-            ])
-            .status()
-            .context("Failed to run PowerShell Get-Content")?;
-        if !status.success() {
-            bail!("PowerShell Get-Content exited with non-zero status");
+    if !follow {
+        for path in &targets {
+            if label_each {
+                println!("==> {} <==", path.display());
+            }
+            run_get_content(path, lines, false)?;
         }
-    } else {
-        let status = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!("Get-Content -Path '{}' -Tail {}", log_file.display(), lines),
-            ])
-            .status()
-            .context("Failed to run PowerShell Get-Content")?;
-        if !status.success() {
-            bail!("PowerShell Get-Content exited with non-zero status");
-        }
+        return Ok(());
+    }
+
+    // `Get-Content -Wait` blocks on one path, so only the primary stream is followed.
+    for path in rest {
+        println!("==> {} <==", path.display());
+        run_get_content(path, lines, false)?;
+    }
+    if label_each {
+        println!("==> {} <==", primary.display());
+    }
+    run_get_content(primary, lines, true)
+}
+
+fn get_content_command(path: &Path, lines: usize, follow: bool) -> String {
+    let quoted = path.display().to_string().replace('\'', "''");
+    let wait = if follow { " -Wait" } else { "" };
+    format!("Get-Content -LiteralPath '{quoted}' -Encoding UTF8 -Tail {lines}{wait}")
+}
+
+fn run_get_content(path: &Path, lines: usize, follow: bool) -> Result<()> {
+    let status = Command::new("powershell")
+        .args(["-Command", &get_content_command(path, lines, follow)])
+        .status()
+        .context("Failed to run PowerShell Get-Content")?;
+    if !status.success() {
+        bail!("PowerShell Get-Content exited with non-zero status");
     }
     Ok(())
 }
 
-/// Tail a log file using the system `tail` command.
-fn tail_file(path: &Path, lines: usize, follow: bool) -> Result<()> {
-    let mut args = vec!["-n".to_string(), lines.to_string()];
-    if follow {
-        args.push("-f".to_string());
+fn windows_task_state_command(task_name: &str) -> String {
+    let quoted = task_name.replace('\'', "''");
+    format!(
+        "$task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{quoted}' }}; \
+         if ($null -eq $task) {{ exit 2 }}; \
+         if ([int]$task.State -eq 4) {{ exit 0 }}; \
+         if ([int]$task.State -eq 2) {{ exit 3 }}; \
+         if ([int]$task.State -eq 1 -or [int]$task.State -eq 3) {{ exit 4 }}; \
+         exit 5"
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsTaskState {
+    Running,
+    Queued,
+    Idle,
+    Missing,
+}
+
+fn windows_task_state_from_exit_code(code: Option<i32>) -> Result<WindowsTaskState> {
+    match code {
+        Some(0) => Ok(WindowsTaskState::Running),
+        Some(2) => Ok(WindowsTaskState::Missing),
+        Some(3) => Ok(WindowsTaskState::Queued),
+        Some(4) => Ok(WindowsTaskState::Idle),
+        Some(code) => bail!("PowerShell task-state query exited with status {code}"),
+        None => bail!("PowerShell task-state query terminated without an exit code"),
     }
-    let status = Command::new("tail")
-        .args(&args)
-        .arg(path)
+}
+
+fn windows_task_state(task_name: &str) -> Result<WindowsTaskState> {
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &windows_task_state_command(task_name),
+        ])
+        .status()
+        .context("Failed to query the Windows scheduled task state")?;
+    windows_task_state_from_exit_code(status.code())
+}
+
+fn windows_task_running(task_name: &str) -> Result<Option<bool>> {
+    Ok(match windows_task_state(task_name)? {
+        WindowsTaskState::Running => Some(true),
+        WindowsTaskState::Queued | WindowsTaskState::Idle => Some(false),
+        WindowsTaskState::Missing => None,
+    })
+}
+
+fn windows_task_replaceable_command(task_name: &str) -> String {
+    let quoted = task_name.replace('\'', "''");
+    format!(
+        "$task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{quoted}' }}; \
+         if ($null -eq $task) {{ exit 0 }}; \
+         if ([int]$task.State -eq 1) {{ exit 0 }}; \
+         exit 6"
+    )
+}
+
+fn windows_task_replaceable_from_exit_code(code: Option<i32>) -> Result<()> {
+    match code {
+        Some(0) => Ok(()),
+        Some(6) => bail!(
+            "Cannot safely replace the Windows scheduled task unless it is disabled and the machine has rebooted. Run `schtasks /Change /TN \"ZeroClaw Daemon\" /Disable`, reboot Windows, then run `zeroclaw service install` again; the existing task registration was left unchanged."
+        ),
+        Some(code) => bail!("PowerShell task-replacement check exited with status {code}"),
+        None => bail!("PowerShell task-replacement check terminated without an exit code"),
+    }
+}
+
+fn ensure_windows_task_replaceable(task_name: &str) -> Result<()> {
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &windows_task_replaceable_command(task_name),
+        ])
+        .status()
+        .context("Failed to check whether the Windows scheduled task can be replaced")?;
+    windows_task_replaceable_from_exit_code(status.code())
+}
+
+fn service_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
+    let candidates = [primary, secondary];
+    let with_content: Vec<PathBuf> = candidates
+        .iter()
+        .filter(|path| has_content(path))
+        .map(|path| path.to_path_buf())
+        .collect();
+    if !with_content.is_empty() {
+        return with_content;
+    }
+    candidates
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.to_path_buf())
+        .collect()
+}
+
+fn follow_log_targets(primary: &Path, secondary: &Path) -> Vec<PathBuf> {
+    // A follower keeps the empty stream too: it is where a later failure lands.
+    [primary, secondary]
+        .into_iter()
+        .filter(|path| path.exists())
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+fn has_content(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.len() > 0)
+}
+
+fn report_empty_capture(targets: &[PathBuf], logs_dir: &Path, follow: bool) {
+    if targets.iter().any(|path| has_content(path)) {
+        return;
+    }
+    if follow {
+        eprintln!(
+            "No daemon output captured yet in {}; waiting for new output.",
+            logs_dir.display()
+        );
+    } else {
+        eprintln!("No daemon output captured yet in {}.", logs_dir.display());
+    }
+}
+
+fn tail_command(paths: &[PathBuf], lines: usize, follow: bool) -> Command {
+    let mut command = Command::new("tail");
+    command.arg("-n").arg(lines.to_string());
+    if follow {
+        command.arg("-f");
+    }
+    command.args(paths);
+    command
+}
+
+fn tail_files(paths: &[PathBuf], lines: usize, follow: bool) -> Result<()> {
+    if paths.is_empty() {
+        bail!("No log files to tail");
+    }
+    let status = tail_command(paths, lines, follow)
         .status()
         .context("Failed to run tail")?;
     if !status.success() {
@@ -511,35 +2394,42 @@ fn tail_file(path: &Path, lines: usize, follow: bool) -> Result<()> {
 }
 
 pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
+    if cfg!(target_os = "linux") {
+        let resolved = init_system.resolve()?;
+        ensure_linux_default_install_scope(config, "uninstall")?;
+        stop_linux(config, resolved)?;
+        return uninstall_linux(config, resolved);
+    }
+
     stop(config, init_system)?;
 
     if cfg!(target_os = "macos") {
         let file = macos_service_file()?;
         if file.exists() {
             fs::remove_file(&file)
-                .with_context(|| format!("Failed to remove {}", file.display()))?;
+                .with_context(|| format!("Failed to remove {}", file.display().to_string()))?;
         }
-        println!("✅ Service uninstalled ({})", file.display());
+        println!("✅ Service uninstalled ({})", file.display().to_string());
         return Ok(());
-    }
-
-    if cfg!(target_os = "linux") {
-        let resolved = init_system.resolve()?;
-        return uninstall_linux(config, resolved);
     }
 
     if cfg!(target_os = "windows") {
         let task_name = windows_task_name();
         let _ = run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]));
-        // Remove the wrapper script
-        let wrapper = config
+        // Remove the wrapper script. It now lives in the config dir root, but
+        // older installs left it under logs/ — clean up both so an upgrade
+        // doesn't strand the legacy copy.
+        let base_dir = config
             .config_path
             .parent()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join("logs")
-            .join("zeroclaw-daemon.cmd");
-        if wrapper.exists() {
-            fs::remove_file(&wrapper).ok();
+            .map_or_else(|| PathBuf::from("."), PathBuf::from);
+        for wrapper in [
+            base_dir.join("zeroclaw-daemon.cmd"),
+            base_dir.join("logs").join("zeroclaw-daemon.cmd"),
+        ] {
+            if wrapper.exists() {
+                fs::remove_file(&wrapper).ok();
+            }
         }
         println!("✅ Service uninstalled");
         return Ok(());
@@ -554,10 +2444,10 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             let file = linux_service_file(config)?;
             if file.exists() {
                 fs::remove_file(&file)
-                    .with_context(|| format!("Failed to remove {}", file.display()))?;
+                    .with_context(|| format!("Failed to remove {}", file.display().to_string()))?;
             }
             let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-            println!("✅ Service uninstalled ({})", file.display());
+            println!("✅ Service uninstalled ({})", file.display().to_string());
         }
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/zeroclaw");
@@ -569,54 +2459,86 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
                         "⚠️  Warning: Could not remove zeroclaw from OpenRC default runlevel: {err}"
                     );
                 }
-                fs::remove_file(init_script)
-                    .with_context(|| format!("Failed to remove {}", init_script.display()))?;
+                fs::remove_file(init_script).with_context(|| {
+                    format!("Failed to remove {}", init_script.display().to_string())
+                })?;
             }
             println!("✅ Service uninstalled (/etc/init.d/zeroclaw)");
         }
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service uninstall"),
     }
     Ok(())
 }
 
-/// Detect if the executable lives under a Homebrew prefix and return the
-/// corresponding `var/zeroclaw` directory.
-///
-/// Homebrew installs binaries into `<prefix>/Cellar/<formula>/<version>/bin/`
-/// and symlinks them to `<prefix>/bin/`. The canonical `var` directory is
-/// `<prefix>/var`.  We check for both layouts.
-fn detect_homebrew_var_dir(exe: &Path) -> Option<PathBuf> {
-    let path_str = exe.to_string_lossy();
+pub fn homebrew_var_dir_from_exe(exe: &Path) -> Option<PathBuf> {
+    let resolved = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let exe = resolved.as_path();
 
-    // Symlinked binary: <prefix>/bin/zeroclaw
-    // Cellar binary:    <prefix>/Cellar/zeroclaw/<version>/bin/zeroclaw
-    let prefix = if path_str.contains("/Cellar/") {
-        // Walk up from .../Cellar/zeroclaw/<ver>/bin/zeroclaw to the prefix
-        let mut ancestor = exe.to_path_buf();
-        while let Some(parent) = ancestor.parent() {
-            ancestor = parent.to_path_buf();
-            if ancestor.file_name().is_some_and(|n| n == "Cellar") {
-                // prefix is one level above Cellar
-                return ancestor.parent().map(|p| p.join("var").join("zeroclaw"));
-            }
-        }
-        return None;
-    } else if let Some(bin_parent) = exe.parent() {
-        // <prefix>/bin/zeroclaw → check if <prefix>/Cellar exists (Homebrew marker)
-        if let Some(prefix) = bin_parent.parent() {
-            if prefix.join("Cellar").is_dir() {
-                Some(prefix.to_path_buf())
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    if let Some(cellar) = exe
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "Cellar"))
+    {
+        return cellar
+            .parent()
+            .map(|prefix| prefix.join("var").join("zeroclaw"));
+    }
 
-    prefix.map(|p| p.join("var").join("zeroclaw"))
+    let prefix = exe.parent()?.parent()?;
+    prefix
+        .join("Cellar")
+        .is_dir()
+        .then(|| prefix.join("var").join("zeroclaw"))
+}
+
+#[cfg(test)]
+mod homebrew_tests {
+    use super::*;
+
+    #[test]
+    fn homebrew_var_dir_from_exe_detects_cellar_path() {
+        let exe = PathBuf::from("/opt/homebrew/Cellar/zeroclaw/1.2.3/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe);
+        assert_eq!(var_dir, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
+    }
+
+    #[test]
+    fn homebrew_var_dir_from_exe_detects_intel_cellar_path() {
+        let exe = PathBuf::from("/usr/local/Cellar/zeroclaw/1.0.0/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe);
+        assert_eq!(var_dir, Some(PathBuf::from("/usr/local/var/zeroclaw")));
+    }
+
+    #[test]
+    fn homebrew_var_dir_from_exe_ignores_non_homebrew_path() {
+        let exe = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe);
+        assert_eq!(var_dir, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn homebrew_var_dir_from_exe_detects_opt_symlink_layout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prefix = temp.path().join("homebrew");
+        let cellar_bin = prefix.join("Cellar/zeroclaw/1.2.3/bin");
+        std::fs::create_dir_all(&cellar_bin).expect("create Cellar binary dir");
+        let cellar_exe = cellar_bin.join("zeroclaw");
+        std::fs::write(&cellar_exe, "").expect("create fake executable");
+
+        let opt_parent = prefix.join("opt");
+        std::fs::create_dir_all(&opt_parent).expect("create opt dir");
+        std::os::unix::fs::symlink(
+            prefix.join("Cellar/zeroclaw/1.2.3"),
+            opt_parent.join("zeroclaw"),
+        )
+        .expect("create opt symlink");
+
+        let expected_prefix = prefix
+            .canonicalize()
+            .expect("canonicalize fake Homebrew prefix");
+        let var_dir = homebrew_var_dir_from_exe(&prefix.join("opt/zeroclaw/bin/zeroclaw"));
+        assert_eq!(var_dir, Some(expected_prefix.join("var/zeroclaw")));
+    }
 }
 
 fn install_macos(config: &Config) -> Result<()> {
@@ -629,7 +2551,7 @@ fn install_macos(config: &Config) -> Result<()> {
 
     // When installed via Homebrew, use the Homebrew var directory for runtime
     // data so that `brew services start zeroclaw` works out of the box.
-    let homebrew_var_dir = detect_homebrew_var_dir(&exe);
+    let homebrew_var_dir = homebrew_var_dir_from_exe(&exe);
     if let Some(ref var_dir) = homebrew_var_dir {
         fs::create_dir_all(var_dir).with_context(|| {
             format!(
@@ -639,68 +2561,19 @@ fn install_macos(config: &Config) -> Result<()> {
         })?;
     }
 
-    let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
-        var_dir.join("logs")
-    } else {
-        config
-            .config_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), PathBuf::from)
-            .join("logs")
-    };
+    let config_dir = homebrew_var_dir.as_deref().map_or_else(
+        || {
+            config
+                .config_path
+                .parent()
+                .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        },
+        Path::to_path_buf,
+    );
+    let logs_dir = config_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
-    let stdout = logs_dir.join("daemon.stdout.log");
-    let stderr = logs_dir.join("daemon.stderr.log");
-
-    // When running under Homebrew, inject ZEROCLAW_CONFIG_DIR and
-    // WorkingDirectory so the daemon finds its data in the Homebrew prefix.
-    let env_section = if let Some(ref var_dir) = homebrew_var_dir {
-        format!(
-            r#"  <key>EnvironmentVariables</key>
-  <dict>
-    <key>ZEROCLAW_CONFIG_DIR</key>
-    <string>{config_dir}</string>
-  </dict>
-  <key>WorkingDirectory</key>
-  <string>{working_dir}</string>
-"#,
-            config_dir = xml_escape(&var_dir.display().to_string()),
-            working_dir = xml_escape(&var_dir.display().to_string()),
-        )
-    } else {
-        String::new()
-    };
-
-    let plist = format!(
-        r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{exe}</string>
-    <string>daemon</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-{env_section}  <key>StandardOutPath</key>
-  <string>{stdout}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr}</string>
-</dict>
-</plist>
-"#,
-        label = SERVICE_LABEL,
-        exe = xml_escape(&exe.display().to_string()),
-        env_section = env_section,
-        stdout = xml_escape(&stdout.display().to_string()),
-        stderr = xml_escape(&stderr.display().to_string())
-    );
+    let plist = render_macos_launch_agent_plist(&exe, &config_dir, homebrew_var_dir.as_deref());
 
     fs::write(&file, plist)?;
     println!("✅ Installed launchd service: {}", file.display());
@@ -711,11 +2584,61 @@ fn install_macos(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Renders the macOS LaunchAgent plist; path arguments are XML-escaped before interpolation,
+/// and the caller is responsible for writing the returned XML to the plist path.
+fn render_macos_launch_agent_plist(
+    exe: &Path,
+    config_dir: &Path,
+    homebrew_var_dir: Option<&Path>,
+) -> String {
+    let working_dir_section = if let Some(var_dir) = homebrew_var_dir {
+        format!(
+            r#"  <key>WorkingDirectory</key>
+  <string>{working_dir}</string>
+"#,
+            working_dir = xml_escape(&var_dir.display().to_string()),
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>--config-dir</string>
+    <string>{config_dir}</string>
+    <string>service</string>
+    <string>run-launchd-daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+{working_dir_section}
+</dict>
+</plist>
+"#,
+        label = SERVICE_LABEL,
+        exe = xml_escape(&exe.display().to_string()),
+        config_dir = xml_escape(&config_dir.display().to_string()),
+        working_dir_section = working_dir_section,
+    )
+}
+
 fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+    ensure_linux_default_install_scope(config, "install")?;
+
     match init_system {
         InitSystem::Systemd => install_linux_systemd(config),
         InitSystem::Openrc => install_linux_openrc(config),
-        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+        InitSystem::Auto => anyhow::bail!("init system must be resolved before service install"),
     }
 }
 
@@ -750,8 +2673,12 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     fs::write(&file, unit)?;
     let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
-    println!("✅ Installed systemd user service: {}", file.display());
+    println!(
+        "✅ Installed systemd user service: {}",
+        file.display().to_string()
+    );
     println!("   Start with: zeroclaw service start");
+    warn_if_systemd_user_linger_disabled();
     Ok(())
 }
 
@@ -903,7 +2830,7 @@ fn chown_to_zeroclaw(path: &Path) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "Failed to change ownership of {} to zeroclaw:zeroclaw: {}",
-            path.display(),
+            path.display().to_string(),
             stderr.trim(),
         );
     }
@@ -926,7 +2853,7 @@ fn chown_recursive_to_zeroclaw(path: &Path) -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "Failed to recursively change ownership of {} to zeroclaw:zeroclaw: {}",
-            path.display(),
+            path.display().to_string(),
             stderr.trim(),
         );
     }
@@ -940,18 +2867,22 @@ fn chown_recursive_to_zeroclaw(_path: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)
-        .with_context(|| format!("Failed to create directory {}", target.display()))?;
+    fs::create_dir_all(target).with_context(|| {
+        format!(
+            "Failed to create directory {}",
+            target.display().to_string()
+        )
+    })?;
 
     for entry in fs::read_dir(source)
-        .with_context(|| format!("Failed to read directory {}", source.display()))?
+        .with_context(|| format!("Failed to read directory {}", source.display().to_string()))?
     {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
         let file_type = entry
             .file_type()
-            .with_context(|| format!("Failed to inspect {}", source_path.display()))?;
+            .with_context(|| format!("Failed to inspect {}", source_path.display().to_string()))?;
 
         if file_type.is_dir() {
             copy_dir_recursive(&source_path, &target_path)?;
@@ -962,7 +2893,7 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
             fs::copy(&source_path, &target_path).with_context(|| {
                 format!(
                     "Failed to copy file {} -> {}",
-                    source_path.display(),
+                    source_path.display().to_string(),
                     target_path.display()
                 )
             })?;
@@ -1017,7 +2948,7 @@ fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
     copy_dir_recursive(&source_dir, config_dir)?;
     println!(
         "✅ Migrated runtime state from {} to {}",
-        source_dir.display(),
+        source_dir.display().to_string(),
         config_dir.display()
     );
     Ok(())
@@ -1026,6 +2957,21 @@ fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
 #[cfg(unix)]
 fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn openrc_log_writer_command(exe_path: &Path, stream: &str) -> String {
+    format!(
+        "{} service run-openrc-log-writer {stream}",
+        exe_path.to_string_lossy()
+    )
+}
+
+fn openrc_executable_path_is_safe(exe_path: &Path) -> bool {
+    let raw = exe_path.to_string_lossy();
+    !raw.is_empty()
+        && raw.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'_' | b'.' | b'-' | b'+')
+        })
 }
 
 #[cfg(unix)]
@@ -1081,7 +3027,7 @@ fn ensure_openrc_runtime_path_writable(path: &Path) -> Result<()> {
         bail!(
             "OpenRC runtime user 'zeroclaw' cannot write {} ({details}). \
              Re-run `sudo zeroclaw service install` and ensure ownership is zeroclaw:zeroclaw.",
-            path.display(),
+            path.display().to_string(),
         );
     }
 
@@ -1117,7 +3063,7 @@ fn warn_if_binary_in_home(exe_path: &Path) {
             "⚠️  Warning: Binary path '{}' appears to be in a user home directory.\n\
              For system-wide OpenRC service, consider installing to /usr/local/bin:\n\
              sudo cp '{}' /usr/local/bin/zeroclaw",
-            exe_path.display(),
+            exe_path.display().to_string(),
             exe_path.display()
         );
     }
@@ -1125,6 +3071,8 @@ fn warn_if_binary_in_home(exe_path: &Path) {
 
 /// Generate OpenRC init script content (pure function for testability)
 fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
+    let output_logger = openrc_log_writer_command(exe_path, "stdout");
+    let error_logger = openrc_log_writer_command(exe_path, "stderr");
     format!(
         r#"#!/sbin/openrc-run
 
@@ -1137,8 +3085,8 @@ command_background="yes"
 command_user="zeroclaw:zeroclaw"
 pidfile="/run/${{RC_SVCNAME}}.pid"
 umask 027
-output_log="/var/log/zeroclaw/access.log"
-error_log="/var/log/zeroclaw/error.log"
+output_logger="{output_logger}"
+error_logger="{error_logger}"
 
 # Provide HOME so headless browsers can create profile/cache directories.
 # Without this, Chromium/Firefox fail with sandbox or profile errors.
@@ -1153,8 +3101,10 @@ start_pre() {{
     checkpath --directory --owner zeroclaw:zeroclaw --mode 0750 /var/lib/zeroclaw
 }}
 "#,
-        exe = exe_path.display(),
-        config_dir = config_dir.display(),
+        exe = exe_path.display().to_string(),
+        config_dir = config_dir.display().to_string(),
+        output_logger = output_logger,
+        error_logger = error_logger,
     )
 }
 
@@ -1176,9 +3126,14 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
         );
     }
 
-    ensure_zeroclaw_user()?;
-
     let exe = resolve_openrc_executable()?;
+    if !openrc_executable_path_is_safe(&exe) {
+        bail!(
+            "OpenRC service executable path contains unsupported shell characters: {}. Install ZeroClaw at /usr/local/bin/zeroclaw and retry",
+            exe.display()
+        );
+    }
+    ensure_zeroclaw_user()?;
     warn_if_binary_in_home(&exe);
 
     let config_dir = Path::new("/etc/zeroclaw");
@@ -1187,27 +3142,37 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
     if !config_dir.exists() {
         fs::create_dir_all(config_dir)
-            .with_context(|| format!("Failed to create {}", config_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", config_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755)).with_context(
-                || format!("Failed to set permissions on {}", config_dir.display()),
+                || {
+                    format!(
+                        "Failed to set permissions on {}",
+                        config_dir.display().to_string()
+                    )
+                },
             )?;
         }
-        println!("✅ Created directory: {}", config_dir.display());
+        println!("✅ Created directory: {}", config_dir.display().to_string());
     }
 
     migrate_openrc_runtime_state_if_needed(config_dir)?;
 
     if !workspace_dir.exists() {
         fs::create_dir_all(&workspace_dir)
-            .with_context(|| format!("Failed to create {}", workspace_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", workspace_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750)).with_context(
-                || format!("Failed to set permissions on {}", workspace_dir.display()),
+                || {
+                    format!(
+                        "Failed to set permissions on {}",
+                        workspace_dir.display().to_string()
+                    )
+                },
             )?;
         }
         chown_to_zeroclaw(&workspace_dir)?;
@@ -1220,25 +3185,45 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750))
-            .with_context(|| format!("Failed to set permissions on {}", workspace_dir.display()))?;
+        fs::set_permissions(&workspace_dir, fs::Permissions::from_mode(0o750)).with_context(
+            || {
+                format!(
+                    "Failed to set permissions on {}",
+                    workspace_dir.display().to_string()
+                )
+            },
+        )?;
     }
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("Failed to set permissions on {}", config_dir.display()))?;
+        fs::set_permissions(config_dir, fs::Permissions::from_mode(0o755)).with_context(|| {
+            format!(
+                "Failed to set permissions on {}",
+                config_dir.display().to_string()
+            )
+        })?;
         let config_path = config_dir.join("config.toml");
         if config_path.exists() {
             fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).with_context(
-                || format!("Failed to set permissions on {}", config_path.display()),
+                || {
+                    format!(
+                        "Failed to set permissions on {}",
+                        config_path.display().to_string()
+                    )
+                },
             )?;
         }
         let secret_key_path = config_dir.join(".secret_key");
         if secret_key_path.exists() {
             fs::set_permissions(&secret_key_path, fs::Permissions::from_mode(0o600)).with_context(
-                || format!("Failed to set permissions on {}", secret_key_path.display()),
+                || {
+                    format!(
+                        "Failed to set permissions on {}",
+                        secret_key_path.display().to_string()
+                    )
+                },
             )?;
         }
     }
@@ -1248,12 +3233,16 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     let created_log_dir = !log_dir.exists();
     if created_log_dir {
         fs::create_dir_all(log_dir)
-            .with_context(|| format!("Failed to create {}", log_dir.display()))?;
+            .with_context(|| format!("Failed to create {}", log_dir.display().to_string()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(log_dir, fs::Permissions::from_mode(0o750))
-                .with_context(|| format!("Failed to set permissions on {}", log_dir.display()))?;
+            fs::set_permissions(log_dir, fs::Permissions::from_mode(0o750)).with_context(|| {
+                format!(
+                    "Failed to set permissions on {}",
+                    log_dir.display().to_string()
+                )
+            })?;
         }
     }
 
@@ -1271,13 +3260,17 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
     let init_script = generate_openrc_script(&exe, config_dir);
     let init_path = Path::new("/etc/init.d/zeroclaw");
     fs::write(init_path, init_script)
-        .with_context(|| format!("Failed to write {}", init_path.display()))?;
+        .with_context(|| format!("Failed to write {}", init_path.display().to_string()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(init_path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("Failed to set permissions on {}", init_path.display()))?;
+        fs::set_permissions(init_path, fs::Permissions::from_mode(0o755)).with_context(|| {
+            format!(
+                "Failed to set permissions on {}",
+                init_path.display().to_string()
+            )
+        })?;
     }
 
     run_checked(Command::new("rc-update").args(["add", "zeroclaw", "default"]))?;
@@ -1290,51 +3283,49 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
 fn install_windows(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let logs_dir = config
+    let base_dir = config
         .config_path
         .parent()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("logs");
-    fs::create_dir_all(&logs_dir)?;
-
-    // Create a wrapper script that redirects output to log files
-    let wrapper = logs_dir.join("zeroclaw-daemon.cmd");
-    let stdout_log = logs_dir.join("daemon.stdout.log");
-    let stderr_log = logs_dir.join("daemon.stderr.log");
-
-    let wrapper_content = format!(
-        "@echo off\r\n\"{}\" daemon >>\"{}\" 2>>\"{}\"",
-        exe.display(),
-        stdout_log.display(),
-        stderr_log.display()
-    );
-    fs::write(&wrapper, &wrapper_content)?;
-
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let base_dir = normalize_desktop_config_dir(base_dir)?;
+    let logs_dir = base_dir.join("logs");
+    let action = windows_task_action(&exe, &base_dir)?;
     let task_name = windows_task_name();
-
-    // Remove any existing task first (ignore errors if it doesn't exist)
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", task_name, "/F"])
-        .output();
-
+    ensure_windows_task_replaceable(task_name)?;
     run_checked(Command::new("schtasks").args([
-        "/Create",
-        "/TN",
-        task_name,
-        "/SC",
-        "ONLOGON",
-        "/TR",
-        &format!("\"{}\"", wrapper.display()),
-        "/RL",
-        "HIGHEST",
-        "/F",
+        "/Create", "/TN", task_name, "/SC", "ONLOGON", "/TR", &action, "/RL", "LIMITED", "/F",
     ]))?;
 
     println!("✅ Installed Windows scheduled task: {}", task_name);
-    println!("   Wrapper: {}", wrapper.display());
-    println!("   Logs: {}", logs_dir.display());
+    println!("   Action: {}", action);
+    println!("   Logs: {}", logs_dir.display().to_string());
     println!("   Start with: zeroclaw service start");
     Ok(())
+}
+
+fn windows_task_action(exe: &Path, config_dir: &Path) -> Result<String> {
+    let exe = exe
+        .to_str()
+        .context("Windows service executable path is not Unicode")?;
+    let config_dir = config_dir
+        .to_str()
+        .context("Windows service config path is not Unicode")?;
+    if exe.contains('"')
+        || exe.contains('%')
+        || config_dir.contains('"')
+        || config_dir.contains('%')
+    {
+        bail!(
+            "Windows service paths cannot contain quotes or percent signs in a scheduled-task action"
+        );
+    }
+    let action = format!("\"{exe}\" --config-dir \"{config_dir}\" service run-windows-daemon");
+    if action.encode_utf16().count() > 262 {
+        bail!(
+            "Windows service scheduled-task action exceeds the 262-character Task Scheduler limit"
+        );
+    }
+    Ok(action)
 }
 
 fn macos_service_file() -> Result<PathBuf> {
@@ -1351,12 +3342,25 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
+    // `service install` remains default-instance only; named instances can be
+    // managed when operators provide matching units themselves.
     let _ = config;
     Ok(home
         .join(".config")
         .join("systemd")
         .join("user")
         .join("zeroclaw.service"))
+}
+
+fn linux_systemd_unit_file(config: &Config) -> Result<PathBuf> {
+    let home = directories::UserDirs::new()
+        .map(|u| u.home_dir().to_path_buf())
+        .context("Could not find home directory")?;
+    Ok(home
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(linux_systemd_unit(config)))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -1385,8 +3389,925 @@ pub fn xml_escape(raw: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-#[cfg(all(test, zeroclaw_root_crate))]
-mod tests {
+#[cfg(unix)]
+fn current_loginctl_user_target() -> Option<String> {
+    // SAFETY: getuid() has no preconditions and returns the real UID of the
+    // process. loginctl accepts the numeric UID, which avoids trusting $USER.
+    Some(unsafe { libc::getuid() }.to_string())
+}
+
+#[cfg(not(unix))]
+fn current_loginctl_user_target() -> Option<String> {
+    None
+}
+
+fn parse_loginctl_linger_property(output: &str) -> Option<bool> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        if !key.trim().eq_ignore_ascii_case("Linger") {
+            return None;
+        }
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("yes") {
+            Some(true)
+        } else if value.eq_ignore_ascii_case("no") {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn systemd_user_linger_status() -> SystemdUserLinger {
+    let Some(user) = current_loginctl_user_target() else {
+        return SystemdUserLinger::Unknown;
+    };
+
+    let output = Command::new("loginctl")
+        .args(["show-user", user.as_str(), "--property=Linger"])
+        .output();
+
+    match output {
+        Ok(output) => systemd_user_linger_status_from_output(
+            user,
+            output.status.success(),
+            &String::from_utf8_lossy(&output.stdout),
+        ),
+        Err(_) => SystemdUserLinger::Unknown,
+    }
+}
+
+fn systemd_user_linger_status_from_output(
+    user: String,
+    success: bool,
+    stdout: &str,
+) -> SystemdUserLinger {
+    if !success {
+        return SystemdUserLinger::Unknown;
+    }
+
+    match parse_loginctl_linger_property(stdout) {
+        Some(true) => SystemdUserLinger::Enabled,
+        Some(false) => SystemdUserLinger::Disabled { user },
+        None => SystemdUserLinger::Unknown,
+    }
+}
+
+fn systemd_linger_hint(user: &str) -> String {
+    crate::i18n::get_required_cli_string_with_args(
+        "cli-service-systemd-linger-disabled-warning",
+        &[("user", user)],
+    )
+}
+
+fn warn_if_systemd_user_linger_disabled() {
+    if let SystemdUserLinger::Disabled { user } = systemd_user_linger_status() {
+        eprintln!("⚠️  {}", systemd_linger_hint(&user));
+    }
+}
+
+// Plain `#[cfg(test)]` is intentional: these pure renderer tests have no
+// integration dependencies and should run in every zeroclaw-runtime test build.
+#[cfg(test)]
+mod macos_plist_tests {
+    use super::*;
+
+    #[test]
+    fn macos_plist_renderer_uses_plain_xml_quotes() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/opt/homebrew/bin/zeroclaw"),
+            Path::new("/opt/homebrew/var/zeroclaw"),
+            Some(Path::new("/opt/homebrew/var/zeroclaw")),
+        );
+
+        assert!(!plist.contains(r#"\""#));
+        assert!(plist.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
+        assert!(plist.contains(
+            r#"<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">"#
+        ));
+        assert!(plist.contains(r#"<plist version="1.0">"#));
+        assert!(plist.contains("<key>WorkingDirectory</key>"));
+    }
+
+    #[test]
+    fn macos_plist_renderer_escapes_paths_and_omits_homebrew_section_when_absent() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
+            Path::new("/tmp/Zero<&>\"'Claw"),
+            None,
+        );
+
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw/bin/zeroclaw"));
+        assert!(plist.contains("/tmp/Zero&lt;&amp;&gt;&quot;&apos;Claw"));
+        assert!(!plist.contains("<key>EnvironmentVariables</key>"));
+        assert!(!plist.contains("<key>WorkingDirectory</key>"));
+    }
+
+    #[test]
+    fn macos_plist_routes_only_launchd_through_bounded_capture() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/usr/local/bin/zeroclaw"),
+            Path::new("/Users/test/.zeroclaw"),
+            None,
+        );
+
+        assert!(plist.contains("<string>--config-dir</string>"));
+        assert!(plist.contains("<string>/Users/test/.zeroclaw</string>"));
+        assert!(plist.contains("<string>service</string>"));
+        assert!(plist.contains("<string>run-launchd-daemon</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(!plist.contains("<key>StandardOutPath</key>"));
+        assert!(!plist.contains("<key>StandardErrorPath</key>"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plist_renderer_emits_plutil_parseable_xml() {
+        let plist = render_macos_launch_agent_plist(
+            Path::new("/tmp/Zero<&>\"'Claw/bin/zeroclaw"),
+            Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw"),
+            Some(Path::new("/tmp/Zero<&>\"'Claw/var/zeroclaw")),
+        );
+
+        let file = std::env::temp_dir().join(format!(
+            "zeroclaw-launch-agent-plist-{}.plist",
+            std::process::id()
+        ));
+        fs::write(&file, plist).expect("write plist fixture");
+
+        let output = Command::new("plutil")
+            .arg("-lint")
+            .arg(&file)
+            .output()
+            .expect("run plutil");
+        let _ = fs::remove_file(&file);
+
+        assert!(
+            output.status.success(),
+            "plutil failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_service_log_tests {
+    use super::*;
+
+    const DESKTOP_CAPTURE_TEST_CHILD_ENV: &str = "ZEROCLAW_DESKTOP_CAPTURE_TEST_CHILD";
+
+    fn desktop_capture_test_command(mode: &str) -> TokioCommand {
+        let executable = std::env::current_exe().expect("resolve current test binary");
+        let mut command = TokioCommand::new(executable);
+        command
+            .arg("desktop_capture_subprocess_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(DESKTOP_CAPTURE_TEST_CHILD_ENV, mode);
+        command
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for desktop capture tests"]
+    fn desktop_capture_subprocess_helper() {
+        use std::io::Write as _;
+
+        match std::env::var(DESKTOP_CAPTURE_TEST_CHILD_ENV).as_deref() {
+            Ok("streams") => {
+                std::io::stdout()
+                    .write_all(b"stdout-value")
+                    .expect("write stdout fixture");
+                std::io::stderr()
+                    .write_all(b"stderr-value")
+                    .expect("write stderr fixture");
+                std::process::exit(0);
+            }
+            Ok("compact") => {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(&vec![b'x'; 9 * 1024 * 1024])
+                    .expect("write compaction fixture");
+                stdout
+                    .write_all(b"desktop-newest-output")
+                    .expect("write newest output fixture");
+                stdout.flush().expect("flush compaction fixture");
+                std::process::exit(0);
+            }
+            Ok("nonzero") => {
+                std::io::stderr()
+                    .write_all(b"child-output")
+                    .expect("write nonzero fixture");
+                std::process::exit(7);
+            }
+            mode => panic!("unexpected desktop capture helper mode: {mode:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_oversized_log_keeps_newest_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("daemon.stdout.log");
+        let mut original = vec![b'a'; SERVICE_LOG_MAX_BYTES as usize + 17];
+        original[17..].fill(b'b');
+        fs::write(&path, original).expect("write oversized log");
+
+        drop(BoundedServiceLog::open(&path).expect("open bounded log"));
+
+        let bytes = fs::read(&path).expect("read compacted log");
+        assert_eq!(bytes.len(), SERVICE_LOG_MAX_BYTES as usize);
+        assert!(bytes.iter().all(|byte| *byte == b'b'));
+    }
+
+    #[test]
+    fn crossing_limit_compacts_before_appending_newest_chunk() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("daemon.stderr.log");
+        let mut log = BoundedServiceLog::open(&path).expect("open bounded log");
+        log.write_chunk(&vec![b'a'; 5 * 1024 * 1024])
+            .expect("write initial chunk");
+        log.write_chunk(&vec![b'b'; 4 * 1024 * 1024])
+            .expect("write overflowing chunk");
+        drop(log);
+
+        let bytes = fs::read(&path).expect("read bounded log");
+        assert_eq!(bytes.len(), SERVICE_LOG_MAX_BYTES as usize);
+        assert!(bytes[..4 * 1024 * 1024].iter().all(|byte| *byte == b'a'));
+        assert!(bytes[4 * 1024 * 1024..].iter().all(|byte| *byte == b'b'));
+    }
+
+    #[test]
+    fn oversized_chunk_keeps_only_its_tail() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("daemon.stdout.log");
+        let mut log = BoundedServiceLog::open(&path).expect("open bounded log");
+        let mut chunk = vec![b'a'; SERVICE_LOG_MAX_BYTES as usize + 23];
+        chunk[23..].fill(b'z');
+        log.write_chunk(&chunk).expect("write oversized chunk");
+        drop(log);
+
+        let bytes = fs::read(&path).expect("read bounded log");
+        assert_eq!(bytes.len(), SERVICE_LOG_MAX_BYTES as usize);
+        assert!(bytes.iter().all(|byte| *byte == b'z'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_storage_is_private_and_regular() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config/logs/zeroclaw-desktop-daemon.log");
+        drop(BoundedServiceLog::open_desktop(&path).expect("open desktop log"));
+
+        let directory = fs::symlink_metadata(path.parent().expect("log parent"))
+            .expect("inspect desktop log directory");
+        let file = fs::metadata(&path).expect("inspect desktop log file");
+        assert!(directory.is_dir());
+        assert_eq!(directory.uid(), unsafe { libc::geteuid() });
+        assert_eq!(directory.permissions().mode() & 0o777, 0o700);
+        assert!(file.is_file());
+        assert_eq!(file.uid(), unsafe { libc::geteuid() });
+        assert_eq!(file.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_rejects_final_symlink_without_touching_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("target.log");
+        let path = dir.path().join("logs/zeroclaw-desktop-daemon.log");
+        fs::create_dir(dir.path().join("logs")).expect("create log directory");
+        fs::write(&target, b"original").expect("write target");
+        std::os::unix::fs::symlink(&target, &path).expect("create log symlink");
+
+        let error = match BoundedServiceLog::open_desktop(&path) {
+            Ok(_) => panic!("symlink must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("desktop log"));
+        assert_eq!(fs::read(&target).expect("read target"), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_first_run_creates_nested_config_and_data_roots() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        for source in ["config", "data"] {
+            let root = dir.path().join(source).join("fresh/nested/root");
+            let path = root.join("logs/zeroclaw-desktop-daemon.log");
+            drop(BoundedServiceLog::open_desktop(&path).expect("open nested desktop log"));
+
+            for component in [
+                dir.path().join(source),
+                dir.path().join(source).join("fresh"),
+                dir.path().join(source).join("fresh/nested"),
+                root.clone(),
+                root.join("logs"),
+            ] {
+                let metadata = fs::symlink_metadata(&component).expect("inspect private directory");
+                assert!(metadata.is_dir());
+                assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+            }
+            assert!(path.is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_rejects_symlink_as_nearest_existing_anchor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let redirected = tempfile::tempdir().expect("redirect target");
+        let first_missing = dir.path().join("fresh");
+        std::os::unix::fs::symlink(redirected.path(), &first_missing)
+            .expect("create ancestor symlink");
+        let path = first_missing.join("nested/root/logs/zeroclaw-desktop-daemon.log");
+
+        let error = match BoundedServiceLog::open_desktop(&path) {
+            Ok(_) => panic!("ancestor symlink must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ancestor"));
+        assert!(!redirected.path().join("nested").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_log_rejects_symlink_in_existing_ancestor_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let redirected = tempfile::tempdir().expect("redirect target");
+        let link = dir.path().join("redirected");
+        let existing = redirected.path().join("already/exists");
+        fs::create_dir_all(&existing).expect("create redirected subtree");
+        std::os::unix::fs::symlink(redirected.path(), &link)
+            .expect("create intermediate ancestor symlink");
+        let path = link.join("already/exists/config/logs/zeroclaw-desktop-daemon.log");
+
+        let error = match BoundedServiceLog::open_desktop(&path) {
+            Ok(_) => panic!("intermediate ancestor symlink must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ancestor"));
+        assert!(!existing.join("config").exists());
+    }
+
+    #[test]
+    fn openrc_stream_worker_writes_to_the_bounded_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("access.log");
+
+        drain_bounded_service_log(std::io::Cursor::new(b"openrc-output"), &path)
+            .expect("drain logger input");
+
+        assert_eq!(fs::read(path).expect("read log"), b"openrc-output");
+    }
+
+    #[test]
+    fn openrc_streams_map_to_the_established_log_paths() {
+        assert_eq!(openrc_log_path(false), Path::new(OPENRC_STDOUT_LOG));
+        assert_eq!(openrc_log_path(true), Path::new(OPENRC_STDERR_LOG));
+        assert_eq!(
+            openrc_log_path(false),
+            Path::new("/var/log/zeroclaw/access.log")
+        );
+        assert_eq!(
+            openrc_log_path(true),
+            Path::new("/var/log/zeroclaw/error.log")
+        );
+    }
+
+    #[test]
+    fn openrc_stream_worker_drains_input_when_destination_cannot_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bytes = vec![b'x'; 64 * 1024];
+        let mut input = std::io::Cursor::new(bytes.clone());
+
+        drain_bounded_service_log(&mut input, dir.path())
+            .expect_err("directory cannot be opened as a service log");
+
+        assert_eq!(input.position(), bytes.len() as u64);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn openrc_stream_worker_drains_input_after_destination_write_fails() {
+        let bytes = vec![b'x'; 64 * 1024];
+        let mut input = std::io::Cursor::new(bytes.clone());
+
+        drain_bounded_service_log(&mut input, Path::new("/dev/full"))
+            .expect_err("writes to /dev/full must fail");
+
+        assert_eq!(input.position(), bytes.len() as u64);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn service_log_writer_reports_a_write_failure() {
+        let log = BoundedServiceLog::open(Path::new("/dev/full")).expect("open full device");
+        let (sender, failures) = mpsc::sync_channel(1);
+        let (sink, task) = spawn_service_log_writer(
+            PathBuf::from("/dev/full"),
+            log,
+            "test service",
+            Some(sender),
+        );
+        sink.push(b"captured output".to_vec());
+
+        let error = failures
+            .recv_timeout(Duration::from_secs(2))
+            .expect("write failure must reach the supervisor");
+        assert!(error.contains("log write failed"), "{error}");
+        sink.close();
+        task.join().expect("writer exits after closing the sink");
+    }
+
+    #[test]
+    fn pending_output_evicts_oldest_chunks() {
+        let inner = Arc::new(ServiceLogSinkInner {
+            pending: Mutex::new(PendingServiceLog {
+                chunks: VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        });
+        let sink = ServiceLogSink(Arc::clone(&inner));
+        sink.push(vec![b'a'; 700 * 1024]);
+        sink.push(vec![b'b'; 700 * 1024]);
+
+        let pending = inner.pending.lock().expect("pending queue");
+        assert!(pending.bytes <= SERVICE_LOG_PENDING_BYTES);
+        assert_eq!(pending.chunks.len(), 1);
+        assert!(pending.chunks[0].iter().all(|byte| *byte == b'b'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_captures_both_child_streams() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = launchd_capture_paths(dir.path());
+        run_with_launchd_capture(paths, || {
+            let mut command = TokioCommand::new("/bin/sh");
+            command.args(["-c", "printf stdout-value; printf stderr-value >&2"]);
+            Ok(command)
+        })
+        .await
+        .expect("capture child output");
+
+        assert_eq!(
+            fs::read(dir.path().join("logs/daemon.stdout.log")).expect("read stdout"),
+            b"stdout-value"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("logs/daemon.stderr.log")).expect("read stderr"),
+            b"stderr-value"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_opens_before_command_resolution() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = launchd_capture_paths(dir.path());
+        let error = run_with_launchd_capture(paths, || bail!("fixture resolution failed"))
+            .await
+            .expect_err("resolution should fail");
+
+        assert!(error.to_string().contains("fixture resolution failed"));
+        let stderr = fs::read_to_string(dir.path().join("logs/daemon.stderr.log"))
+            .expect("read bootstrap diagnostics");
+        assert!(stderr.contains("launchd capture failed: fixture resolution failed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_child_exit_is_reported_in_bounded_stderr() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let paths = launchd_capture_paths(dir.path());
+        let error = run_with_launchd_capture(paths, || {
+            let mut command = TokioCommand::new("/bin/sh");
+            command.args(["-c", "exit 7"]);
+            Ok(command)
+        })
+        .await
+        .expect_err("child should fail");
+
+        assert!(error.to_string().contains("status"));
+        let stderr = fs::read_to_string(dir.path().join("logs/daemon.stderr.log"))
+            .expect("read failure diagnostics");
+        assert!(stderr.contains("daemon child exited with status"));
+    }
+
+    #[test]
+    fn desktop_pre_capture_failures_emit_once_and_preserve_the_error() {
+        let cases = [
+            (
+                anyhow::Error::msg("Failed to resolve desktop log path: config\r\npath"),
+                "ERROR Failed to resolve desktop log path: config path\n",
+            ),
+            (
+                anyhow::Error::msg(
+                    "Failed to resolve the desktop daemon executable: executable\npath",
+                ),
+                "ERROR Failed to resolve the desktop daemon executable: executable path\n",
+            ),
+        ];
+
+        for (error, expected_frame) in cases {
+            let expected_error = format!("{error:#}");
+            let mut frames = Vec::new();
+            let returned = handle_desktop_preflight::<()>(Err(error), |error| {
+                frames.push(desktop_error_frame(error));
+            })
+            .expect_err("pre-capture failure should be preserved");
+            assert_eq!(format!("{returned:#}"), expected_error);
+            assert_eq!(frames.len(), 1);
+            let frame = &frames[0];
+            assert_eq!(frame, expected_frame);
+            assert_eq!(frame.matches('\n').count(), 1);
+            assert!(!frame[..frame.len() - 1].contains('\r'));
+        }
+    }
+
+    #[test]
+    fn desktop_error_frame_is_bounded_and_valid_utf8() {
+        let message = "failure ".to_string() + &"界".repeat(DESKTOP_READINESS_FRAME_MAX_BYTES);
+        let frame = desktop_handshake_frame("ERROR", Some(&message));
+
+        assert!(frame.len() <= DESKTOP_READINESS_FRAME_MAX_BYTES);
+        assert!(frame.starts_with("ERROR "));
+        assert!(frame.ends_with("...\n"));
+        assert_eq!(frame.matches('\n').count(), 1);
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_combines_both_child_streams() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("streams")))
+            .await
+            .expect("capture child output");
+
+        let log = fs::read(path).expect("read combined desktop log");
+        assert!(
+            log.windows(b"stdout-value".len())
+                .any(|window| window == b"stdout-value")
+        );
+        assert!(
+            log.windows(b"stderr-value".len())
+                .any(|window| window == b"stderr-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_compacts_continuous_output_and_preserves_newest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("compact")))
+            .await
+            .expect("capture continuous child output");
+
+        let log = fs::read(&path).expect("read compacted desktop log");
+        assert!(log.len() as u64 <= SERVICE_LOG_MAX_BYTES);
+        assert!(log.ends_with(b"desktop-newest-output"));
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_records_spawn_startup_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let missing_child = dir.path().join("missing-desktop-child");
+        let error = run_with_desktop_capture(path.clone(), || {
+            Ok(TokioCommand::new(missing_child.clone()))
+        })
+        .await
+        .expect_err("missing child should fail to spawn");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to start desktop daemon child")
+        );
+        let log = fs::read_to_string(path).expect("read spawn failure diagnostics");
+        assert!(log.contains("desktop capture failed:"));
+        assert!(log.contains("Failed to start desktop daemon child"));
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_records_nonzero_child_exit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let mut generations = 0;
+        let error = run_with_desktop_capture(path.clone(), || {
+            generations += 1;
+            Ok(desktop_capture_test_command("nonzero"))
+        })
+        .await
+        .expect_err("child should fail");
+
+        assert!(error.to_string().contains("status"));
+        assert_eq!(generations, 1);
+        let log = fs::read_to_string(path).expect("read nonzero-exit diagnostics");
+        assert!(log.contains("child-output"));
+        assert!(log.contains("daemon child exited with status"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_capture_restarts_once_for_dedicated_exit_code() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let mut generations = 0;
+        run_with_desktop_capture(path, || {
+            generations += 1;
+            let mut command = TokioCommand::new("/bin/sh");
+            if generations == 1 {
+                command.args([
+                    "-c",
+                    "printf 'desktop-generation-one:%s\\n' \"$ZEROCLAW_DESKTOP_SUPERVISED\"; : > \"$ZEROCLAW_DESKTOP_RESTART_MARKER\"; sleep 0.1; exit 75",
+                ]);
+            } else {
+                command.args([
+                    "-c",
+                    "printf 'desktop-generation-two:%s\\n' \"$ZEROCLAW_DESKTOP_SUPERVISED\"; exit 0",
+                ]);
+            }
+            Ok(command)
+        })
+        .await
+        .expect("desktop supervisor should finish after normal second generation");
+        assert_eq!(generations, 2);
+        let log = fs::read_to_string(dir.path().join("logs/desktop-daemon.log"))
+            .expect("read two-generation desktop log");
+        assert!(log.contains("desktop-generation-one:1"));
+        assert!(log.contains("desktop-generation-two:1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_capture_does_not_restart_for_unmarked_dedicated_exit_code() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let mut generations = 0;
+        let error = run_with_desktop_capture(path, || {
+            generations += 1;
+            let mut command = TokioCommand::new("/bin/sh");
+            command.args(["-c", "exit 75"]);
+            Ok(command)
+        })
+        .await
+        .expect_err("unmarked dedicated exit must be ordinary failure");
+        assert_eq!(generations, 1);
+        assert!(error.to_string().contains("status"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn desktop_capture_reuses_stable_executable_after_atomic_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("logs/desktop-daemon.log");
+        let executable = dir.path().join("desktop-child");
+        let replacement = dir.path().join("desktop-child.next");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        // Keep real stable-path replacement without writing executable bytes while
+        // sibling tests may fork and inherit a fixture's writable descriptor.
+        symlink(fixtures.join("desktop-generation-two.sh"), &replacement)
+            .expect("link replacement child");
+        symlink(fixtures.join("desktop-generation-one.sh"), &executable)
+            .expect("link initial child");
+
+        run_desktop_capture_with_executable(path.clone(), executable, 0)
+            .await
+            .expect("stable executable should survive an atomic replacement");
+
+        let log = fs::read_to_string(path).expect("read stable-path log");
+        assert!(log.contains("stable-generation-one:1"));
+        assert!(log.contains("stable-generation-two:1"));
+    }
+
+    #[test]
+    fn windows_acl_inheritance_flags_match_object_kind() {
+        assert_eq!(windows_acl_ace_flags(true), 0x3);
+        assert_eq!(windows_acl_ace_flags(false), 0);
+    }
+
+    #[test]
+    fn relative_desktop_config_dir_resolves_before_first_run_binding() {
+        let relative = PathBuf::from("relative-first-run-config");
+        let resolved = normalize_desktop_config_dir(relative.clone()).expect("resolve config dir");
+        assert_eq!(resolved, std::env::current_dir().unwrap().join(relative));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn relative_desktop_config_dir_resolves_parent_components() {
+        let resolved = normalize_desktop_config_dir(PathBuf::from("nested/../config"))
+            .expect("resolve config dir parent component");
+        assert_eq!(resolved, std::env::current_dir().unwrap().join("config"));
+        assert!(resolved.is_absolute());
+    }
+
+    #[test]
+    fn windows_owner_sid_match_requires_exact_nonempty_bytes() {
+        assert!(windows_owner_sid_matches(b"owner", b"owner"));
+        assert!(!windows_owner_sid_matches(b"owner", b"other"));
+        assert!(!windows_owner_sid_matches(b"", b""));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_signal_reaps_owned_child_and_preserves_status() {
+        let mut child = TokioCommand::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn child");
+        let status = tokio::time::timeout(
+            Duration::from_secs(2),
+            stop_service_child(&mut child, libc::SIGTERM),
+        )
+        .await
+        .expect("child stop timeout")
+        .expect("stop child");
+        assert!(!status.success());
+        assert!(child.try_wait().expect("inspect child").is_some());
+    }
+}
+
+#[cfg(test)]
+mod linux_service_tests {
+    use super::*;
+
+    fn config_at(path: &str) -> Config {
+        Config {
+            config_path: PathBuf::from(path),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn linux_service_base_derives_named_instance_from_config_dir() {
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw-p100-104/config.toml")),
+            "zeroclaw-p100-104"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/zeroclaw-prod/config.toml")),
+            "zeroclaw-prod"
+        );
+    }
+
+    #[test]
+    fn linux_service_base_falls_back_for_default_and_unrelated_dirs() {
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/tmp/scratch/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw-/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(linux_service_base(&config_at("config.toml")), "zeroclaw");
+    }
+
+    #[test]
+    fn linux_service_control_args_use_named_instance() {
+        let config = config_at("/home/user/.zeroclaw-p100-104/config.toml");
+
+        assert_eq!(
+            linux_systemd_action_args(&config, "start"),
+            ["--user", "start", "zeroclaw-p100-104.service"]
+        );
+        assert_eq!(
+            linux_openrc_action_args(&config, "status"),
+            ["zeroclaw-p100-104", "status"]
+        );
+    }
+
+    #[test]
+    fn linux_openrc_log_dir_uses_named_instance() {
+        assert_eq!(
+            linux_openrc_log_dir(&config_at("/home/user/.zeroclaw/config.toml")),
+            PathBuf::from("/var/log/zeroclaw")
+        );
+        assert_eq!(
+            linux_openrc_log_dir(&config_at("/home/user/.zeroclaw-p100-104/config.toml")),
+            PathBuf::from("/var/log/zeroclaw-p100-104")
+        );
+    }
+
+    #[test]
+    fn linux_install_scope_rejects_named_instances() {
+        assert!(
+            ensure_linux_default_install_scope(
+                &config_at("/home/user/.zeroclaw/config.toml"),
+                "install"
+            )
+            .is_ok()
+        );
+
+        let err = ensure_linux_default_install_scope(
+            &config_at("/home/user/.zeroclaw-p100-104/config.toml"),
+            "install",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only manages the default zeroclaw service"));
+        assert!(err.contains("zeroclaw-p100-104"));
+    }
+
+    #[test]
+    fn linux_journalctl_args_use_named_instance() {
+        let config = config_at("/home/user/.zeroclaw-p100-104/config.toml");
+
+        assert_eq!(
+            linux_journalctl_args(&config, 50, true),
+            [
+                "--user",
+                "-u",
+                "zeroclaw-p100-104.service",
+                "-n",
+                "50",
+                "--no-pager",
+                "-f"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_reads_yes_and_no() {
+        assert_eq!(
+            parse_loginctl_linger_property("Linger=yes\nUID=1000\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_loginctl_linger_property("UID=1000\nLinger=no\n"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_is_case_and_whitespace_tolerant() {
+        assert_eq!(
+            parse_loginctl_linger_property("  linger = YeS  \n"),
+            Some(true)
+        );
+        assert_eq!(parse_loginctl_linger_property("LINGER = No\n"), Some(false));
+    }
+
+    #[test]
+    fn parse_loginctl_linger_property_ignores_unusable_output() {
+        assert_eq!(parse_loginctl_linger_property("UID=1000\nName=dan\n"), None);
+        assert_eq!(parse_loginctl_linger_property("Linger=maybe\n"), None);
+        assert_eq!(parse_loginctl_linger_property(""), None);
+    }
+
+    #[test]
+    fn systemd_user_linger_status_requires_successful_loginctl() {
+        assert_eq!(
+            systemd_user_linger_status_from_output("1000".to_string(), false, "Linger=no\n"),
+            SystemdUserLinger::Unknown
+        );
+    }
+
+    #[test]
+    fn systemd_user_linger_status_maps_disabled_user_target() {
+        assert_eq!(
+            systemd_user_linger_status_from_output("1000".to_string(), true, "Linger=no\n"),
+            SystemdUserLinger::Disabled {
+                user: "1000".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn systemd_linger_hint_names_enable_command() {
+        let hint = systemd_linger_hint("1000");
+        assert!(hint.contains("may stop after logout"));
+        assert!(hint.contains("loginctl enable-linger 1000"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn linux_service_file_stays_default_for_install_path() {
+        let file =
+            linux_service_file(&config_at("/home/user/.zeroclaw-p100-104/config.toml")).unwrap();
+        let path = file.to_string_lossy();
+        assert!(path.ends_with(".config/systemd/user/zeroclaw.service"));
+    }
+}
+
+#[cfg(test)]
+mod service_helper_tests {
     use super::*;
 
     #[test]
@@ -1430,6 +4351,83 @@ mod tests {
     #[test]
     fn windows_task_name_is_constant() {
         assert_eq!(windows_task_name(), "ZeroClaw Daemon");
+    }
+
+    #[test]
+    fn windows_task_state_probe_uses_invariant_numeric_state_and_exit_codes() {
+        assert_eq!(
+            windows_task_state_command("ZeroClaw Daemon"),
+            "$task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object { $_.TaskName -eq 'ZeroClaw Daemon' }; if ($null -eq $task) { exit 2 }; if ([int]$task.State -eq 4) { exit 0 }; if ([int]$task.State -eq 2) { exit 3 }; if ([int]$task.State -eq 1 -or [int]$task.State -eq 3) { exit 4 }; exit 5"
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(0)).unwrap(),
+            WindowsTaskState::Running
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(4)).unwrap(),
+            WindowsTaskState::Idle
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(2)).unwrap(),
+            WindowsTaskState::Missing
+        );
+        assert_eq!(
+            windows_task_state_from_exit_code(Some(3)).unwrap(),
+            WindowsTaskState::Queued
+        );
+        assert!(windows_task_state_from_exit_code(Some(1)).is_err());
+        assert!(windows_task_state_from_exit_code(Some(5)).is_err());
+        assert!(windows_task_state_from_exit_code(Some(17)).is_err());
+        assert!(windows_task_state_from_exit_code(None).is_err());
+    }
+
+    #[test]
+    fn windows_task_replacement_requires_a_disabled_existing_task() {
+        let command = windows_task_replaceable_command("ZeroClaw Daemon");
+        assert!(command.contains("Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop"));
+        assert!(command.contains("[int]$task.State -eq 1"));
+        assert!(!command.contains("Stop-ScheduledTask"));
+        assert!(command.ends_with("exit 6"));
+        windows_task_replaceable_from_exit_code(Some(0))
+            .expect("missing or disabled task should be replaceable");
+        let active_error = windows_task_replaceable_from_exit_code(Some(6))
+            .expect_err("active task must block reinstall");
+        assert!(active_error.to_string().contains("left unchanged"));
+        assert!(windows_task_replaceable_from_exit_code(Some(17)).is_err());
+        assert!(windows_task_replaceable_from_exit_code(None).is_err());
+    }
+
+    #[test]
+    fn windows_task_action_binds_the_config_directory_without_cmd_redirection() {
+        let action = windows_task_action(
+            Path::new(r"C:\Program Files\ZeroClaw\zeroclaw.exe"),
+            Path::new(r"C:\Users\agent\Zero Claw"),
+        )
+        .expect("Windows action");
+        assert_eq!(
+            action,
+            r#""C:\Program Files\ZeroClaw\zeroclaw.exe" --config-dir "C:\Users\agent\Zero Claw" service run-windows-daemon"#
+        );
+        assert!(!action.contains(".cmd"));
+        assert!(!action.contains(">>"));
+    }
+
+    #[test]
+    fn windows_task_action_rejects_environment_expansion_and_oversized_actions() {
+        assert!(
+            windows_task_action(
+                Path::new(r"C:\%USERPROFILE%\zeroclaw.exe"),
+                Path::new(r"C:\Users\agent\.zeroclaw")
+            )
+            .is_err()
+        );
+        assert!(
+            windows_task_action(
+                Path::new(r"C:\zeroclaw.exe"),
+                Path::new(&format!(r"C:\{}", "x".repeat(270)))
+            )
+            .is_err()
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1505,8 +4503,14 @@ mod tests {
         assert!(script.contains("command_user=\"zeroclaw:zeroclaw\""));
         assert!(script.contains("pidfile=\"/run/${RC_SVCNAME}.pid\""));
         assert!(script.contains("umask 027"));
-        assert!(script.contains("output_log=\"/var/log/zeroclaw/access.log\""));
-        assert!(script.contains("error_log=\"/var/log/zeroclaw/error.log\""));
+        assert!(script.contains(
+            "output_logger=\"/usr/local/bin/zeroclaw service run-openrc-log-writer stdout\""
+        ));
+        assert!(script.contains(
+            "error_logger=\"/usr/local/bin/zeroclaw service run-openrc-log-writer stderr\""
+        ));
+        assert!(!script.contains("output_log="));
+        assert!(!script.contains("error_log="));
         assert!(script.contains("depend()"));
         assert!(script.contains("need net"));
         assert!(script.contains("after firewall"));
@@ -1542,53 +4546,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn systemd_unit_contains_home_and_pass_environment() {
-        let unit = "[Unit]\n\
-             Description=ZeroClaw daemon\n\
-             After=network.target\n\
-             \n\
-             [Service]\n\
-             Type=simple\n\
-             ExecStart=/usr/local/bin/zeroclaw daemon\n\
-             Restart=always\n\
-             RestartSec=3\n\
-             # Ensure HOME is set so headless browsers can create profile/cache dirs.\n\
-             Environment=HOME=%h\n\
-             # Allow inheriting DISPLAY and XDG_RUNTIME_DIR from the user session\n\
-             # so graphical/headless browsers can function correctly.\n\
-             PassEnvironment=DISPLAY XDG_RUNTIME_DIR\n\
-             \n\
-             [Install]\n\
-             WantedBy=default.target\n"
-            .to_string();
-
-        assert!(
-            unit.contains("Environment=HOME=%h"),
-            "systemd unit must set HOME for headless browser support"
-        );
-        assert!(
-            unit.contains("PassEnvironment=DISPLAY XDG_RUNTIME_DIR"),
-            "systemd unit must pass through display/runtime env vars"
-        );
-    }
-
-    #[test]
-    fn warn_if_binary_in_home_detects_home_path() {
-        use std::path::PathBuf;
-
-        let home_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
-        assert!(home_path.to_string_lossy().contains("/home/"));
-        assert!(home_path.to_string_lossy().contains(".cargo/bin"));
-
-        let cargo_path = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
-        assert!(cargo_path.to_string_lossy().contains(".cargo/bin"));
-
-        let system_path = PathBuf::from("/usr/local/bin/zeroclaw");
-        assert!(!system_path.to_string_lossy().contains("/home/"));
-        assert!(!system_path.to_string_lossy().contains(".cargo/bin"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn shell_single_quote_escapes_single_quotes() {
@@ -1596,6 +4553,19 @@ mod tests {
             shell_single_quote("/tmp/weird'path"),
             "'/tmp/weird'\"'\"'path'"
         );
+    }
+
+    #[test]
+    fn openrc_executable_path_rejects_shell_syntax() {
+        assert!(openrc_executable_path_is_safe(Path::new(
+            "/usr/local/bin/zeroclaw"
+        )));
+        assert!(!openrc_executable_path_is_safe(Path::new(
+            "/opt/zero claw/bin/zeroclaw"
+        )));
+        assert!(!openrc_executable_path_is_safe(Path::new(
+            "/opt/$zero/bin/zeroclaw"
+        )));
     }
 
     #[cfg(unix)]
@@ -1615,27 +4585,6 @@ mod tests {
                 "test -w '/etc/zeroclaw'".to_string()
             ]
         );
-    }
-
-    #[test]
-    fn detect_homebrew_var_dir_from_cellar_path() {
-        let exe = PathBuf::from("/opt/homebrew/Cellar/zeroclaw/1.2.3/bin/zeroclaw");
-        let var_dir = detect_homebrew_var_dir(&exe);
-        assert_eq!(var_dir, Some(PathBuf::from("/opt/homebrew/var/zeroclaw")));
-    }
-
-    #[test]
-    fn detect_homebrew_var_dir_intel_cellar_path() {
-        let exe = PathBuf::from("/usr/local/Cellar/zeroclaw/1.0.0/bin/zeroclaw");
-        let var_dir = detect_homebrew_var_dir(&exe);
-        assert_eq!(var_dir, Some(PathBuf::from("/usr/local/var/zeroclaw")));
-    }
-
-    #[test]
-    fn detect_homebrew_var_dir_non_homebrew_path() {
-        let exe = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
-        let var_dir = detect_homebrew_var_dir(&exe);
-        assert_eq!(var_dir, None);
     }
 
     #[cfg(unix)]
@@ -1658,36 +4607,183 @@ mod tests {
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn tail_file_errors_on_missing_file() {
-        let missing = Path::new("/tmp/zeroclaw-test-nonexistent-log-file.log");
-        let result = tail_file(missing, 10, false);
+    fn tail_files_errors_on_missing_file() {
+        let missing = PathBuf::from("/tmp/zeroclaw-test-nonexistent-log-file.log");
+        let result = tail_files(&[missing], 10, false);
         assert!(result.is_err(), "tail on missing file should fail");
     }
 
     #[cfg(not(target_os = "windows"))]
     #[test]
-    fn tail_file_reads_existing_file() {
+    fn tail_files_reads_existing_file() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
         let log = dir.path().join("test-tail.log");
         fs::write(&log, "line1\nline2\nline3\nline4\nline5\n").unwrap();
-        // tail should succeed on existing file
-        let result = tail_file(&log, 3, false);
+        let result = tail_files(&[log], 3, false);
         assert!(result.is_ok(), "tail on existing file should succeed");
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
-    fn logs_variant_is_recognized() {
-        // Ensure the Logs variant can be constructed and matched
-        let cmd = crate::ServiceCommands::Logs {
-            lines: 25,
-            follow: true,
-        };
-        match &cmd {
-            crate::ServiceCommands::Logs { lines, follow } => {
-                assert_eq!(*lines, 25);
-                assert!(*follow);
+    fn tail_files_reads_every_named_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let first = dir.path().join("first.log");
+        let second = dir.path().join("second.log");
+        fs::write(&first, "first\n").unwrap();
+        fs::write(&second, "second\n").unwrap();
+        let result = tail_files(&[first, second], 3, false);
+        assert!(result.is_ok(), "tail on two existing files should succeed");
+    }
+
+    #[test]
+    fn tail_files_rejects_an_empty_selection() {
+        let result = tail_files(&[], 10, false);
+        assert!(result.is_err(), "tail with no paths should fail");
+    }
+
+    #[test]
+    fn service_log_targets_skips_the_stream_without_output() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log],
+            "an empty capture file must not hide the stream that has output"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_lists_both_streams_when_both_have_output() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "provider error\n").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log, stderr_log],
+            "both streams carry output, so both are shown, primary first"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_keeps_empty_files_so_follow_can_attach() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log, stderr_log],
+            "a daemon that has not written yet is still followable"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_is_empty_when_nothing_was_captured() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+
+        assert!(
+            service_log_targets(&stdout_log, &stderr_log).is_empty(),
+            "no capture files means the caller reports a missing install"
+        );
+    }
+
+    #[test]
+    fn service_log_targets_ignores_a_missing_counterpart() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+
+        assert_eq!(
+            service_log_targets(&stdout_log, &stderr_log),
+            vec![stdout_log],
+            "a capture file that was never created is not a target"
+        );
+    }
+
+    #[test]
+    fn get_content_command_uses_literal_path_and_doubles_quotes() {
+        let command = get_content_command(Path::new("C:\\logs\\o'brien[1].log"), 25, true);
+        assert_eq!(
+            command,
+            "Get-Content -LiteralPath 'C:\\logs\\o''brien[1].log' -Encoding UTF8 -Tail 25 -Wait"
+        );
+    }
+
+    #[test]
+    fn get_content_command_omits_wait_without_follow() {
+        let command = get_content_command(Path::new("C:\\logs\\daemon.stdout.log"), 50, false);
+        assert_eq!(
+            command,
+            "Get-Content -LiteralPath 'C:\\logs\\daemon.stdout.log' -Encoding UTF8 -Tail 50"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn follow_sees_a_failure_written_to_stderr_after_startup() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let stdout_log = dir.path().join("daemon.stdout.log");
+        let stderr_log = dir.path().join("daemon.stderr.log");
+        fs::write(&stdout_log, "listening for messages\n").unwrap();
+        fs::write(&stderr_log, "").unwrap();
+
+        let targets = follow_log_targets(&stdout_log, &stderr_log);
+        let mut viewer = tail_command(&targets, 10, true)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("tail should start");
+        let output = viewer.stdout.take().expect("tail stdout is piped");
+        let (line_tx, line_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(output).lines().map_while(Result::ok) {
+                if line_tx.send(line).is_err() {
+                    break;
+                }
             }
-            _ => panic!("Expected Logs variant"),
-        }
+        });
+        let saw = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+                match line_rx.recv_timeout(left) {
+                    Ok(line) if line.contains(needle) => return true,
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        };
+
+        let attached = saw("daemon.stderr.log <==");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&stderr_log)
+            .unwrap()
+            .write_all(b"launchd capture failed: child exited\n")
+            .unwrap();
+        let delivered = saw("launchd capture failed");
+        let _ = viewer.kill();
+        let _ = viewer.wait();
+
+        assert!(attached, "the follower must open the empty stderr file");
+        assert!(
+            delivered,
+            "a failure appended to stderr must reach the running viewer"
+        );
     }
 }

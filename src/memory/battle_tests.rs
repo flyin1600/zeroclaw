@@ -1,8 +1,4 @@
 //! Battle tests for the memory system improvements.
-//!
-//! Exercises all 6 phases end-to-end: retrieval pipeline, namespace isolation,
-//! importance scoring, conflict resolution, audit trail, and policy engine.
-//! Designed to surface regressions in edge cases and multi-feature interactions.
 
 #[cfg(test)]
 mod tests {
@@ -19,7 +15,7 @@ mod tests {
 
     fn temp_sqlite() -> (TempDir, SqliteMemory) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
     }
 
@@ -39,9 +35,16 @@ mod tests {
         .await
         .unwrap();
 
-        let pipeline = RetrievalPipeline::new(Arc::new(mem), RetrievalConfig::default());
+        // This test exercises the hot cache, which is opt-in (off by default).
+        let pipeline = RetrievalPipeline::new(
+            Arc::new(mem),
+            RetrievalConfig {
+                cache_enabled: true,
+                ..RetrievalConfig::default()
+            },
+        );
 
-        // First call — cache miss, hits FTS
+        // First call: cache miss, hits FTS
         let r1 = pipeline
             .recall("Rust", 10, None, None, None, None)
             .await
@@ -71,7 +74,14 @@ mod tests {
         .unwrap();
 
         let mem = Arc::new(mem);
-        let pipeline = RetrievalPipeline::new(mem.clone(), RetrievalConfig::default());
+        // This test exercises the hot cache, which is opt-in (off by default).
+        let pipeline = RetrievalPipeline::new(
+            mem.clone(),
+            RetrievalConfig {
+                cache_enabled: true,
+                ..RetrievalConfig::default()
+            },
+        );
 
         let _ = pipeline
             .recall("searchable", 10, None, None, None, None)
@@ -378,6 +388,7 @@ mod tests {
     #[test]
     fn conflict_detection_skips_non_core() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "daily1".into(),
             content: "User prefers Rust".into(),
@@ -388,6 +399,11 @@ mod tests {
             namespace: "default".into(),
             importance: None,
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
         }];
 
         let conflicts = conflict::find_text_conflicts(&entries, "User prefers Go", 0.3);
@@ -400,6 +416,7 @@ mod tests {
     #[test]
     fn conflict_detection_skips_already_superseded() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "old_pref".into(),
             content: "User prefers Rust for systems work".into(),
@@ -410,6 +427,11 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: Some("newer_id".into()), // already superseded
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
         }];
 
         let conflicts =
@@ -423,6 +445,7 @@ mod tests {
     #[test]
     fn conflict_detection_identical_content_not_flagged() {
         let entries = vec![MemoryEntry {
+            principal_id: None,
             id: "1".into(),
             key: "pref".into(),
             content: "User prefers Rust".into(),
@@ -433,6 +456,11 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
         }];
 
         // Exact same content should not be a conflict
@@ -514,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn audit_logs_all_operation_types() {
         let tmp = TempDir::new().unwrap();
-        let inner = crate::memory::NoneMemory::new();
+        let inner = crate::memory::NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         audited
@@ -536,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn audit_with_namespaced_operations() {
         let tmp = TempDir::new().unwrap();
-        let inner = crate::memory::NoneMemory::new();
+        let inner = crate::memory::NoneMemory::new("none");
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         audited
@@ -561,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn audit_wrapping_sqlite_backend() {
         let tmp = TempDir::new().unwrap();
-        let inner = SqliteMemory::new(tmp.path()).unwrap();
+        let inner = SqliteMemory::new("test", tmp.path()).unwrap();
         let audited = AuditedMemory::new(inner, tmp.path()).unwrap();
 
         // Full round-trip through audited sqlite
@@ -583,13 +611,13 @@ mod tests {
     #[tokio::test]
     async fn audit_concurrent_operations() {
         let tmp = TempDir::new().unwrap();
-        let inner = crate::memory::NoneMemory::new();
+        let inner = crate::memory::NoneMemory::new("none");
         let audited = Arc::new(AuditedMemory::new(inner, tmp.path()).unwrap());
 
         let mut handles = Vec::new();
         for i in 0..10 {
             let a = audited.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(zeroclaw_spawn::spawn!(async move {
                 a.store(
                     &format!("k{i}"),
                     &format!("v{i}"),
@@ -773,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn pipeline_with_audited_sqlite() {
         let tmp = TempDir::new().unwrap();
-        let sqlite = SqliteMemory::new(tmp.path()).unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
         let audited = AuditedMemory::new(sqlite, tmp.path()).unwrap();
         let audited = Arc::new(audited);
 
@@ -913,7 +941,7 @@ mod tests {
 
         // First open: creates schema with all columns
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             mem.store_with_metadata(
                 "persist_key",
                 "persisted data",
@@ -928,7 +956,7 @@ mod tests {
 
         // Second open: migrations run again but are idempotent
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             let entry = mem.get("persist_key").await.unwrap().unwrap();
             assert_eq!(entry.content, "persisted data");
             assert_eq!(entry.namespace, "test-ns");
@@ -937,7 +965,7 @@ mod tests {
 
         // Third open: still fine
         {
-            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            let mem = SqliteMemory::new("test", tmp.path()).unwrap();
             assert!(mem.health_check().await);
             assert_eq!(mem.count().await.unwrap(), 1);
         }
@@ -1029,6 +1057,7 @@ mod tests {
     #[test]
     fn memory_entry_serde_roundtrip_with_new_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "test-id".into(),
             key: "test-key".into(),
             content: "test content".into(),
@@ -1039,6 +1068,11 @@ mod tests {
             namespace: "my-namespace".into(),
             importance: Some(0.7),
             superseded_by: Some("newer-id".into()),
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

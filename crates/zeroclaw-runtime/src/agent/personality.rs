@@ -1,9 +1,5 @@
 //! Personality system — loads workspace identity files (SOUL.md, IDENTITY.md,
 //! USER.md) and injects them into the system prompt pipeline.
-//!
-//! Ported from RustyClaw `src/agent/personality.rs`.  The loader reads markdown
-//! files from the workspace root, validates size limits, and produces a
-//! [`PersonalityProfile`] that the prompt builder can render.
 
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -23,11 +19,28 @@ pub const PERSONALITY_FILES: &[&str] = &[
     "MEMORY.md",
 ];
 
-/// Subset of [`PERSONALITY_FILES`] that the dashboard exposes for
-/// authoring. `BOOTSTRAP.md` is deliberately excluded: it's a
-/// first-run scaffold the agent reads once and deletes, not a file
-/// the user is meant to hand-edit. The runtime still injects it when
-/// it exists on disk.
+/// The curated long-term memory file. Isolated sessions withhold this one file
+/// from the provider-visible prompt; every other personality file still loads.
+pub const MEMORY_PERSONALITY_FILE: &str = "MEMORY.md";
+
+/// [`PERSONALITY_FILES`] minus [`MEMORY_PERSONALITY_FILE`], for isolated / ACP
+/// sessions created with `exclude_memory: true`. Those sessions get no memory
+/// tools, a `NoneMemory` backend and no automatic saves; the curated memory
+/// *content* must be withheld from the provider-visible prompt too, otherwise
+/// the "persistent memory isolated" guarantee is only half enforced.
+///
+/// Derived from [`PERSONALITY_FILES`] at call time so the canonical list stays
+/// the single source of truth: a new non-memory personality file is picked up
+/// by isolated sessions automatically, with no second list to update in
+/// lockstep. Do not filter ad hoc at a call site — use this helper.
+pub fn personality_files_without_memory() -> Vec<&'static str> {
+    PERSONALITY_FILES
+        .iter()
+        .copied()
+        .filter(|name| *name != MEMORY_PERSONALITY_FILE)
+        .collect()
+}
+
 pub const EDITABLE_PERSONALITY_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
@@ -78,12 +91,13 @@ impl PersonalityProfile {
     pub fn render(&self) -> String {
         let mut out = String::new();
         for file in &self.files {
-            let _ = writeln!(out, "### {}\n", file.name);
             out.push_str(&file.content);
             if file.truncated {
                 let _ = writeln!(
                     out,
-                    "\n\n[... truncated at {MAX_FILE_CHARS} chars — use `read` for full file]\n"
+                    "\n\n[... {name} truncated at {limit} chars — use `read {name}` for full file]\n",
+                    name = file.name,
+                    limit = MAX_FILE_CHARS,
                 );
             } else {
                 out.push_str("\n\n");
@@ -94,11 +108,29 @@ impl PersonalityProfile {
 }
 
 /// Loads personality files from a workspace directory.
-///
 /// Each well-known file is read and validated.  Missing files are recorded
 /// in `PersonalityProfile::missing` rather than treated as errors.
 pub fn load_personality(workspace_dir: &Path) -> PersonalityProfile {
     load_personality_files(workspace_dir, PERSONALITY_FILES)
+}
+
+pub async fn seed_default_personality(
+    config: &zeroclaw_config::schema::Config,
+    alias: &str,
+    workspace_dir: &Path,
+) -> std::io::Result<Vec<&'static str>> {
+    use zeroclaw_config::multi_agent::MemoryBackendKind;
+    let include_memory = config
+        .agents
+        .get(alias)
+        .map(|agent| agent.memory.backend != MemoryBackendKind::None)
+        .unwrap_or(true);
+    let ctx = crate::agent::personality_templates::TemplateContext {
+        agent: alias.to_string(),
+        include_memory,
+        ..Default::default()
+    };
+    crate::agent::personality_templates::ensure_personality_preset(workspace_dir, &ctx).await
 }
 
 /// Load a specific set of personality files from a workspace directory.
@@ -161,6 +193,52 @@ mod tests {
     }
 
     #[test]
+    fn isolated_personality_view_is_canonical_list_minus_memory() {
+        let isolated = personality_files_without_memory();
+
+        // The isolated view must be derived from the canonical list, not a
+        // hand-maintained copy: exactly the canonical selection minus the one
+        // memory file, in canonical order.
+        let expected: Vec<&str> = PERSONALITY_FILES
+            .iter()
+            .copied()
+            .filter(|name| *name != MEMORY_PERSONALITY_FILE)
+            .collect();
+        assert_eq!(
+            isolated, expected,
+            "isolated view must equal the canonical list minus the memory file"
+        );
+
+        // Nothing but the memory file may be dropped.
+        assert_eq!(
+            isolated.len(),
+            PERSONALITY_FILES.len() - 1,
+            "exactly one file (the memory file) may be withheld from isolated sessions"
+        );
+        assert!(
+            !isolated.contains(&MEMORY_PERSONALITY_FILE),
+            "isolated sessions must not load the curated memory file"
+        );
+        for name in PERSONALITY_FILES
+            .iter()
+            .filter(|name| **name != MEMORY_PERSONALITY_FILE)
+        {
+            assert!(
+                isolated.contains(name),
+                "isolated sessions must still load canonical personality file {name}"
+            );
+        }
+
+        // Guards the actual regression: the canonical list is the only place a
+        // new personality file is registered, so a future addition reaches
+        // isolated sessions with no second list to update.
+        assert!(
+            PERSONALITY_FILES.contains(&MEMORY_PERSONALITY_FILE),
+            "the memory file must be part of the canonical list it is filtered from"
+        );
+    }
+
+    #[test]
     fn load_personality_reads_existing_files() {
         let ws = setup_workspace(&[
             ("SOUL.md", "I am a helpful assistant."),
@@ -218,9 +296,12 @@ mod tests {
 
         let profile = load_personality(&ws);
         let rendered = profile.render();
-        assert!(rendered.contains("### SOUL.md"));
+        assert!(!rendered.contains("SOUL.md"), "heading removed: {rendered}");
         assert!(rendered.contains("Be kind."));
-        assert!(rendered.contains("### IDENTITY.md"));
+        assert!(
+            !rendered.contains("IDENTITY.md"),
+            "heading removed: {rendered}"
+        );
         assert!(rendered.contains("Name: Nova"));
 
         let _ = std::fs::remove_dir_all(ws);
@@ -233,7 +314,10 @@ mod tests {
 
         let profile = load_personality(&ws);
         let rendered = profile.render();
-        assert!(rendered.contains("[... truncated at"));
+        assert!(
+            rendered.contains("SOUL.md truncated"),
+            "expected filename in truncation notice: {rendered}"
+        );
 
         let _ = std::fs::remove_dir_all(ws);
     }
@@ -264,5 +348,71 @@ mod tests {
         assert!(profile.is_empty());
         assert!(!profile.missing.is_empty());
         let _ = std::fs::remove_dir_all(ws);
+    }
+
+    fn config_with_agent_memory_backend(
+        alias: &str,
+        backend: zeroclaw_config::multi_agent::MemoryBackendKind,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                memory: zeroclaw_config::multi_agent::AgentMemoryConfig { backend },
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn seed_default_personality_memoryless_agent_uses_no_memory_variant() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        let dir = tempfile::tempdir().unwrap();
+        // The agent's OWN backend is `none`, even though the install-wide
+        // default (config.memory.backend) is memory-enabled (sqlite).
+        let config = config_with_agent_memory_backend("clawdia", MemoryBackendKind::None);
+        assert_eq!(config.memory.backend.as_str(), "sqlite");
+
+        let written = seed_default_personality(&config, "clawdia", dir.path())
+            .await
+            .unwrap();
+
+        // MEMORY.md must be skipped for a memoryless agent.
+        assert!(
+            !written.contains(&"MEMORY.md"),
+            "memoryless agent must not be seeded MEMORY.md"
+        );
+        assert!(
+            !dir.path().join("MEMORY.md").exists(),
+            "MEMORY.md must not exist on disk for a none-backend agent"
+        );
+        // AGENTS.md must be the no-memory variant.
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("memory.backend = \"none\""),
+            "memoryless agent must get the no-memory AGENTS.md variant, got:\n{agents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_default_personality_memory_agent_gets_memory_variant() {
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_with_agent_memory_backend("clawdia", MemoryBackendKind::Sqlite);
+
+        let written = seed_default_personality(&config, "clawdia", dir.path())
+            .await
+            .unwrap();
+
+        assert!(
+            written.contains(&"MEMORY.md"),
+            "a memory-backed agent must be seeded MEMORY.md"
+        );
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("Daily notes"),
+            "memory-backed agent must get the memory-on AGENTS.md variant"
+        );
     }
 }

@@ -1,13 +1,17 @@
 //! Raspberry Pi GPIO peripheral — native rppal access.
-//!
 //! Only compiled when `peripheral-rpi` feature is enabled and target is Linux.
 //! Uses BCM pin numbering (e.g. GPIO 17, 27).
 
 use crate::peripherals::Peripheral;
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
 use zeroclaw_config::schema::PeripheralBoardConfig;
+
+tool_attribution!(RpiGpioReadTool, ToolKind::Plugin);
+tool_attribution!(RpiGpioWriteTool, ToolKind::Plugin);
 
 /// RPi GPIO peripheral — direct access via rppal.
 pub struct RpiGpioPeripheral {
@@ -87,10 +91,16 @@ impl Tool for RpiGpioReadTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_read", "param": "pin"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })?;
         let pin_u8 = pin as u8;
 
         let value = tokio::task::spawn_blocking(move || {
@@ -105,7 +115,7 @@ impl Tool for RpiGpioReadTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("pin {} = {}", pin, value),
+            output: format!("pin {} = {}", pin, value).into(),
             error: None,
         })
     }
@@ -142,14 +152,26 @@ impl Tool for RpiGpioWriteTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
-            .get("pin")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
-        let value = args
-            .get("value")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'value' parameter"))?;
+        let pin = args.get("pin").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_write", "param": "pin"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'pin' parameter")
+        })?;
+        let value = args.get("value").and_then(|v| v.as_u64()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": "gpio_write", "param": "value"})),
+                "tool argument validation failed: missing parameter"
+            );
+            anyhow::Error::msg("Missing 'value' parameter")
+        })?;
         let pin_u8 = pin as u8;
         let level = match value {
             0 => rppal::gpio::Level::Low,
@@ -166,7 +188,7 @@ impl Tool for RpiGpioWriteTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("pin {} = {}", pin, value),
+            output: format!("pin {} = {}", pin, value).into(),
             error: None,
         })
     }

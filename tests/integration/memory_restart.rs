@@ -1,23 +1,17 @@
 //! TG5: Memory Restart Resilience Tests
-//!
-//! Prevents: Pattern 5 — Memory & state persistence bugs (10% of user bugs).
-//! Issues: #430, #693, #802
-//!
-//! Tests SqliteMemory deduplication on restart, session scoping, concurrent
-//! message ordering, and recall behavior after re-initialization.
 
 use std::sync::Arc;
 use zeroclaw::memory::sqlite::SqliteMemory;
 use zeroclaw::memory::traits::{Memory, MemoryCategory};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Deduplication: same key overwrites instead of duplicating (#430)
+// Deduplication: same key overwrites instead of duplicating
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn sqlite_memory_store_same_key_deduplicates() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     // Store same key twice with different content
     mem.store("greeting", "hello world", MemoryCategory::Core, None)
@@ -46,7 +40,7 @@ async fn sqlite_memory_store_same_key_deduplicates() {
 #[tokio::test]
 async fn sqlite_memory_store_different_keys_creates_separate_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     mem.store("key_a", "content a", MemoryCategory::Core, None)
         .await
@@ -69,7 +63,7 @@ async fn sqlite_memory_persists_across_reinitialization() {
 
     // First "session": store data
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store(
             "persistent_fact",
             "Rust is great",
@@ -82,7 +76,7 @@ async fn sqlite_memory_persists_across_reinitialization() {
 
     // Second "session": re-create memory from same path
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let entry = mem
             .get("persistent_fact")
             .await
@@ -98,7 +92,7 @@ async fn sqlite_memory_restart_does_not_duplicate_on_rewrite() {
 
     // First session: store entries
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store("fact_1", "original content", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -109,7 +103,7 @@ async fn sqlite_memory_restart_does_not_duplicate_on_rewrite() {
 
     // Second session: re-store same keys (simulates channel re-reading history)
     {
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         mem.store("fact_1", "original content", MemoryCategory::Core, None)
             .await
             .unwrap();
@@ -132,7 +126,7 @@ async fn sqlite_memory_restart_does_not_duplicate_on_rewrite() {
 #[tokio::test]
 async fn sqlite_memory_session_scoped_store_and_recall() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     // Store in different sessions
     mem.store(
@@ -168,7 +162,7 @@ async fn sqlite_memory_session_scoped_store_and_recall() {
 #[tokio::test]
 async fn sqlite_memory_global_recall_includes_all_sessions() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     mem.store(
         "global_a",
@@ -197,7 +191,7 @@ async fn sqlite_memory_global_recall_includes_all_sessions() {
 #[tokio::test]
 async fn sqlite_memory_recall_returns_relevant_results() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     mem.store(
         "lang_pref",
@@ -231,7 +225,7 @@ async fn sqlite_memory_recall_returns_relevant_results() {
 #[tokio::test]
 async fn sqlite_memory_recall_respects_limit() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     for i in 0..10 {
         mem.store(
@@ -258,7 +252,7 @@ async fn sqlite_memory_recall_respects_limit() {
 #[tokio::test]
 async fn sqlite_memory_recall_empty_query_returns_recent_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     mem.store("fact", "some content", MemoryCategory::Core, None)
         .await
@@ -277,7 +271,7 @@ async fn sqlite_memory_recall_empty_query_returns_recent_entries() {
 #[tokio::test]
 async fn sqlite_memory_forget_removes_entry() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     mem.store("to_forget", "temporary info", MemoryCategory::Core, None)
         .await
@@ -292,7 +286,7 @@ async fn sqlite_memory_forget_removes_entry() {
 #[tokio::test]
 async fn sqlite_memory_forget_nonexistent_returns_false() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     let removed = mem.forget("nonexistent_key").await.unwrap();
     assert!(!removed, "forget should return false for nonexistent key");
@@ -301,7 +295,7 @@ async fn sqlite_memory_forget_nonexistent_returns_false() {
 #[tokio::test]
 async fn sqlite_memory_health_check_returns_true() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     assert!(mem.health_check().await, "health_check should return true");
 }
@@ -313,12 +307,12 @@ async fn sqlite_memory_health_check_returns_true() {
 #[tokio::test]
 async fn sqlite_memory_concurrent_stores_no_data_loss() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+    let mem = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());
 
     let mut handles = Vec::new();
     for i in 0..5 {
         let mem_clone = mem.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             mem_clone
                 .store(
                     &format!("concurrent_{i}"),
@@ -349,7 +343,7 @@ async fn sqlite_memory_concurrent_stores_no_data_loss() {
 #[tokio::test]
 async fn sqlite_memory_list_by_category() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let mem = SqliteMemory::new(tmp.path()).unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
 
     mem.store("core_fact", "core info", MemoryCategory::Core, None)
         .await

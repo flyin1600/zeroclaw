@@ -11,7 +11,7 @@ use tokio_tungstenite::{
         http::{HeaderValue, header},
     },
 };
-use zeroclaw_config::schema::resolve_runtime_dirs_for_onboarding;
+use zeroclaw_config::schema::resolve_runtime_dirs;
 
 const CONFIG_NOT_FOUND_ERROR: &str = "ERROR: config.toml not found.  Are you sure the bridge and ZeroClaw are running on the same host?  Tool use will not work remotely!";
 const PAIRING_TOKEN_NOT_FOUND_ERROR: &str = "ERROR: Gateway pairing is active but no ACP bridge token is cached. Run `zeroclaw gateway get-paircode --new`, then run `zeroclaw-acp-bridge --pair-code <code>`, or set ZEROCLAW_ACP_BRIDGE_TOKEN.";
@@ -44,7 +44,7 @@ async fn run() -> Result<()> {
         .with_context(|| format!("failed to connect to {}", bridge_target.url))?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    let stdin_to_ws = tokio::spawn(async move {
+    let stdin_to_ws = zeroclaw_spawn::spawn!(async move {
         let stdin = io::stdin();
         let mut lines = BufReader::new(stdin).lines();
 
@@ -61,7 +61,7 @@ async fn run() -> Result<()> {
             .context("failed to close websocket")
     });
 
-    let ws_to_stdout = tokio::spawn(async move {
+    let ws_to_stdout = zeroclaw_spawn::spawn!(async move {
         let mut stdout = io::stdout();
 
         while let Some(message) = ws_read.next().await {
@@ -85,7 +85,11 @@ async fn run() -> Result<()> {
 }
 
 async fn load_acp_bridge_target() -> Result<BridgeTarget> {
-    let (config_dir, _) = resolve_runtime_dirs_for_onboarding().await?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config_dir = match config_dir_from_args(args.iter().cloned())? {
+        Some(dir) => PathBuf::from(dir),
+        None => resolve_runtime_dirs().await?.0,
+    };
     let config_path = config_dir.join("config.toml");
     if !config_path.exists() {
         anyhow::bail!(CONFIG_NOT_FOUND_ERROR);
@@ -94,11 +98,14 @@ async fn load_acp_bridge_target() -> Result<BridgeTarget> {
     let contents = tokio::fs::read_to_string(&config_path)
         .await
         .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let config: BridgeConfig = toml::from_str(&contents)
+    // Strip a leading UTF-8 BOM if present before parsing config.toml.
+    let contents = contents
+        .strip_prefix('\u{FEFF}')
+        .unwrap_or(contents.as_str());
+    let config: BridgeConfig = toml::from_str(contents)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
 
-    let pair_code = pair_code_from_args(std::env::args().skip(1))?
-        .or_else(|| env_value(ACP_BRIDGE_PAIRING_CODE_ENV));
+    let pair_code = pair_code_from_args(args)?.or_else(|| env_value(ACP_BRIDGE_PAIRING_CODE_ENV));
     resolve_acp_bridge_target(&config.gateway, &config_dir, pair_code.as_deref()).await
 }
 
@@ -158,23 +165,65 @@ fn bridge_target(config: &BridgeGatewayConfig, token: Option<String>) -> BridgeT
 }
 
 fn token_from_env() -> Option<String> {
-    env_value(ACP_BRIDGE_TOKEN_ENV)
+    token_from_env_with(|key| std::env::var(key))
+}
+
+fn token_from_env_with<F>(lookup: F) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    env_value_with(ACP_BRIDGE_TOKEN_ENV, lookup)
 }
 
 fn env_value(key: &str) -> Option<String> {
-    std::env::var(key)
+    env_value_with(key, |name| std::env::var(name))
+}
+
+fn env_value_with<F>(key: &str, lookup: F) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    lookup(key)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn config_dir_from_args(args: impl IntoIterator<Item = String>) -> Result<Option<String>> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--config-dir" {
+            let dir = args.next().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "acp-bridge args rejected: --config-dir missing value"
+                );
+                anyhow::Error::msg("--config-dir requires a path value")
+            })?;
+            return Ok(Some(dir));
+        }
+        if let Some(dir) = arg.strip_prefix("--config-dir=") {
+            return Ok(Some(dir.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn pair_code_from_args(args: impl IntoIterator<Item = String>) -> Result<Option<String>> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == "--pair-code" {
-            let code = args
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("--pair-code requires a code value"))?;
+            let code = args.next().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "acp-bridge args rejected: --pair-code missing value"
+                );
+                anyhow::Error::msg("--pair-code requires a code value")
+            })?;
             return Ok(Some(code));
         }
         if let Some(code) = arg.strip_prefix("--pair-code=") {
@@ -221,6 +270,9 @@ async fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     file.write_all(contents)
         .await
         .with_context(|| format!("failed to write {}", path.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to fsync {}", path.display()))?;
     Ok(())
 }
 
@@ -422,32 +474,10 @@ mod tests {
     use super::{
         BridgeGatewayConfig, BridgeGatewayTlsConfig, CONFIG_NOT_FOUND_ERROR,
         PAIRING_TOKEN_NOT_FOUND_ERROR, acp_bridge_target, acp_websocket_url, cached_token_path,
-        exchange_pairing_code, fetch_pairing_code, http_gateway_url, pair_code_from_args,
-        read_cached_token, token_from_env, write_cached_token, write_frame,
+        config_dir_from_args, exchange_pairing_code, fetch_pairing_code, http_gateway_url,
+        pair_code_from_args, read_cached_token, token_from_env_with, write_cached_token,
+        write_frame,
     };
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                unsafe { std::env::set_var(self.key, value) };
-            } else {
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
-    }
 
     #[tokio::test]
     async fn write_frame_appends_newline() {
@@ -530,9 +560,12 @@ mod tests {
 
     #[test]
     fn token_from_env_uses_plaintext_bridge_token() {
-        let _guard = EnvGuard::set("ZEROCLAW_ACP_BRIDGE_TOKEN", "zc_plaintext");
+        let token = token_from_env_with(|key| {
+            assert_eq!(key, "ZEROCLAW_ACP_BRIDGE_TOKEN");
+            Ok("  zc_plaintext  ".to_string())
+        });
 
-        assert_eq!(token_from_env().as_deref(), Some("zc_plaintext"));
+        assert_eq!(token.as_deref(), Some("zc_plaintext"));
     }
 
     #[test]
@@ -564,6 +597,19 @@ mod tests {
         assert_eq!(
             read_cached_token(&path).await.unwrap().as_deref(),
             Some("zc_new")
+        );
+    }
+
+    #[test]
+    fn config_dir_from_args_supports_flag_forms() {
+        assert_eq!(
+            config_dir_from_args(["--config-dir".to_string(), "/tmp/zeroclaw".to_string()])
+                .unwrap(),
+            Some("/tmp/zeroclaw".to_string())
+        );
+        assert_eq!(
+            config_dir_from_args(["--config-dir=/tmp/zeroclaw".to_string()]).unwrap(),
+            Some("/tmp/zeroclaw".to_string())
         );
     }
 

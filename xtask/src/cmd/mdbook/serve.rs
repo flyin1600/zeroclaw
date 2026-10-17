@@ -1,4 +1,4 @@
-use crate::cmd::mdbook::refs::{build_api, build_refs};
+use crate::cmd::mdbook::refs::build_api;
 use crate::util::*;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -9,7 +9,7 @@ use std::sync::{
 
 const PORT: u16 = 3000;
 
-pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
+pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
     require_tool("cargo", "https://rustup.rs")?;
     ensure_cargo_tool("mdbook", "mdbook")?;
@@ -31,48 +31,46 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
         );
     }
 
-    let ref_dir = ref_dir(&root);
-    if !ref_dir.join("cli.md").exists() || !ref_dir.join("config.md").exists() {
-        build_refs(&root)?;
-    }
     if !root.join("target/doc").exists() {
         build_api(&root)?;
     }
 
     let book = book_dir(&root);
-    let out_dir = book.join("book");
-
-    // Lang switcher always advertises every locale from locales.toml — switching
-    // to an unbuilt locale will 404 in single-locale mode, which is fine for
-    // local iteration.
-    crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &entries)?;
+    let tag_dir = tag.unwrap_or("master");
+    let out_dir = book.join("book").join(tag_dir);
 
     // Watched locale: the one passed in, or the first entry in locales.toml.
     let watch_locale = locale
         .map(str::to_string)
         .or_else(|| entries.first().map(|e| e.code.clone()))
-        .ok_or_else(|| anyhow::anyhow!("locales.toml has no entries"))?;
+        .ok_or_else(|| anyhow::Error::msg("locales.toml has no entries"))?;
 
     match locale {
         Some(code) => {
+            // Lang switcher advertises every locale even when serve builds one.
+            crate::cmd::mdbook::build::prepare_generated_book_inputs(&root, &entries)?;
             println!("==> Building locale '{code}' for serve...");
-            build_one_locale(&book, code)?;
+            build_one_locale(&book, tag_dir, code)?;
         }
         None => {
             println!("==> Building all locales for serve...");
-            crate::cmd::mdbook::build::build_locales(&root)?;
+            crate::cmd::mdbook::build::build_locales(&root, tag)?;
         }
     }
-    crate::cmd::mdbook::build::assemble(&root)?;
+    crate::cmd::mdbook::build::assemble(&root, tag)?;
 
     // Watch the active locale for live-reload (rebuilds book/{locale}/ on change)
-    let mut watch = Command::new(mdbook_program()?)
-        .args(["watch", "-d", &format!("book/{watch_locale}")])
+    let mut watch_cmd = Command::new(mdbook_program()?);
+    watch_cmd
+        .args(["watch", "-d", &format!("book/{}/{}", tag_dir, watch_locale)])
         .env("MDBOOK_BOOK__LANGUAGE", &watch_locale)
         .current_dir(&book)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    if let Some(env) = mdbook_xtask_preprocessor_env() {
+        watch_cmd.envs(env);
+    }
+    let mut watch = watch_cmd.spawn()?;
 
     // Re-copy api/ whenever mdbook's clean-on-rebuild removes it
     let running = Arc::new(AtomicBool::new(true));
@@ -131,21 +129,31 @@ pub fn run(locale: Option<&str>) -> anyhow::Result<()> {
     result
 }
 
-fn build_one_locale(book: &Path, locale: &str) -> anyhow::Result<()> {
-    run_cmd(
-        Command::new(mdbook_program()?)
-            .args(["build", "-d", &format!("book/{locale}")])
-            .env("MDBOOK_BOOK__LANGUAGE", locale)
-            .current_dir(book),
-    )
+fn build_one_locale(book: &Path, tag_dir: &str, locale: &str) -> anyhow::Result<()> {
+    let dest = format!("book/{}/{}", tag_dir, locale);
+    let mut cmd = Command::new(mdbook_program()?);
+    cmd.args(["build", "-d", &dest])
+        .env("MDBOOK_BOOK__LANGUAGE", locale)
+        .current_dir(book);
+    if let Some(env) = mdbook_xtask_preprocessor_env() {
+        cmd.envs(env);
+    }
+    run_cmd(&mut cmd)
 }
 
 async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {
     use axum::Router;
     use tower_http::services::ServeDir;
 
-    let app =
-        Router::new().fallback_service(ServeDir::new(&dir).append_index_html_on_directories(true));
+    let shared_dir = dir
+        .parent()
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("book directory has no parent: {}", dir.display()))
+        })?
+        .join("_shared");
+    let app = Router::new()
+        .nest_service("/_shared", ServeDir::new(&shared_dir))
+        .fallback_service(ServeDir::new(&dir).append_index_html_on_directories(true));
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{PORT}")).await?;
     axum::serve(listener, app).await?;
     Ok(())

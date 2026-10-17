@@ -1,17 +1,12 @@
 //! Cloud operations advisory tool for cloud transformation analysis.
-//!
-//! Provides read-only analysis capabilities: IaC review, migration assessment,
-//! cost analysis, and Well-Architected Framework architecture review.
-//! This tool does NOT create, modify, or delete cloud resources.
 
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use serde_json::json;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::CloudOpsConfig;
 
 /// Read-only cloud operations advisory tool.
-///
 /// Actions: `review_iac`, `assess_migration`, `cost_analysis`, `architecture_review`.
 pub struct CloudOpsTool {
     config: CloudOpsConfig,
@@ -50,7 +45,7 @@ impl Tool for CloudOpsTool {
                 },
                 "cloud": {
                     "type": "string",
-                    "description": "Target cloud provider (aws, azure, gcp). Uses configured default if omitted."
+                    "description": "Target cloud model_provider (aws, azure, gcp). Uses configured default if omitted."
                 }
             },
             "required": ["action", "input"]
@@ -59,34 +54,64 @@ impl Tool for CloudOpsTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = match args.get("action") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'action' must be a string, got: {}", v))?,
+            Some(v) => v.as_str().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "param": "action",
+                            "value": v,
+                        })),
+                    "cloud_ops: action must be a string"
+                );
+                anyhow::Error::msg(format!("'action' must be a string, got: {}", v))
+            })?,
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("'action' parameter is required".into()),
                 });
             }
         };
         let input = match args.get("input") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'input' must be a string, got: {}", v))?,
+            Some(v) => v.as_str().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "param": "input",
+                            "value": v,
+                        })),
+                    "cloud_ops: input must be a string"
+                );
+                anyhow::Error::msg(format!("'input' must be a string, got: {}", v))
+            })?,
             None => "",
         };
         let cloud = match args.get("cloud") {
-            Some(v) => v
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("'cloud' must be a string, got: {}", v))?,
+            Some(v) => v.as_str().ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "param": "cloud",
+                            "value": v,
+                        })),
+                    "cloud_ops: cloud must be a string"
+                );
+                anyhow::Error::msg(format!("'cloud' must be a string, got: {}", v))
+            })?,
             None => &self.config.default_cloud,
         };
 
         if input.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'input' parameter is required and cannot be empty".into()),
             });
         }
@@ -94,9 +119,9 @@ impl Tool for CloudOpsTool {
         if !self.config.supported_clouds.contains(&cloud.to_string()) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
-                    "Cloud provider '{}' is not in supported_clouds: {:?}",
+                    "Cloud model_provider '{}' is not in supported_clouds: {:?}",
                     cloud, self.config.supported_clouds
                 )),
             });
@@ -109,7 +134,7 @@ impl Tool for CloudOpsTool {
             "architecture_review" => self.architecture_review(input, cloud).await,
             _ => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{}'. Valid: review_iac, assess_migration, cost_analysis, architecture_review",
                     action
@@ -152,7 +177,7 @@ impl CloudOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -168,7 +193,7 @@ impl CloudOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -186,7 +211,7 @@ impl CloudOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -203,7 +228,7 @@ impl CloudOpsTool {
 
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&output)?,
+            output: serde_json::to_string_pretty(&output)?.into(),
             error: None,
         })
     }
@@ -338,11 +363,6 @@ fn scan_iac_best_practices(input: &str, cloud: &str) -> Vec<serde_json::Value> {
     findings
 }
 
-/// Scan for cost-related observations in IaC.
-///
-/// Only emits findings for resources whose estimated monthly cost exceeds
-/// `threshold`.  AWS-specific patterns (NAT Gateway, Elastic IP, ALB) are
-/// gated behind `cloud == "aws"`.
 fn scan_iac_cost(input: &str, cloud: &str, threshold: f64) -> Vec<serde_json::Value> {
     let lower = input.to_lowercase();
     let mut findings = Vec::new();

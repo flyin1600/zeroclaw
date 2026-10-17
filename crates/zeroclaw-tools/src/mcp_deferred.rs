@@ -1,18 +1,14 @@
 //! Deferred MCP tool loading — stubs and activated-tool tracking.
-//!
-//! When `mcp.deferred_loading` is enabled, MCP tool schemas are NOT eagerly
-//! included in the LLM context window. Instead, only lightweight stubs (name +
-//! description) are exposed in the system prompt. The LLM must call the built-in
-//! `tool_search` tool to fetch full schemas, which moves them into the
-//! [`ActivatedToolSet`] for the current conversation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::mcp_client::McpRegistry;
 use crate::mcp_protocol::McpToolDef;
 use crate::mcp_tool::McpToolWrapper;
+use crate::tool_search::ToolAccessPolicy;
 use zeroclaw_api::tool::{Tool, ToolSpec};
+use zeroclaw_config::policy::SecurityPolicy;
 
 // ── DeferredMcpToolStub ──────────────────────────────────────────────────
 
@@ -43,8 +39,21 @@ impl DeferredMcpToolStub {
     }
 
     /// Materialize this stub into a live [`McpToolWrapper`].
-    pub fn activate(&self, registry: Arc<McpRegistry>) -> McpToolWrapper {
-        McpToolWrapper::new(self.prefixed_name.clone(), self.def.clone(), registry)
+    ///
+    /// `security` is the execution-scope [`SecurityPolicy`] snapshot (source of
+    /// truth for the workspace path used when materializing MCP `resource`+`blob`
+    /// results) — an immutable `Arc`, not a reloadable live handle.
+    pub fn activate(
+        &self,
+        registry: Arc<McpRegistry>,
+        security: Arc<SecurityPolicy>,
+    ) -> McpToolWrapper {
+        McpToolWrapper::new(
+            self.prefixed_name.clone(),
+            self.def.clone(),
+            registry,
+            security,
+        )
     }
 }
 
@@ -58,11 +67,13 @@ pub struct DeferredMcpToolSet {
     pub stubs: Vec<DeferredMcpToolStub>,
     /// Shared registry — exposed for test construction.
     pub registry: Arc<McpRegistry>,
+    /// Security policy handle for activated wrappers (workspace at use time).
+    pub security: Arc<SecurityPolicy>,
 }
 
 impl DeferredMcpToolSet {
     /// Build the set from a connected [`McpRegistry`].
-    pub async fn from_registry(registry: Arc<McpRegistry>) -> Self {
+    pub async fn from_registry(registry: Arc<McpRegistry>, security: Arc<SecurityPolicy>) -> Self {
         let names = registry.tool_names();
         let mut stubs = Vec::with_capacity(names.len());
         for name in names {
@@ -70,7 +81,11 @@ impl DeferredMcpToolSet {
                 stubs.push(DeferredMcpToolStub::new(name, def));
             }
         }
-        Self { stubs, registry }
+        Self {
+            stubs,
+            registry,
+            security,
+        }
     }
 
     /// All stub names (for rendering in the system prompt).
@@ -89,6 +104,27 @@ impl DeferredMcpToolSet {
     /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
         self.stubs.is_empty()
+    }
+
+    /// Return a copy of this set with stubs whose `prefixed_name` is
+    /// not allowed by `policy` removed. `policy == None` is a no-op
+    /// (the set is returned unchanged) — this matches the
+    /// `if let Some(policy) = ...` pattern at every production
+    /// call site. Centralizes the per-stub filter logic so the
+    /// prompt-side claim and the `ToolSearchTool` constructor see
+    /// exactly the same tool set.
+    pub fn filter_by_policy(&self, policy: Option<&ToolAccessPolicy>) -> Self {
+        let filtered_stubs: Vec<DeferredMcpToolStub> = self
+            .stubs
+            .iter()
+            .filter(|stub| policy.is_none_or(|p| p.is_tool_allowed(&stub.prefixed_name)))
+            .cloned()
+            .collect();
+        Self {
+            stubs: filtered_stubs,
+            registry: Arc::clone(&self.registry),
+            security: Arc::clone(&self.security),
+        }
     }
 
     /// Look up stubs by exact name. Used for `select:name1,name2` queries.
@@ -112,15 +148,7 @@ impl DeferredMcpToolSet {
             .stubs
             .iter()
             .filter_map(|stub| {
-                let haystack = format!(
-                    "{} {}",
-                    stub.prefixed_name.to_ascii_lowercase(),
-                    stub.description.to_ascii_lowercase()
-                );
-                let hits = terms
-                    .iter()
-                    .filter(|t| haystack.contains(t.as_str()))
-                    .count();
+                let hits = deferred_search_score(&stub.prefixed_name, &stub.description, &terms);
                 if hits > 0 { Some((stub, hits)) } else { None }
             })
             .collect();
@@ -136,7 +164,7 @@ impl DeferredMcpToolSet {
     /// Activate a stub by name, returning a boxed [`Tool`].
     pub fn activate(&self, name: &str) -> Option<Box<dyn Tool>> {
         self.get_by_name(name).map(|stub| {
-            let wrapper = stub.activate(Arc::clone(&self.registry));
+            let wrapper = stub.activate(Arc::clone(&self.registry), Arc::clone(&self.security));
             Box::new(wrapper) as Box<dyn Tool>
         })
     }
@@ -144,27 +172,104 @@ impl DeferredMcpToolSet {
     /// Return the full [`ToolSpec`] for a stub (for inclusion in `tool_search` results).
     pub fn tool_spec(&self, name: &str) -> Option<ToolSpec> {
         self.get_by_name(name).map(|stub| {
-            let wrapper = stub.activate(Arc::clone(&self.registry));
+            let wrapper = stub.activate(Arc::clone(&self.registry), Arc::clone(&self.security));
             wrapper.spec()
         })
     }
 }
 
+/// Shared keyword ranking for MCP stubs and built-in schema metadata.
+pub(crate) fn deferred_search_score(name: &str, description: &str, terms: &[String]) -> usize {
+    let haystack = format!("{name} {description}").to_ascii_lowercase();
+    terms
+        .iter()
+        .filter(|term| haystack.contains(term.as_str()))
+        .count()
+}
+
 // ── ActivatedToolSet ─────────────────────────────────────────────────────
 
-/// Per-conversation mutable state tracking which deferred tools have been
-/// activated (i.e. their full schemas have been fetched via `tool_search`).
-/// The agent loop consults this each iteration to decide which tool_specs
-/// to include in the LLM request.
+/// Per-conversation MCP activation and built-in schema selection.
+///
+/// Built-in specs are a metadata projection of the scoped registry. The
+/// registry remains their executable owner and refreshes this catalog when
+/// admitted tools change. Selecting a built-in schema grants no capability.
 pub struct ActivatedToolSet {
+    // Executable activation remains MCP-only.
     tools: HashMap<String, Arc<dyn Tool>>,
+    deferred_builtin_specs: HashMap<String, ToolSpec>,
+    selected_builtin_names: HashSet<String>,
 }
 
 impl ActivatedToolSet {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            deferred_builtin_specs: HashMap::new(),
+            selected_builtin_names: HashSet::new(),
         }
+    }
+
+    /// Install the initial metadata-only catalog of admitted deferred built-ins.
+    pub fn set_deferred_builtin_specs(&mut self, specs: Vec<ToolSpec>) {
+        self.deferred_builtin_specs = specs
+            .into_iter()
+            .map(|spec| (spec.name.clone(), spec))
+            .collect();
+        self.selected_builtin_names.clear();
+    }
+
+    /// Refresh previously deferred names from the canonical scoped registry.
+    /// New names stay eager; removed names lose their schema and selection.
+    pub fn refresh_deferred_builtin_specs(&mut self, specs: Vec<ToolSpec>) {
+        self.deferred_builtin_specs = specs
+            .into_iter()
+            .filter(|spec| self.deferred_builtin_specs.contains_key(&spec.name))
+            .map(|spec| (spec.name.clone(), spec))
+            .collect();
+        self.selected_builtin_names
+            .retain(|name| self.deferred_builtin_specs.contains_key(name));
+    }
+
+    pub fn hidden_builtin_names(&self) -> HashSet<String> {
+        self.deferred_builtin_specs
+            .keys()
+            .filter(|name| !self.selected_builtin_names.contains(*name))
+            .cloned()
+            .collect()
+    }
+
+    /// Render the current unselected built-in catalog after registry refresh
+    /// or principal narrowing, rather than retaining a startup prompt snapshot.
+    pub fn deferred_builtin_prompt_section(&self) -> String {
+        build_deferred_builtin_tools_section(self, None)
+    }
+
+    /// Render discovery for one request without narrowing shared schema metadata.
+    pub fn deferred_builtin_prompt_section_filtered(
+        &self,
+        is_allowed: impl Fn(&str) -> bool,
+    ) -> String {
+        render_deferred_builtin_tools_section(self, is_allowed)
+    }
+
+    pub fn has_deferred_builtin_schemas(&self) -> bool {
+        !self.deferred_builtin_specs.is_empty()
+    }
+
+    pub fn is_builtin_schema_exposed(&self, name: &str) -> bool {
+        !self.deferred_builtin_specs.contains_key(name)
+            || self.selected_builtin_names.contains(name)
+    }
+
+    pub(crate) fn deferred_builtin_specs(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.deferred_builtin_specs.values()
+    }
+
+    pub(crate) fn select_builtin_schema(&mut self, name: &str) -> Option<ToolSpec> {
+        let spec = self.deferred_builtin_specs.get(name)?.clone();
+        self.selected_builtin_names.insert(name.to_string());
+        Some(spec)
     }
 
     pub fn activate(&mut self, name: String, tool: Arc<dyn Tool>) {
@@ -180,11 +285,6 @@ impl ActivatedToolSet {
         self.tools.get(name).cloned()
     }
 
-    /// Resolve an activated tool by exact name first, then by unique MCP suffix.
-    ///
-    /// Some providers occasionally strip the `<server>__` prefix when calling a
-    /// deferred MCP tool after `tool_search` activation. When the suffix maps to
-    /// exactly one activated tool, allow that call to proceed.
     pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {
         if let Some(tool) = self.get(name) {
             return Some(tool);
@@ -217,6 +317,18 @@ impl ActivatedToolSet {
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
+
+    /// Remove MCP executables and built-in schema metadata outside a narrowed
+    /// principal's ceiling. Callers resolve policy from its canonical source;
+    /// this set retains no independent policy.
+    pub fn retain_allowed(&mut self, allowed: &[String]) {
+        self.tools
+            .retain(|name, _| allowed.iter().any(|allowed_name| allowed_name == name));
+        self.deferred_builtin_specs
+            .retain(|name, _| allowed.contains(name));
+        self.selected_builtin_names
+            .retain(|name| self.deferred_builtin_specs.contains_key(name));
+    }
 }
 
 impl Default for ActivatedToolSet {
@@ -227,11 +339,100 @@ impl Default for ActivatedToolSet {
 
 // ── System prompt helper ─────────────────────────────────────────────────
 
+/// Longest one-line summary the deferred index carries per tool, in chars.
+const DEFERRED_SUMMARY_MAX_CHARS: usize = 200;
+
+/// The one-line summary the index shows for a deferred tool: the first
+/// non-empty line of its description, capped at
+/// [`DEFERRED_SUMMARY_MAX_CHARS`] on a char boundary.
+///
+/// MCP servers routinely ship multi-paragraph docstrings with `Args:` and
+/// `Returns:` blocks. Those still drive `tool_search` keyword matching through
+/// the full [`DeferredMcpToolStub::description`], but they have no place in a
+/// prompt section whose only job is to say which names exist: with a couple
+/// of hundred deferred tools the bodies alone cost more context per turn than
+/// every activated schema combined.
+fn deferred_summary_line(description: &str) -> String {
+    summary_line(description, DEFERRED_SUMMARY_MAX_CHARS)
+}
+
+fn summary_line(description: &str, max_chars: usize) -> String {
+    let line = description
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= max_chars {
+        return line.to_string();
+    }
+    let mut cut: String = line.chars().take(max_chars).collect();
+    cut.push_str("...");
+    cut
+}
+
+/// Advertise unselected built-in schemas without copying their JSON schemas
+/// into the prompt. Access policy is applied before any name is rendered.
+pub(crate) fn build_deferred_builtin_tools_section(
+    activated: &ActivatedToolSet,
+    policy: Option<&ToolAccessPolicy>,
+) -> String {
+    render_deferred_builtin_tools_section(activated, |name| {
+        policy.is_none_or(|p| p.is_tool_allowed(name))
+    })
+}
+
+fn render_deferred_builtin_tools_section(
+    activated: &ActivatedToolSet,
+    is_allowed: impl Fn(&str) -> bool,
+) -> String {
+    let mut specs: Vec<_> = activated
+        .deferred_builtin_specs()
+        .filter(|spec| !activated.is_builtin_schema_exposed(&spec.name))
+        .filter(|spec| is_allowed(&spec.name))
+        .collect();
+    if specs.is_empty() {
+        return String::new();
+    }
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = String::from(
+        "## Deferred Built-in Tools\n\n\
+         Use `tool_search` to fetch full schemas for the built-in tools below. \
+         Use `\"select:name1,name2\"` for exact tools or keywords to search. \
+         Schema selection does not change tool permissions or approval requirements.\n\n\
+         <available-deferred-builtin-tools>\n",
+    );
+    for spec in specs {
+        out.push_str(&spec.name);
+        out.push_str(" - ");
+        out.push_str(&summary_line(&spec.description, 120));
+        out.push('\n');
+    }
+    out.push_str("</available-deferred-builtin-tools>\n");
+    out
+}
+
 /// Build the `<available-deferred-tools>` section for the system prompt.
-/// Lists only tool names so the LLM knows what is available without
-/// consuming context window on full schemas. Includes an instruction
-/// block that tells the LLM to call `tool_search` to activate them.
+/// Lists tool names with a one-line summary each (the first non-empty line
+/// of the description, capped) so the LLM knows what is available without
+/// consuming context window on full schemas or full docstrings. Includes an
+/// instruction block that tells the LLM to call `tool_search` to activate
+/// them.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
+    build_deferred_tools_section_filtered(deferred, None)
+}
+
+pub fn build_deferred_tools_section_filtered(
+    deferred: &DeferredMcpToolSet,
+    policy: Option<&crate::tool_search::ToolAccessPolicy>,
+) -> String {
+    build_deferred_tools_section_excluding(deferred, policy, &HashSet::new())
+}
+
+pub fn build_deferred_tools_section_excluding(
+    deferred: &DeferredMcpToolSet,
+    policy: Option<&crate::tool_search::ToolAccessPolicy>,
+    exclude: &HashSet<String>,
+) -> String {
     if deferred.is_empty() {
         return String::new();
     }
@@ -245,19 +446,36 @@ pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
          become callable for the rest of the conversation.\n\n",
     );
     out.push_str("<available-deferred-tools>\n");
+    let mut count = 0;
     for stub in &deferred.stubs {
+        if exclude.contains(&stub.prefixed_name) {
+            continue;
+        }
+        if let Some(p) = policy
+            && !p.is_tool_allowed(&stub.prefixed_name)
+        {
+            continue;
+        }
         out.push_str(&stub.prefixed_name);
         out.push_str(" - ");
-        out.push_str(&stub.description);
+        out.push_str(&deferred_summary_line(&stub.description));
         out.push('\n');
+        count += 1;
     }
     out.push_str("</available-deferred-tools>\n");
+    if count == 0 {
+        return String::new();
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     fn make_stub(name: &str, desc: &str) -> DeferredMcpToolStub {
         let def = McpToolDef {
@@ -286,11 +504,107 @@ mod tests {
     }
 
     #[test]
+    fn builtin_catalog_refresh_updates_only_surviving_deferred_names() {
+        let make_spec = |name: &str, description: &str| {
+            ToolSpec::new(name, description, serde_json::json!({"type": "object"}))
+        };
+        let mut set = ActivatedToolSet::new();
+        set.set_deferred_builtin_specs(vec![
+            make_spec("keep", "Original description"),
+            make_spec("revoke", "Revoked description"),
+            make_spec("hidden", "Unselected description"),
+        ]);
+        assert!(set.has_deferred_builtin_schemas());
+        assert!(!set.is_builtin_schema_exposed("keep"));
+        assert!(set.is_builtin_schema_exposed("eager"));
+        set.select_builtin_schema("keep").unwrap();
+        set.select_builtin_schema("revoke").unwrap();
+
+        set.refresh_deferred_builtin_specs(vec![
+            make_spec("keep", "Rebound description"),
+            make_spec("hidden", "Updated unselected description"),
+            make_spec("new", "New tool stays eager"),
+        ]);
+        assert!(set.is_builtin_schema_exposed("keep"));
+        assert_eq!(
+            set.hidden_builtin_names(),
+            HashSet::from(["hidden".to_string()])
+        );
+        assert_eq!(
+            set.select_builtin_schema("keep").unwrap().description,
+            "Rebound description"
+        );
+        assert!(set.select_builtin_schema("revoke").is_none());
+        assert!(set.select_builtin_schema("new").is_none());
+        assert!(set.selected_builtin_names.contains("keep"));
+        assert!(!set.selected_builtin_names.contains("revoke"));
+        assert!(set.get("keep").is_none());
+        assert!(set.get_resolved("keep").is_none());
+        assert!(set.tool_names().is_empty());
+        assert!(set.tool_specs().is_empty());
+
+        set.retain_allowed(&[]);
+        assert!(!set.has_deferred_builtin_schemas());
+        assert!(set.hidden_builtin_names().is_empty());
+        assert!(set.selected_builtin_names.is_empty());
+        assert!(set.deferred_builtin_prompt_section().is_empty());
+        // A later refresh cannot revive a revoked schema.
+        set.refresh_deferred_builtin_specs(vec![make_spec("keep", "Reintroduced")]);
+        assert!(set.select_builtin_schema("keep").is_none());
+    }
+
+    #[test]
+    fn builtin_prompt_is_compact_filtered_and_omits_selected_schemas() {
+        let mut set = ActivatedToolSet::new();
+        set.set_deferred_builtin_specs(vec![
+            ToolSpec::new(
+                "calendar",
+                format!("\n  {}\nArgs: full documentation", "é".repeat(150)),
+                serde_json::json!({"properties": {"private_schema_marker": {"type": "string"}}}),
+            ),
+            ToolSpec::new("denied", "Denied description", serde_json::json!({})),
+        ]);
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["denied".to_string()]),
+            ..ToolAccessPolicy::default()
+        };
+        let prompt = build_deferred_builtin_tools_section(&set, Some(&policy));
+        assert!(prompt.contains("tool_search"));
+        assert!(prompt.contains("select:name1,name2"));
+        assert!(prompt.contains(&format!("calendar - {}...\n", "é".repeat(120))));
+        assert!(!prompt.contains("Args:"));
+        assert!(!prompt.contains("private_schema_marker"));
+        assert!(!prompt.contains("denied"));
+        let hidden_names = set.hidden_builtin_names();
+        assert_eq!(
+            set.deferred_builtin_prompt_section_filtered(|name| name == "calendar"),
+            prompt
+        );
+        assert!(
+            set.deferred_builtin_prompt_section_filtered(|_| false)
+                .is_empty()
+        );
+        assert_eq!(set.hidden_builtin_names(), hidden_names);
+        set.select_builtin_schema("calendar").unwrap();
+        assert!(build_deferred_builtin_tools_section(&set, Some(&policy)).is_empty());
+    }
+
+    #[test]
     fn activated_set_tracks_activation() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool;
+        impl ::zeroclaw_api::attribution::Attributable for FakeTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
         #[async_trait]
         impl Tool for FakeTool {
             fn name(&self) -> &str {
@@ -305,7 +619,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -322,9 +636,19 @@ mod tests {
     #[test]
     fn activated_set_resolves_unique_suffix() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool;
+        impl ::zeroclaw_api::attribution::Attributable for FakeTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
         #[async_trait]
         impl Tool for FakeTool {
             fn name(&self) -> &str {
@@ -339,7 +663,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -353,9 +677,19 @@ mod tests {
     #[test]
     fn activated_set_rejects_ambiguous_suffix() {
         use async_trait::async_trait;
-        use zeroclaw_api::tool::ToolResult;
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
 
         struct FakeTool(&'static str);
+        impl ::zeroclaw_api::attribution::Attributable for FakeTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
         #[async_trait]
         impl Tool for FakeTool {
             fn name(&self) -> &str {
@@ -370,7 +704,7 @@ mod tests {
             async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: None,
                 })
             }
@@ -398,6 +732,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         assert!(build_deferred_tools_section(&set).is_empty());
     }
@@ -416,12 +751,85 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("<available-deferred-tools>"));
         assert!(section.contains("fs__read_file - Read a file"));
         assert!(section.contains("git__status - Git status"));
         assert!(section.contains("</available-deferred-tools>"));
+    }
+
+    fn make_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
+        DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+            security: test_security(),
+        }
+    }
+
+    /// A docstring-style description contributes only its first line to the
+    /// index; the `Args:` and `Returns:` body must not reach the prompt.
+    #[test]
+    fn build_deferred_section_uses_first_line_of_multiline_description() {
+        let desc = "Fetch the food diary for a day.\n\n    Args:\n        date: YYYY-MM-DD, defaults to today.\n\n    Returns:\n        Every entry logged for the day.";
+        let set = make_set(vec![make_stub("cronometer__get_diary", desc)]);
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("cronometer__get_diary - Fetch the food diary for a day.\n"));
+        assert!(!section.contains("Args:"));
+        assert!(!section.contains("Returns:"));
+        assert!(!section.contains("defaults to today"));
+    }
+
+    /// Leading blank lines and indentation are skipped so a description that
+    /// starts with a newline still yields its real first sentence.
+    #[test]
+    fn build_deferred_section_skips_leading_blank_lines() {
+        let set = make_set(vec![make_stub(
+            "wger__get_routine",
+            "\n\n   Fetch a routine.  \nMore.",
+        )]);
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("wger__get_routine - Fetch a routine.\n"));
+        assert!(!section.contains("More."));
+    }
+
+    /// A single very long first line is capped on a char boundary, so a
+    /// multi-byte character straddling the cap cannot split.
+    #[test]
+    fn build_deferred_section_caps_long_first_line_on_char_boundary() {
+        let long: String = "é".repeat(DEFERRED_SUMMARY_MAX_CHARS + 50);
+        let set = make_set(vec![make_stub("fs__read", &long)]);
+        let section = build_deferred_tools_section(&set);
+        let line = section
+            .lines()
+            .find(|l| l.starts_with("fs__read - "))
+            .expect("tool line present");
+        let summary = &line["fs__read - ".len()..];
+        assert!(summary.ends_with("..."));
+        assert_eq!(
+            summary.trim_end_matches("...").chars().count(),
+            DEFERRED_SUMMARY_MAX_CHARS
+        );
+    }
+
+    /// The summary is a rendering concern only: keyword search still matches
+    /// terms that appear solely in the body of a multi-line description.
+    #[test]
+    fn deferred_search_still_matches_description_body() {
+        let set = make_set(vec![make_stub(
+            "cronometer__get_diary",
+            "Fetch the food diary for a day.\n\nReturns:\n    total_target_kcal for the day.",
+        )]);
+        let hits = set.search("target_kcal", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].prefixed_name, "cronometer__get_diary");
+        assert!(!build_deferred_tools_section(&set).contains("target_kcal"));
     }
 
     #[test]
@@ -435,6 +843,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(
@@ -462,6 +871,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("server_a__list"));
@@ -471,6 +881,48 @@ mod tests {
             section.contains("tool_search"),
             "section must mention tool_search for multi-server setups"
         );
+    }
+
+    #[test]
+    fn build_deferred_section_excluding_omits_named_stubs() {
+        let stubs = vec![
+            make_stub("fs__read_file", "Read a file"),
+            make_stub("git__status", "Git status"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+            security: test_security(),
+        };
+        let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
+        let section = build_deferred_tools_section_excluding(&set, None, &exclude);
+        assert!(
+            !section.contains("fs__read_file"),
+            "pre-activated stub must not be advertised as deferred"
+        );
+        assert!(section.contains("git__status"));
+    }
+
+    #[test]
+    fn build_deferred_section_excluding_all_returns_empty() {
+        let stubs = vec![make_stub("fs__read_file", "Read a file")];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+            security: test_security(),
+        };
+        let exclude: HashSet<String> = ["fs__read_file".to_string()].into_iter().collect();
+        assert!(build_deferred_tools_section_excluding(&set, None, &exclude).is_empty());
     }
 
     #[test]
@@ -488,6 +940,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
 
         // "file read" should rank fs__read_file highest (2 hits vs 1)
@@ -510,6 +963,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
         assert!(set.get_by_name("a__one").is_some());
         assert!(set.get_by_name("nonexistent").is_none());
@@ -529,6 +983,7 @@ mod tests {
                     .block_on(McpRegistry::connect_all(&[]))
                     .unwrap(),
             ),
+            security: test_security(),
         };
 
         // "read" should match stubs from both servers
@@ -544,5 +999,63 @@ mod tests {
         let results = set.search("config database", 10);
         assert!(!results.is_empty());
         assert_eq!(results[0].prefixed_name, "server_b__read_config");
+    }
+
+    #[test]
+    fn filter_by_policy_none_returns_unchanged() {
+        // The centralized filter helper must be a no-op when no
+        // policy is set (the common case for callers that do not
+        // configure a `ToolAccessPolicy`).
+        let stubs = vec![
+            make_stub("fs__read_file", "Read a file"),
+            make_stub("git__status", "Git status"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs: stubs.clone(),
+            registry: std::sync::Arc::new(empty_registry()),
+            security: test_security(),
+        };
+        let filtered = set.filter_by_policy(None);
+        assert_eq!(filtered.stubs.len(), stubs.len());
+    }
+
+    #[test]
+    fn filter_by_policy_denied_removes_stubs() {
+        // A policy that denies a tool by name must drop that stub
+        // from the filtered set. The stub registry is irrelevant to
+        // the policy decision (it is the named filter), so an empty
+        // registry is fine.
+        let stubs = vec![
+            make_stub("srv__visible", "Visible tool"),
+            make_stub("srv__hidden", "Hidden tool"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(empty_registry()),
+            security: test_security(),
+        };
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["srv__hidden".into()]),
+            ..ToolAccessPolicy::default()
+        };
+        let filtered = set.filter_by_policy(Some(&policy));
+        let names: Vec<&str> = filtered
+            .stubs
+            .iter()
+            .map(|s| s.prefixed_name.as_str())
+            .collect();
+        assert!(names.contains(&"srv__visible"));
+        assert!(!names.contains(&"srv__hidden"));
+    }
+
+    /// Build an empty [`McpRegistry`] for tests that exercise the
+    /// stub set independently of any backing MCP server. The
+    /// `filter_by_policy` helper does not consult the registry, so
+    /// an empty one is sufficient.
+    fn empty_registry() -> McpRegistry {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(McpRegistry::connect_all(&[]))
+            .unwrap()
     }
 }

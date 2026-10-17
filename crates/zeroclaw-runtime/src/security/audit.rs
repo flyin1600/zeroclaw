@@ -1,9 +1,8 @@
 //! Audit logging for security events
-//!
 //! Each audit entry is chained via a Merkle hash: `entry_hash = SHA-256(prev_hash || canonical_json)`.
 //! This makes the trail tamper-evident — modifying any entry invalidates all subsequent hashes.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -16,6 +15,7 @@ use zeroclaw_config::schema::AuditConfig;
 
 /// Well-known seed for the genesis entry's `prev_hash`.
 const GENESIS_PREV_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const MAX_RETAINED_GENERATIONS: usize = 10;
 
 /// Audit event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +28,28 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    /// A client certificate issuance (or renewal) was attempted: the CSR is
+    /// signed but the issued-cert ledger has not committed and no certificate
+    /// has been delivered. Recorded before the ledger write, so it never claims
+    /// a completed issuance; the matching `CertIssued`/`CertRenewed` follows
+    /// once the row commits. An attempt with no completion is an interrupted,
+    /// retryable issuance.
+    CertIssuanceAttempted,
+    /// A client mTLS certificate was issued from the daemon CA (enrollment or
+    /// operator `issue-client-cert`) AND committed to the issued-cert ledger.
+    CertIssued,
+    /// A client certificate was renewed over an authenticated mTLS session and
+    /// committed to the issued-cert ledger.
+    CertRenewed,
+    /// A client certificate was revoked (status flipped in the ledger).
+    CertRevoked,
+    /// A certificate issuance that committed a ledger row but never completed
+    /// was reconciled away: the row is discarded and the certificate - if it
+    /// ever reached a client at all - is not, and never was, in the ledger.
+    /// This is what closes out an unmatched `CertIssuanceAttempted` left by a
+    /// process that died mid-issuance, so the trail explains the gap instead of
+    /// leaving it to inference.
+    CertIssuanceAbandoned,
 }
 
 /// Actor information (who performed the action)
@@ -74,6 +96,8 @@ pub struct AuditEvent {
     pub action: Option<Action>,
     pub result: Option<ExecutionResult>,
     pub security: SecurityContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_alias: Option<String>,
 
     /// Monotonically increasing sequence number.
     #[serde(default)]
@@ -105,6 +129,7 @@ impl AuditEvent {
                 rate_limit_remaining: None,
                 sandbox_backend: None,
             },
+            agent_alias: None,
             sequence: 0,
             prev_hash: String::new(),
             entry_hash: String::new(),
@@ -124,6 +149,16 @@ impl AuditEvent {
             user_id,
             username,
         });
+        self
+    }
+
+    /// Set the owning agent's alias for multi-agent attribution.
+    /// Builder method so existing AuditEvent construction sites can
+    /// add the alias without an explicit field assignment. Pass the
+    /// alias bound at agent-loop entry.
+    #[must_use]
+    pub fn with_agent_alias(mut self, agent_alias: impl Into<String>) -> Self {
+        self.agent_alias = Some(agent_alias.into());
         self
     }
 
@@ -168,10 +203,6 @@ impl AuditEvent {
     }
 }
 
-/// Compute the SHA-256 entry hash: `H(prev_hash || content_json)`.
-///
-/// `content_json` is the canonical JSON of the event *without* the chain fields
-/// (`sequence`, `prev_hash`, `entry_hash`), so the hash covers only the payload.
 fn compute_entry_hash(prev_hash: &str, event: &AuditEvent) -> String {
     // Build a canonical representation of the content fields only.
     let content = serde_json::json!({
@@ -202,11 +233,18 @@ struct ChainState {
 pub struct AuditLogger {
     log_path: PathBuf,
     config: AuditConfig,
-    #[allow(dead_code)] // WIP: buffered writes for batch flushing
-    buffer: Mutex<Vec<AuditEvent>>,
     chain: Mutex<ChainState>,
     /// Signing key (loaded once at construction time if sign_events enabled)
     signing_key: Option<Vec<u8>>,
+    /// Remaining [`AuditLogger::log`] calls to honour before every further one
+    /// fails. Test-only; see [`AuditLogger::fail_writes_after_for_test`].
+    #[cfg(test)]
+    write_budget: Mutex<Option<usize>>,
+    /// Remaining durable appends to honour before every further one fails at
+    /// the file-write step. Test-only; see
+    /// [`AuditLogger::fail_durable_write_after_for_test`].
+    #[cfg(test)]
+    durable_write_budget: Mutex<Option<usize>>,
 }
 
 /// Structured command execution details for audit logging.
@@ -222,22 +260,60 @@ pub struct CommandExecutionLog<'a> {
 }
 
 impl AuditLogger {
-    /// Create a new audit logger.
+    /// Construct a logger over `<zeroclaw_dir>/<config.log_path>`.
     ///
-    /// If the log file already exists, the chain state is recovered from the last
-    /// entry so that new writes continue the existing hash chain.
+    /// **One instance per file.** The Merkle chain's sequence and `prev_hash`
+    /// live in this struct's mutex, so the mutex serializes only the writers
+    /// that go through THIS instance. Two loggers over one file each recover
+    /// the same tip at construction and then both claim it, producing
+    /// duplicate sequence numbers and broken links that make `verify_chain`
+    /// reject the file — see `two_loggers_on_one_file_duplicate_a_sequence`.
     ///
-    /// If `config.sign_events` is true, requires `ZEROCLAW_AUDIT_SIGNING_KEY` env var
-    /// to be set with a hex-encoded 32-byte key. Fails if key is missing or invalid.
+    /// Production code must therefore never construct a logger per request or
+    /// per subsystem. Build one at daemon startup with
+    /// [`AuditLogger::open_shared`] and inject the `Arc`; the certificate
+    /// paths reach it through `RpcContext::cert_audit`. This constructor stays
+    /// public for tests and for the single startup call behind `open_shared`.
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
         // Load and validate signing key if sign_events enabled
         let signing_key = if config.sign_events {
-            let key_hex = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").map_err(|_| {
-                anyhow::anyhow!("sign_events enabled but ZEROCLAW_AUDIT_SIGNING_KEY not set")
+            let key_hex = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").map_err(|e| {
+                // Do not format the VarError: VarError::NotUnicode includes the
+                // raw env-var value in its Display/Debug text, which would leak
+                // signing-key material into logs and error output.
+                let reason = match e {
+                    std::env::VarError::NotPresent => "missing",
+                    std::env::VarError::NotUnicode(_) => "not_valid_unicode",
+                };
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"reason": reason})),
+                    "audit log: sign_events=true but ZEROCLAW_AUDIT_SIGNING_KEY env var is not usable"
+                );
+                match e {
+                    std::env::VarError::NotPresent => anyhow::Error::msg(
+                        "sign_events enabled but ZEROCLAW_AUDIT_SIGNING_KEY not set",
+                    ),
+                    std::env::VarError::NotUnicode(_) => anyhow::Error::msg(
+                        "ZEROCLAW_AUDIT_SIGNING_KEY env var is not valid UTF-8",
+                    ),
+                }
             })?;
 
-            let key_bytes = hex::decode(&key_hex)
-                .map_err(|_| anyhow::anyhow!("ZEROCLAW_AUDIT_SIGNING_KEY must be hex-encoded"))?;
+            let key_bytes = hex::decode(&key_hex).map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "audit log: ZEROCLAW_AUDIT_SIGNING_KEY env var must be hex-encoded"
+                );
+                anyhow::Error::msg(format!(
+                    "ZEROCLAW_AUDIT_SIGNING_KEY must be hex-encoded: {e}"
+                ))
+            })?;
 
             if key_bytes.len() != 32 {
                 bail!(
@@ -252,14 +328,80 @@ impl AuditLogger {
         };
 
         let log_path = zeroclaw_dir.join(&config.log_path);
-        let chain_state = recover_chain_state(&log_path);
+        let chain_state = recover_chain_state(&log_path)?;
         Ok(Self {
             log_path,
             config,
-            buffer: Mutex::new(Vec::new()),
             chain: Mutex::new(chain_state),
             signing_key,
+            #[cfg(test)]
+            write_budget: Mutex::new(None),
+            #[cfg(test)]
+            durable_write_budget: Mutex::new(None),
         })
+    }
+
+    /// Open THE audit logger for `zeroclaw_dir` — the single instance every
+    /// certificate path in a daemon shares.
+    ///
+    /// Returns an `Arc` because sharing is the whole point: enrollment,
+    /// renewal and the issued-cert ledger all append to one file, and the
+    /// chain is only consistent while one instance owns it (see
+    /// [`AuditLogger::new`] for what a second instance does). Call this once
+    /// per daemon iteration, store it in `RpcContext::cert_audit`, and clone
+    /// the `Arc` into every consumer.
+    pub fn open_shared(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<std::sync::Arc<Self>> {
+        Ok(std::sync::Arc::new(Self::new(config, zeroclaw_dir)?))
+    }
+
+    /// Fault injection: honour the next `successes` [`AuditLogger::log`] calls,
+    /// then fail every one after them.
+    ///
+    /// Callers that write MORE THAN ONE event to describe a single durable
+    /// action need a partial audit failure - the first event landing and a
+    /// later one failing - which no external manipulation of the log file can
+    /// produce, because the whole sequence happens inside one call. The
+    /// certificate issuance attempt/completion pair
+    /// (`security::cert_ledger::CertLedger::record_issued`) is that shape.
+    ///
+    /// The injected failure lands right after the rotation step and before
+    /// the entry is sequenced, so it models a rotate/open failure. For the
+    /// later window — entry sequenced and hashed, durable append then fails —
+    /// use [`AuditLogger::fail_durable_write_after_for_test`]. Both leave the
+    /// hash chain consistent with the file for the caller's retry, because
+    /// [`AuditLogger::log`] commits the chain state only after `sync_all`.
+    #[cfg(test)]
+    pub(crate) fn fail_writes_after_for_test(&self, successes: usize) {
+        *self.write_budget.lock() = Some(successes);
+    }
+
+    /// Undo [`AuditLogger::fail_writes_after_for_test`].
+    #[cfg(test)]
+    pub(crate) fn clear_write_failure_for_test(&self) {
+        *self.write_budget.lock() = None;
+    }
+
+    /// Fault injection, second phase: honour the next `successes` durable
+    /// appends, then fail every one after them AT THE FILE-WRITE STEP -
+    /// after the candidate entry has been sequenced, hashed, signed and
+    /// serialized.
+    ///
+    /// [`AuditLogger::fail_writes_after_for_test`] models a rotate/open
+    /// failure that lands *before* the chain is touched, so it cannot reach
+    /// the window this one covers: the gap between "this entry's sequence and
+    /// hash have been computed" and "that entry is durable on disk". A
+    /// failure there must leave the chain state exactly as it was, so the
+    /// retry reuses the same sequence and `prev_hash` and the file stays
+    /// verifiable. See `chain_state_survives_a_failed_durable_append`.
+    #[cfg(test)]
+    pub(crate) fn fail_durable_write_after_for_test(&self, successes: usize) {
+        *self.durable_write_budget.lock() = Some(successes);
+    }
+
+    /// Undo [`AuditLogger::fail_durable_write_after_for_test`].
+    #[cfg(test)]
+    pub(crate) fn clear_durable_write_failure_for_test(&self) {
+        *self.durable_write_budget.lock() = None;
     }
 
     /// Compute HMAC-SHA256 signature over entry_hash when sign_events enabled.
@@ -268,8 +410,16 @@ impl AuditLogger {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
 
-            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes)
-                .map_err(|_| anyhow::anyhow!("Invalid HMAC key length"))?;
+            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "audit log: HMAC-SHA256 init rejected key length"
+                );
+                anyhow::Error::msg(format!("Invalid HMAC key length: {e}"))
+            })?;
             mac.update(entry_hash.as_bytes());
 
             Ok(Some(hex::encode(mac.finalize().into_bytes())))
@@ -278,39 +428,87 @@ impl AuditLogger {
         }
     }
 
-    /// Log an event
+    /// Log an event.
+    ///
+    /// One event is one atomic step. The chain lock spans rotation,
+    /// sequencing, hashing, signing, serialization AND the durable append,
+    /// and the in-memory chain state is committed only after `sync_all`
+    /// returns. Two properties the trail depends on follow from that order:
+    ///
+    /// * **Concurrent callers cannot interleave.** If the lock were released
+    ///   before the append, two threads could take sequences 0 and 1 and then
+    ///   write their lines in the opposite order — `verify_chain` rejects the
+    ///   file even though each write was individually correct.
+    /// * **A failed append changes nothing.** Rotation, serialization, open,
+    ///   write and fsync all fail before the commit, so the state stays
+    ///   exactly as it was and the caller's retry reuses the same sequence
+    ///   and `prev_hash`. Advancing first left the in-memory chain ahead of
+    ///   the file, and every later entry then linked to a hash that was never
+    ///   written.
+    ///
+    /// Both properties hold only WITHIN one instance: one `AuditLogger` per
+    /// file is a hard requirement, see [`AuditLogger::new`].
     pub fn log(&self, event: &AuditEvent) -> Result<()> {
         if !self.config.enabled {
             return Ok(());
         }
 
+        // Held across the whole event, released on every exit path.
+        let mut state = self.chain.lock();
+
         // Check log size and rotate if needed
         self.rotate_if_needed()?;
 
-        // Populate chain fields under the lock
-        let mut chained = event.clone();
+        #[cfg(test)]
         {
-            let mut state = self.chain.lock();
-            chained.sequence = state.sequence;
-            chained.prev_hash = state.prev_hash.clone();
-            chained.entry_hash = compute_entry_hash(&state.prev_hash, &chained);
-
-            // Compute signature if sign_events enabled
-            chained.signature = self.compute_signature(&chained.entry_hash)?;
-
-            state.prev_hash = chained.entry_hash.clone();
-            state.sequence += 1;
+            let mut budget = self.write_budget.lock();
+            if let Some(remaining) = budget.as_mut() {
+                match remaining.checked_sub(1) {
+                    Some(left) => *remaining = left,
+                    None => bail!("injected audit write failure"),
+                }
+            }
         }
 
-        // Serialize and write
-        let line = serde_json::to_string(&chained)?;
+        // Build the candidate entry from the current tip. Nothing below
+        // mutates `state` until the append is durable.
+        let mut chained = event.clone();
+        chained.sequence = state.sequence;
+        chained.prev_hash = state.prev_hash.clone();
+        chained.entry_hash = compute_entry_hash(&state.prev_hash, &chained);
+
+        // Compute signature if sign_events enabled
+        chained.signature = self.compute_signature(&chained.entry_hash)?;
+
+        // Serialize
+        let mut line = serde_json::to_string(&chained)?.into_bytes();
+        line.push(b'\n');
+
+        #[cfg(test)]
+        {
+            let mut budget = self.durable_write_budget.lock();
+            if let Some(remaining) = budget.as_mut() {
+                match remaining.checked_sub(1) {
+                    Some(left) => *remaining = left,
+                    None => bail!("injected durable audit write failure"),
+                }
+            }
+        }
+
+        // Write
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)?;
 
-        writeln!(file, "{}", line)?;
+        // One `write_all` of the complete line, so the append is a single
+        // syscall rather than `writeln!`'s multi-write formatting path.
+        file.write_all(&line)?;
         file.sync_all()?;
+
+        // Durable — commit the new tip. This is the only mutation of `state`.
+        state.prev_hash = chained.entry_hash;
+        state.sequence += 1;
 
         Ok(())
     }
@@ -366,74 +564,158 @@ impl AuditLogger {
 
     /// Rotate the log file
     fn rotate(&self) -> Result<()> {
-        for i in (1..10).rev() {
-            let old_name = format!("{}.{}.log", self.log_path.display(), i);
-            let new_name = format!("{}.{}.log", self.log_path.display(), i + 1);
-            let _ = std::fs::rename(&old_name, &new_name);
+        for i in (1..MAX_RETAINED_GENERATIONS).rev() {
+            let old_name = rotated_log_path(&self.log_path, i);
+            let new_name = rotated_log_path(&self.log_path, i + 1);
+            match std::fs::rename(&old_name, &new_name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to rotate audit segment {} to {}",
+                            old_name.display(),
+                            new_name.display()
+                        )
+                    });
+                }
+            }
         }
 
-        let rotated = format!("{}.1.log", self.log_path.display());
+        let rotated = rotated_log_path(&self.log_path, 1);
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
     }
 }
 
+fn rotated_log_path(log_path: &Path, generation: usize) -> PathBuf {
+    let mut path = log_path.as_os_str().to_os_string();
+    path.push(format!(".{generation}.log"));
+    PathBuf::from(path)
+}
+
+fn retained_log_paths(log_path: &Path) -> impl DoubleEndedIterator<Item = PathBuf> + '_ {
+    (1..=MAX_RETAINED_GENERATIONS)
+        .rev()
+        .map(|generation| rotated_log_path(log_path, generation))
+}
+
 /// Recover chain state from an existing log file.
-///
-/// Returns the genesis state if the file does not exist or is empty.
-fn recover_chain_state(log_path: &Path) -> ChainState {
-    let file = match std::fs::File::open(log_path) {
-        Ok(f) => f,
-        Err(_) => {
-            return ChainState {
-                prev_hash: GENESIS_PREV_HASH.to_string(),
-                sequence: 0,
-            };
+/// Falls back through retained generations only when newer files have no records.
+fn recover_chain_state(log_path: &Path) -> Result<ChainState> {
+    let paths = std::iter::once(log_path.to_path_buf()).chain(retained_log_paths(log_path).rev());
+
+    for path in paths {
+        if let Some(entry) = last_audit_entry(&path)? {
+            return Ok(ChainState {
+                prev_hash: entry.entry_hash,
+                sequence: entry
+                    .sequence
+                    .checked_add(1)
+                    .context("audit sequence overflow during recovery")?,
+            });
         }
+    }
+
+    Ok(genesis_chain_state())
+}
+
+fn last_audit_entry(log_path: &Path) -> Result<Option<AuditEvent>> {
+    let file = match std::fs::File::open(log_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
     };
 
     let reader = BufReader::new(file);
     let mut last_entry: Option<AuditEvent> = None;
-    for l in reader.lines().map_while(Result::ok) {
-        if let Ok(entry) = serde_json::from_str::<AuditEvent>(&l) {
-            last_entry = Some(entry);
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
         }
+        let entry = serde_json::from_str::<AuditEvent>(&line).with_context(|| {
+            format!(
+                "invalid audit record in {} at line {}",
+                log_path.display(),
+                line_idx + 1
+            )
+        })?;
+        last_entry = Some(entry);
     }
+    Ok(last_entry)
+}
 
-    match last_entry {
-        Some(entry) => ChainState {
-            prev_hash: entry.entry_hash,
-            sequence: entry.sequence + 1,
-        },
-        None => ChainState {
-            prev_hash: GENESIS_PREV_HASH.to_string(),
-            sequence: 0,
-        },
+fn genesis_chain_state() -> ChainState {
+    ChainState {
+        prev_hash: GENESIS_PREV_HASH.to_string(),
+        sequence: 0,
     }
 }
 
-/// Verify the integrity of an audit log's Merkle hash chain.
-///
-/// Reads every entry from the log file and checks:
-/// - Each `entry_hash` matches the recomputed `SHA-256(prev_hash || content)`.
-/// - `prev_hash` links to the preceding entry (or the genesis seed for the first).
-/// - Sequence numbers are contiguous starting from 0.
-/// - If a record has a `signature` field and `ZEROCLAW_AUDIT_SIGNING_KEY` is available,
-///   verifies the HMAC-SHA256 signature over `entry_hash`.
-///
-/// Returns `Ok(entry_count)` on success, or an error describing the first violation.
 pub fn verify_chain(log_path: &Path) -> Result<u64> {
-    let file = std::fs::File::open(log_path)?;
-    let reader = BufReader::new(file);
+    let mut expected = Some(genesis_chain_state());
+    verify_chain_file(log_path, &mut expected, false, signing_key().as_deref())
+}
 
-    let mut expected_prev_hash = GENESIS_PREV_HASH.to_string();
-    let mut expected_sequence: u64 = 0;
+/// Verify every retained generation and the active audit log as one chain.
+///
+/// The oldest available record is the retained-window trust boundary because
+/// rotation intentionally discards generations beyond the configured family.
+/// Every later record, including the first record after each rotation, must
+/// link to the preceding retained record.
+pub fn verify_rotated_chain(log_path: &Path) -> Result<u64> {
+    let mut expected = None;
+    let signing_key = signing_key();
+    let mut verified = 0;
 
-    // Attempt to load signing key from environment (optional)
-    let signing_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY")
+    for path in retained_log_paths(log_path) {
+        match verify_chain_file(&path, &mut expected, true, signing_key.as_deref()) {
+            Ok(count) => verified += count,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("audit chain verification failed for {}", path.display())
+                });
+            }
+        }
+    }
+
+    match verify_chain_file(log_path, &mut expected, false, signing_key.as_deref()) {
+        Ok(count) => verified += count,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("audit chain verification failed for {}", log_path.display())
+            });
+        }
+    }
+
+    Ok(verified)
+}
+
+fn signing_key() -> Option<Vec<u8>> {
+    std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY")
         .ok()
         .and_then(|key_hex| hex::decode(&key_hex).ok())
-        .filter(|key_bytes| key_bytes.len() == 32);
+        .filter(|key_bytes| key_bytes.len() == 32)
+}
+
+fn verify_chain_file(
+    log_path: &Path,
+    expected: &mut Option<ChainState>,
+    allow_retained_anchor: bool,
+    signing_key: Option<&[u8]>,
+) -> Result<u64> {
+    let file = std::fs::File::open(log_path)?;
+    let reader = BufReader::new(file);
+    let mut verified = 0;
 
     for (line_idx, line) in reader.lines().enumerate() {
         let line = line?;
@@ -441,24 +723,34 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
             continue;
         }
         let entry: AuditEvent = serde_json::from_str(&line)?;
+        let expected = expected.get_or_insert_with(|| {
+            if allow_retained_anchor && entry.sequence > 0 {
+                ChainState {
+                    prev_hash: entry.prev_hash.clone(),
+                    sequence: entry.sequence,
+                }
+            } else {
+                genesis_chain_state()
+            }
+        });
 
         // Check sequence continuity
-        if entry.sequence != expected_sequence {
+        if entry.sequence != expected.sequence {
             bail!(
                 "sequence gap at line {}: expected {}, got {}",
                 line_idx + 1,
-                expected_sequence,
+                expected.sequence,
                 entry.sequence
             );
         }
 
         // Check prev_hash linkage
-        if entry.prev_hash != expected_prev_hash {
+        if entry.prev_hash != expected.prev_hash {
             bail!(
                 "prev_hash mismatch at line {} (sequence {}): expected {}, got {}",
                 line_idx + 1,
                 entry.sequence,
-                expected_prev_hash,
+                expected.prev_hash,
                 entry.prev_hash
             );
         }
@@ -477,13 +769,21 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
 
         // Verify signature if present and key is available
         if let Some(ref signature) = entry.signature
-            && let Some(ref key_bytes) = signing_key
+            && let Some(key_bytes) = signing_key
         {
             use hmac::{Hmac, Mac};
             use sha2::Sha256;
 
-            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes)
-                .map_err(|_| anyhow::anyhow!("Invalid HMAC key length during verification"))?;
+            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes).map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "audit log: HMAC-SHA256 verify rejected key length"
+                );
+                anyhow::Error::msg(format!("Invalid HMAC key length during verification: {e}"))
+            })?;
             mac.update(entry.entry_hash.as_bytes());
             let expected_sig = hex::encode(mac.finalize().into_bytes());
 
@@ -497,11 +797,15 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
         }
         // If signature present but key not available, skip verification (backward compat)
 
-        expected_prev_hash = entry.entry_hash.clone();
-        expected_sequence += 1;
+        expected.prev_hash = entry.entry_hash.clone();
+        expected.sequence = expected
+            .sequence
+            .checked_add(1)
+            .context("audit sequence overflow during verification")?;
+        verified += 1;
     }
 
-    Ok(expected_sequence)
+    Ok(verified)
 }
 
 #[cfg(test)]
@@ -664,11 +968,164 @@ mod tests {
         let event = AuditEvent::new(AuditEventType::CommandExecution);
         logger.log(&event)?;
 
-        let rotated = format!("{}.1.log", log_path.display());
+        let rotated = format!("{}.1.log", log_path.display().to_string());
         assert!(
             std::path::Path::new(&rotated).exists(),
             "rotation must create .1.log backup"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_restart_before_next_append_recovers_retained_tail() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = || AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+
+        let logger = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.rotate()?;
+        drop(logger);
+
+        assert!(
+            !log_path.exists(),
+            "the crash window starts after rotation and before a new active append"
+        );
+        let retained_path = rotated_log_path(&log_path, 1);
+        let retained_tail = last_audit_entry(&retained_path)?.expect("retained audit tail");
+
+        let restarted = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        restarted.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+
+        let active = last_audit_entry(&log_path)?.expect("new active audit entry");
+        assert_eq!(active.sequence, retained_tail.sequence + 1);
+        assert_eq!(active.prev_hash, retained_tail.entry_hash);
+        assert_eq!(verify_rotated_chain(&log_path)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_chain_verification_rejects_broken_segment_link() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = || AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+
+        let logger = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.rotate()?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+
+        let mut active = last_audit_entry(&log_path)?.expect("active audit entry");
+        active.prev_hash = GENESIS_PREV_HASH.to_string();
+        active.entry_hash = compute_entry_hash(&active.prev_hash, &active);
+        std::fs::write(&log_path, format!("{}\n", serde_json::to_string(&active)?))?;
+
+        let error = verify_rotated_chain(&log_path)
+            .expect_err("a segment boundary with the wrong predecessor must fail");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("prev_hash mismatch"),
+            "unexpected verification error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_active_segment_does_not_fall_back_to_retained_tail() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = || AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+
+        let logger = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.rotate()?;
+        drop(logger);
+        std::fs::write(&log_path, "malformed audit record\n")?;
+
+        let Err(error) = AuditLogger::new(config(), tmp.path().to_path_buf()) else {
+            bail!("malformed active state must fail closed");
+        };
+        assert!(
+            error.to_string().contains("invalid audit record"),
+            "unexpected recovery error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotated_chain_verification_rejects_non_genesis_active_only_log() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+
+        let mut active = last_audit_entry(&log_path)?.expect("active audit entry");
+        active.sequence = 1;
+        active.prev_hash = "f".repeat(64);
+        active.entry_hash = compute_entry_hash(&active.prev_hash, &active);
+        std::fs::write(&log_path, format!("{}\n", serde_json::to_string(&active)?))?;
+
+        let error = verify_rotated_chain(&log_path)
+            .expect_err("an active-only audit log must start from genesis");
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("sequence gap"),
+            "unexpected verification error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_shift_failure_preserves_active_and_immediate_retained_segment() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+        let retained_path = rotated_log_path(&log_path, 1);
+        let shift_source = rotated_log_path(&log_path, 9);
+        let conflicting_path = rotated_log_path(&log_path, 10);
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        logger.rotate()?;
+        logger.log(&AuditEvent::new(AuditEventType::SecurityEvent))?;
+        std::fs::write(&shift_source, "retained generation nine\n")?;
+        std::fs::create_dir(&conflicting_path)?;
+        std::fs::write(conflicting_path.join("blocker"), "occupied\n")?;
+
+        let active_before = std::fs::read(&log_path)?;
+        let retained_before = std::fs::read(&retained_path)?;
+        let error = logger
+            .rotate()
+            .expect_err("a retained-generation shift failure must abort rotation");
+
+        assert!(
+            error.to_string().contains("failed to rotate audit segment"),
+            "unexpected rotation error: {error:#}"
+        );
+        assert_eq!(std::fs::read(&log_path)?, active_before);
+        assert_eq!(std::fs::read(&retained_path)?, retained_before);
         Ok(())
     }
 
@@ -1050,6 +1507,51 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn constructor_fails_if_signing_key_not_unicode_and_does_not_leak_value() -> Result<()> {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var_os("ZEROCLAW_AUDIT_SIGNING_KEY");
+        defer! {
+            if let Some(key) = old_key {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        let secret_bytes: &[u8] = b"ab\xFFc";
+        let bad_value = OsStr::from_bytes(secret_bytes);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", bad_value) };
+
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            ..Default::default()
+        };
+
+        let result = AuditLogger::new(config, tmp.path().to_path_buf());
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let err_msg = e.to_string();
+            assert!(err_msg.contains("not valid UTF-8"), "error: {}", err_msg);
+            assert!(
+                !err_msg.contains("ab"),
+                "error message must not contain the raw signing-key value: {}",
+                err_msg
+            );
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn constructor_fails_if_signing_key_wrong_length() -> Result<()> {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -1273,6 +1775,167 @@ mod tests {
         assert!(rec2.signature.is_some(), "first signed record");
         assert!(rec3.signature.is_some(), "second signed record");
 
+        Ok(())
+    }
+
+    // ── Durability: chain state must not outrun the file ────
+
+    /// A write/sync failure AFTER the entry is sequenced and hashed must not
+    /// advance the in-memory chain. If it does, the next event starts from a
+    /// `prev_hash`/`sequence` that never reached the file and every later
+    /// entry is unverifiable - the audit trail is destroyed by a transient
+    /// disk error on a path that is on by default.
+    #[test]
+    fn chain_state_survives_a_failed_durable_append() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let log_path = tmp.path().join("audit.log");
+
+        let event = |tag: &str| {
+            AuditEvent::new(AuditEventType::CertRenewed).with_action(
+                tag.to_string(),
+                "low".to_string(),
+                false,
+                true,
+            )
+        };
+
+        logger.log(&event("before"))?;
+
+        // Fail at the durable-append step: sequencing, hashing, signing and
+        // serialization all succeed, then the file write fails.
+        logger.fail_durable_write_after_for_test(0);
+        let err = logger
+            .log(&event("lost"))
+            .expect_err("an injected durable-write failure must surface to the caller");
+        assert!(
+            err.to_string().contains("durable audit write"),
+            "unexpected error: {err}"
+        );
+        logger.clear_durable_write_failure_for_test();
+
+        // The next event must reuse the sequence and prev_hash the failed
+        // append never committed.
+        logger.log(&event("after"))?;
+
+        let count = verify_chain(&log_path)?;
+        assert_eq!(
+            count, 2,
+            "the failed append must leave no gap: exactly the two durable events"
+        );
+
+        let content = std::fs::read_to_string(&log_path)?;
+        let seqs: Vec<u64> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<AuditEvent>(l).map(|e| e.sequence))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(seqs, vec![0, 1], "sequences must stay consecutive");
+        Ok(())
+    }
+
+    /// The daemon shares ONE logger across enrollment, renewal and every other
+    /// certificate path, so concurrent callers meet inside a single instance.
+    /// Sequencing, hashing and the durable append must be one atomic step, or
+    /// two writers interleave their lines and the file no longer verifies.
+    #[test]
+    fn concurrent_writers_on_one_shared_logger_keep_the_chain_verifiable() -> Result<()> {
+        const WRITERS: usize = 8;
+        const PER_WRITER: usize = 8;
+
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = std::sync::Arc::new(AuditLogger::new(config, tmp.path().to_path_buf())?);
+        let log_path = tmp.path().join("audit.log");
+
+        // A barrier so the writers actually overlap instead of queueing behind
+        // each other's thread spawn.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::with_capacity(WRITERS);
+        for writer in 0..WRITERS {
+            let logger = std::sync::Arc::clone(&logger);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..PER_WRITER {
+                    let event = AuditEvent::new(AuditEventType::CertRenewed).with_action(
+                        format!("renew-{writer}-{i}"),
+                        "low".to_string(),
+                        false,
+                        true,
+                    );
+                    logger.log(&event).expect("concurrent audit write");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread panicked");
+        }
+
+        let total = (WRITERS * PER_WRITER) as u64;
+        let count = verify_chain(&log_path)?;
+        assert_eq!(count, total, "every concurrent event must be in the chain");
+
+        let content = std::fs::read_to_string(&log_path)?;
+        let seqs: Vec<u64> = content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<AuditEvent>(l).map(|e| e.sequence))
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(
+            seqs,
+            (0..total).collect::<Vec<u64>>(),
+            "sequences must be strictly consecutive with no duplicates"
+        );
+        Ok(())
+    }
+
+    /// Why [`AuditLogger::new`] carries a one-instance-per-file invariant, in
+    /// executable form: two loggers over the same file each recover the same
+    /// chain tip and then both claim it. The mutex inside an instance cannot
+    /// see across instances, so this corruption is unreachable only as long as
+    /// production builds exactly one logger per audit file and shares it -
+    /// which is what `RpcContext::cert_audit` is for.
+    #[test]
+    fn two_loggers_on_one_file_duplicate_a_sequence() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = || AuditConfig {
+            enabled: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let log_path = tmp.path().join("audit.log");
+
+        // Both recover the genesis tip before either has written.
+        let first = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+        let second = AuditLogger::new(config(), tmp.path().to_path_buf())?;
+
+        let event = |tag: &str| {
+            AuditEvent::new(AuditEventType::CertIssued).with_action(
+                tag.to_string(),
+                "low".to_string(),
+                false,
+                true,
+            )
+        };
+        first.log(&event("enrollment"))?;
+        second.log(&event("renewal"))?;
+
+        let err = verify_chain(&log_path)
+            .expect_err("two writers over one audit file must corrupt the chain");
+        assert!(
+            err.to_string().contains("sequence gap"),
+            "expected a duplicated sequence, got: {err}"
+        );
         Ok(())
     }
 }

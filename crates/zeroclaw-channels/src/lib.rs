@@ -1,6 +1,25 @@
 //! Channel implementations and orchestration for messaging platform integrations.
 
+#![allow(
+    clippy::to_string_in_format_args,
+    clippy::useless_format,
+    clippy::explicit_auto_deref
+)]
+#![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
+
+pub mod allowlist;
+// Ungated: the reader-aligned paired-identity writer is now shared by every
+// writer of an `external_peers` grant, including the CLI/API bind core and the
+// Telegram and LINE pairing paths, none of which are wechat/whatsapp-web.
+pub(crate) mod identity_persist;
+pub mod listing;
+pub mod login_events;
+pub mod login_probe;
+pub mod login_relink;
+#[cfg(feature = "channel-telegram")]
+pub(crate) mod model_picker_delivery;
 pub mod orchestrator;
+pub mod paced_channel;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
@@ -10,8 +29,11 @@ pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
 pub mod tts;
+pub mod voice;
 
 // Feature-gated channels
+#[cfg(feature = "channel-amqp")]
+pub mod amqp;
 #[cfg(feature = "channel-bluesky")]
 pub mod bluesky;
 #[cfg(feature = "channel-clawdtalk")]
@@ -21,9 +43,13 @@ pub mod dingtalk;
 #[cfg(feature = "channel-discord")]
 pub mod discord;
 #[cfg(feature = "channel-discord")]
-pub mod discord_history;
+pub mod discord_slash_state;
 #[cfg(feature = "channel-email")]
 pub mod email_channel;
+#[cfg(feature = "channel-filesystem")]
+pub mod filesystem;
+#[cfg(feature = "channel-git")]
+pub mod git;
 #[cfg(feature = "channel-email")]
 pub mod gmail_push;
 #[cfg(feature = "channel-imessage")]
@@ -58,21 +84,23 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+#[cfg(feature = "channel-twitch")]
+pub mod twitch;
 #[cfg(feature = "channel-twitter")]
 pub mod twitter;
 #[cfg(feature = "channel-voice-call")]
 pub mod voice_call;
 #[cfg(feature = "voice-wake")]
 pub mod voice_wake;
-#[cfg(feature = "channel-wati")]
-pub mod wati;
 #[cfg(feature = "channel-webhook")]
 pub mod webhook;
 #[cfg(feature = "channel-wechat")]
 pub mod wechat;
 #[cfg(feature = "channel-wecom")]
 pub mod wecom;
-#[cfg(feature = "channel-whatsapp-cloud")]
+#[cfg(feature = "channel-wecom-ws")]
+pub mod wecom_ws;
+#[cfg(any(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;

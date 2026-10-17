@@ -1,8 +1,4 @@
 //! Identity system supporting OpenClaw (markdown) and AIEOS (JSON) formats.
-//!
-//! AIEOS (AI Entity Object Specification) is a standardization framework for
-//! portable AI identity. This module handles loading and converting AIEOS v1.1
-//! JSON to ZeroClaw's system prompt format.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,7 +8,6 @@ use std::path::{Path, PathBuf};
 use zeroclaw_config::schema::IdentityConfig;
 
 /// AIEOS v1.1 identity structure.
-///
 /// This follows the AIEOS schema for defining AI agent identity, personality,
 /// and behavior. See <https://aieos.org> for the full specification.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -154,7 +149,6 @@ pub struct InterestsSection {
 }
 
 /// Load AIEOS identity from config (file path or inline JSON).
-///
 /// Checks `aieos_path` first, then `aieos_inline`. Returns `Ok(None)` if
 /// neither is configured.
 pub fn load_aieos_identity(
@@ -174,11 +168,19 @@ pub fn load_aieos_identity(
             workspace_dir.join(path)
         };
 
-        let content = std::fs::read_to_string(&full_path)
-            .with_context(|| format!("Failed to read AIEOS file: {}", full_path.display()))?;
+        let content = std::fs::read_to_string(&full_path).with_context(|| {
+            format!(
+                "Failed to read AIEOS file: {}",
+                full_path.display().to_string()
+            )
+        })?;
 
-        let identity = parse_aieos_identity(&content)
-            .with_context(|| format!("Failed to parse AIEOS JSON from: {}", full_path.display()))?;
+        let identity = parse_aieos_identity(&content).with_context(|| {
+            format!(
+                "Failed to parse AIEOS JSON from: {}",
+                full_path.display().to_string()
+            )
+        })?;
 
         return Ok(Some(identity));
     }
@@ -712,7 +714,6 @@ fn non_empty_list_at(value: &Value, path: &[&str]) -> Option<Vec<String>> {
 }
 
 /// Convert AIEOS identity to a system prompt string.
-///
 /// Formats the AIEOS data into a structured markdown prompt compatible
 /// with ZeroClaw's agent system.
 pub fn aieos_to_system_prompt(identity: &AieosIdentity) -> String {
@@ -787,8 +788,9 @@ pub fn aieos_to_system_prompt(identity: &AieosIdentity) -> String {
             let mut sorted_keys: Vec<_> = matrix.keys().collect();
             sorted_keys.sort();
             for trait_name in sorted_keys {
-                let weight = matrix.get(trait_name).unwrap();
-                let _ = writeln!(prompt, "- {}: {:.2}", trait_name, weight);
+                if let Some(weight) = matrix.get(trait_name) {
+                    let _ = writeln!(prompt, "- {}: {:.2}", trait_name, weight);
+                }
             }
         }
 
@@ -959,8 +961,9 @@ pub fn aieos_to_system_prompt(identity: &AieosIdentity) -> String {
             let mut sorted_keys: Vec<_> = favorites.keys().collect();
             sorted_keys.sort();
             for category in sorted_keys {
-                let value = favorites.get(category).unwrap();
-                let _ = writeln!(prompt, "- {}: {}", category, value);
+                if let Some(value) = favorites.get(category) {
+                    let _ = writeln!(prompt, "- {}: {}", category, value);
+                }
             }
         }
 
@@ -975,7 +978,6 @@ pub fn aieos_to_system_prompt(identity: &AieosIdentity) -> String {
 }
 
 /// Check if AIEOS identity is configured and should be used.
-///
 /// Returns true if format is "aieos" and either aieos_path or aieos_inline is set.
 pub fn is_aieos_configured(config: &IdentityConfig) -> bool {
     config.format == "aieos" && (config.aieos_path.is_some() || config.aieos_inline.is_some())

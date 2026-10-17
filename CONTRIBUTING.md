@@ -31,7 +31,19 @@ All PRs target **`master`**. PRs targeting `main` will be rejected.
 3. **Fork → branch → change → test → PR.** PRs target `master`. Use `feat/*` or `fix/*` branch names.
 4. **Open a draft PR early** if you get stuck and ask questions in the description.
 
-For the full mechanics — code style, testing levels, PR template requirements, review process — see **[How to contribute](docs/book/src/contributing/how-to.md)**.
+For the full mechanics — code style, testing levels, PR template requirements, review process — see **[How to contribute](docs/book/src/contributing/how-to.md)**. For non-trivial architecture, workflow, config, security, or agent-assisted changes, use the **[Architecture and contribution map](docs/book/src/contributing/architecture-map.md)** to find the right foundation and architecture context before implementing.
+
+## Keep contributions moving
+
+Contributors are not expected to respond instantly, but should remain in contact throughout the review process to avoid their contributions becoming inactive. The policies below explain contributor expectations and how inactive work is handled.
+
+**Pull requests:** Respond to actionable review feedback. Resolve conflicts or update your branch when a maintainer asks, or leave a comment explaining what is blocking you. A PR that remains unresponsive after a documented author-action request and follow-up period may be closed for backlog hygiene. Closing the PR does not reject the underlying bug or idea. If the work remains valuable, maintainers may carry it forward through a takeover or superseding PR while preserving contributor attribution. See [PR backlog pruning](docs/book/src/maintainers/reviewer-playbook.md#pr-backlog-pruning) and [Superseding PRs](docs/book/src/maintainers/superseding.md).
+
+Before requesting or re-requesting review, inspect the current PR state yourself. Relevant checks should pass, obvious failures and conflicts should be resolved, prior review findings should be addressed, and the PR description and validation evidence should match the current head. Perform a focused self-review of the production and user-visible paths changed by the PR.
+
+Do not rely on maintainers to check the test status or determine whether you have addressed every review finding. When the PR is ready, post one concise comment summarizing what changed and requesting re-review, and also use GitHub's re-request review control so the appropriate reviewers are formally requested again.
+
+**Issues:** If you open an issue, follow the discussion when you can and add new details as they become available. Other participants may also provide evidence that the issue remains relevant. A substantive update, such as a current reproduction, logs, or a concrete affected use case, can keep it active; a generic `+1` cannot. Issues without current evidence may close for backlog hygiene, but updated evidence can support reopening the issue or filing a new one. See the [issue stale policy](docs/book/src/maintainers/labels.md#issue-stale-policy) for the canonical rules.
 
 ## Development setup
 
@@ -50,6 +62,10 @@ cargo test --locked
 # Format and lint (required before PR)
 ./scripts/ci/rust_quality_gate.sh
 
+# Rustdoc warnings (required CI lint step; fatal via .cargo/config.toml).
+# Excludes zeroclaw-desktop — same surface as docs-deploy / xtask build_api.
+cargo doc --no-deps --workspace --exclude zeroclaw-desktop
+
 # Full CI parity in Docker
 ./dev/ci.sh all
 ```
@@ -59,7 +75,6 @@ Pre-push hook opt-ins (set the env var to enable for one push):
 | Variable | Effect |
 |---|---|
 | `ZEROCLAW_STRICT_LINT=1` | Strict lint pass on the full repo |
-| `ZEROCLAW_STRICT_DELTA_LINT=1` | Strict lint on changed Rust lines only |
 | `ZEROCLAW_DOCS_LINT=1` | Markdown gate on changed lines |
 | `ZEROCLAW_DOCS_LINKS=1` | Link check on added links only |
 
@@ -72,15 +87,24 @@ ZeroClaw supports layered secret management for local development.
 **Storage options:**
 
 1. **Environment variables** (recommended for development) — copy `.env.example` to `.env` and fill in values. `.env` is git-ignored.
-2. **Config file** (`~/.zeroclaw/config.toml`) — when `secrets.encrypt = true` (default), values are encrypted with the key at `~/.zeroclaw/.secret_key`. Use `zeroclaw onboard` for guided setup.
+2. **Config file** (`~/.zeroclaw/config.toml`) — when `secrets.encrypt = true` (default), values are encrypted with the key at `~/.zeroclaw/.secret_key`. Use `zeroclaw quickstart` for guided setup.
 
 **API key resolution order:**
 
 1. Explicit key passed from config or CLI.
-2. Provider-specific env vars (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …).
-3. Generic env vars (`ZEROCLAW_API_KEY`, `API_KEY`).
+2. `ZEROCLAW_<lowercase_dotted_path>` env-var override (lands on the in-memory `Config` at load time; see below).
 
-Provider/model overrides via `ZEROCLAW_PROVIDER`, `PROVIDER`, `ZEROCLAW_MODEL`. See `.env.example` for the supported list.
+Set credentials in your config file (`~/.zeroclaw/config.toml` by default; custom workspaces override the path) under `[providers.models.<type>.<alias>]`, or inject at runtime via the V0.8.0 schema-mirror grammar:
+
+```sh
+ZEROCLAW_providers__models__anthropic__default__api_key=sk-ant-...
+ZEROCLAW_providers__models__openrouter__prod_v2__model=anthropic/claude-sonnet-4-6
+ZEROCLAW_gateway__request_timeout_secs=120
+```
+
+The lowercase tail mirrors the dotted TOML path 1:1; each `__` (double underscore) is a path separator (`.` in TOML) and each single `_` is either a snake-case joiner inside a field name (`api_key` → `api-key`) or a literal char inside an alias key (`prod_v2`). Aliases are `[a-z0-9][a-z0-9_]{0,62}` — lowercase letters, digits, and single underscores; no leading underscore, no hyphen, no uppercase. Bootstrap variables (`ZEROCLAW_WORKSPACE`, `ZEROCLAW_CONFIG_DIR`) keep their UPPERCASE form; the case rule disambiguates them from the schema-mirror surface.
+
+V0.8.0 eradicated every per-provider env-var fallback (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY`, …), the generic `ZEROCLAW_API_KEY` / `API_KEY`, and the legacy `ZEROCLAW_PROVIDER` / `PROVIDER` / `ZEROCLAW_MODEL` dispatchers. Legacy names have no runtime effect — they're silently ignored. See `docs/book/src/reference/env-vars.md` for the migration table and the `💉` visibility behavior.
 
 **Never commit:** `.env`, API keys / tokens / passwords / OAuth tokens / webhook signing secrets, `~/.zeroclaw/.secret_key`, or any personal identifier in tests or fixtures. The full content discipline is in **[Privacy & PII](docs/book/src/contributing/privacy.md)**.
 
@@ -106,6 +130,7 @@ The book is the source of truth for everything contributor-facing. Quick links:
 | Topic | Page |
 |---|---|
 | The full contribution flow | [How to contribute](docs/book/src/contributing/how-to.md) |
+| What to read before architecture-sensitive changes | [Architecture and contribution map](docs/book/src/contributing/architecture-map.md) |
 | Communication channels | [Communication](docs/book/src/contributing/communication.md) |
 | Filing an RFC | [RFC process](docs/book/src/contributing/rfcs.md) |
 | Privacy & PII rules | [Privacy](docs/book/src/contributing/privacy.md) |
@@ -124,7 +149,7 @@ For maintainer-facing content (PR workflow, reviewer playbook, release runbook, 
 - **Template is mandatory.** Complete every section in `.github/pull_request_template.md`.
 - **Validation evidence is required** — actual command output, not "CI will check."
 - **Privacy and identity discipline is a merge gate.** Never commit real names, emails, tokens, or PII.
-- **Co-authoring with AI is welcome.** Use the `Co-Authored-By` trailer where AI tools materially contributed.
+- **AI-assisted collaboration is welcome.** Do not add bot/AI attribution trailers or generated tool footers to PR bodies or commit-message tails. Human `Co-authored-by` trailers remain appropriate for incorporated contributor work when they follow the superseding and privacy rules.
 - **Squash-merge with conventional commits** is the merge style.
 
 ## Reporting

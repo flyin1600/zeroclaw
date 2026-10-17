@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_memory::Memory;
@@ -42,10 +42,16 @@ impl Tool for MemoryForgetTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let key = args
-            .get("key")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'key' parameter"))?;
+        let key = args.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "key"})),
+                "memory_forget: missing key parameter"
+            );
+            anyhow::Error::msg("Missing 'key' parameter")
+        })?;
 
         if let Err(error) = self
             .security
@@ -53,7 +59,7 @@ impl Tool for MemoryForgetTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -61,17 +67,17 @@ impl Tool for MemoryForgetTool {
         match self.memory.forget(key).await {
             Ok(true) => Ok(ToolResult {
                 success: true,
-                output: format!("Forgot memory: {key}"),
+                output: format!("Forgot memory: {key}").into(),
                 error: None,
             }),
             Ok(false) => Ok(ToolResult {
                 success: true,
-                output: format!("No memory found with key: {key}"),
+                output: format!("No memory found with key: {key}").into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to forget memory: {e}")),
             }),
         }
@@ -92,7 +98,7 @@ mod tests {
 
     fn test_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
     }
 

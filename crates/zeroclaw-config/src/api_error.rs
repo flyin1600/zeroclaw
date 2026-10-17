@@ -1,18 +1,4 @@
 //! Structured error type for the gateway HTTP CRUD surface and its CLI peer.
-//!
-//! Every fallible operation against the new per-property endpoints (`/api/config/prop`,
-//! `/api/config/list`, `OPTIONS /api/config*`, `PATCH /api/config`) and the matching
-//! `zeroclaw config` CLI subcommands returns this error type. The `code` field is
-//! a stable string the dashboard / scripts can match programmatically; `message`
-//! is human-readable for terminal output and tooltip text. `path` carries the
-//! offending field (when applicable) so the dashboard can render the error
-//! contextually next to the input.
-//!
-//! This replaces the prior pattern of returning `anyhow::Error` strings that
-//! consumers had to substring-match. Existing `anyhow::bail!(...)` sites in
-//! `Config::validate()` are wrapped via `ConfigApiError::from_validation` —
-//! the friendly text becomes `message`, the code stays generic
-//! (`validation_failed`) until callers refine to a more specific code.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,18 +11,14 @@ pub enum ConfigApiCode {
     /// The supplied property path is not defined in the schema.
     PathNotFound,
     /// Generic schema validation failure (catch-all wrapping `Config::validate()` bails).
-    /// Specific failure modes (`provider_fallback_dangling`, etc.) get their own
-    /// codes as the validator is incrementally restructured.
     ValidationFailed,
-    /// `providers.fallback` references a key not present in `providers.models`.
-    ProviderFallbackDangling,
     /// On-disk config differs from in-memory state (an out-of-band file edit
     /// happened despite the daemon-running rule). Caller should reload.
     ConfigChangedExternally,
     /// The daemon-reload step after a successful save failed; on-disk config
     /// has been reverted to the pre-write snapshot to keep state consistent.
     ReloadFailed,
-    /// JSON Patch operation type is not supported in this PR (`move` / `copy`).
+    /// JSON Patch operation type is not supported (`move` / `copy`).
     OpNotSupported,
     /// JSON Patch `test` operation targeted a secret or derived-from-secret
     /// path; rejected to prevent differential value inference.
@@ -56,12 +38,10 @@ pub enum ConfigApiCode {
     /// scheme, invalid path prefix, characters outside the allowed set.
     InvalidFormat,
     /// An enum / discriminator field carried a value not in the allowed
-    /// set (e.g. `tunnel.provider` with an unknown name).
+    /// set (e.g. `tunnel.tunnel_provider` with an unknown name).
     InvalidEnumVariant,
     /// A reference to another config entry pointed at something that
-    /// doesn't exist (e.g. `agents.<x>.delegate_to` naming a missing
-    /// agent). Distinct from `ProviderFallbackDangling` — that's the
-    /// specific case the dashboard surfaces for the providers section.
+    /// doesn't exist (e.g. `agents.<x>.delegate_to` naming a missing agent).
     DanglingReference,
     /// Catch-all server failure not classified above. Avoid in code; log the
     /// original error and convert to a more specific code where possible.
@@ -73,7 +53,6 @@ impl ConfigApiCode {
         match self {
             Self::PathNotFound => "path_not_found",
             Self::ValidationFailed => "validation_failed",
-            Self::ProviderFallbackDangling => "provider_fallback_dangling",
             Self::ConfigChangedExternally => "config_changed_externally",
             Self::ReloadFailed => "reload_failed",
             Self::OpNotSupported => "op_not_supported",
@@ -93,7 +72,6 @@ impl ConfigApiCode {
         match self {
             Self::PathNotFound => 404,
             Self::ValidationFailed
-            | Self::ProviderFallbackDangling
             | Self::OpNotSupported
             | Self::SecretTestForbidden
             | Self::ValueTypeMismatch
@@ -147,17 +125,6 @@ impl ConfigApiError {
         self
     }
 
-    /// Wrap an `anyhow::Error` from `Config::validate()` (or similar bail
-    /// sites) into a structured error. The error string becomes `message`;
-    /// the code is best-effort classified by matching the error text against
-    /// known patterns from `Config::validate()`. Unrecognized text falls
-    /// through to `ValidationFailed`.
-    ///
-    /// First tries to downcast — `Config::validate()` and friends now use
-    /// the `validation_bail!` macro to attach a structured `ConfigApiError`
-    /// directly to the anyhow chain. The classifier remains as the
-    /// fallback for any bail sites not yet converted, so the contract
-    /// degrades gracefully across the refactor.
     pub fn from_validation(err: anyhow::Error) -> Self {
         if let Some(structured) = err.downcast_ref::<ConfigApiError>() {
             return structured.clone();
@@ -168,20 +135,8 @@ impl ConfigApiError {
     }
 }
 
-/// Best-effort classify a `Config::validate()` error string into a stable
-/// code. Matches against the specific message text the validator emits today
-/// (`crates/zeroclaw-config/src/schema.rs:10151+`). Adding a new pattern here
-/// is the safe step until `validate()` itself is refactored to return
-/// structured errors per bail site.
 pub fn classify_validation_message(msg: &str) -> ConfigApiCode {
     let lower = msg.to_lowercase();
-    if lower.contains("providers.fallback")
-        && (lower.contains("not configured")
-            || lower.contains("not found")
-            || lower.contains("references"))
-    {
-        return ConfigApiCode::ProviderFallbackDangling;
-    }
     if lower.contains("type mismatch") || lower.contains("invalid value") {
         return ConfigApiCode::ValueTypeMismatch;
     }
@@ -236,24 +191,6 @@ impl std::fmt::Display for ConfigApiError {
 
 impl std::error::Error for ConfigApiError {}
 
-/// Per-bail-site shorthand for emitting a structured `ConfigApiError`
-/// inside a `validate()` chain that returns `anyhow::Result<()>`. Wraps
-/// the structured error as the anyhow source so
-/// `ConfigApiError::from_validation` downcasts to it without having to
-/// re-classify the message text. Pattern:
-///
-/// ```ignore
-/// validation_bail!(
-///     RequiredFieldEmpty,
-///     "gateway.host",
-///     "gateway.host must not be empty",
-/// );
-/// ```
-///
-/// Sites not yet converted still bail through `anyhow::bail!` — the
-/// classifier in `from_validation` covers them as fallback. Migration
-/// is incremental: each PR that touches a `validate()` site swaps the
-/// macro in.
 #[macro_export]
 macro_rules! validation_bail {
     ($code:ident, $path:expr, $($msg:tt)*) => {{
@@ -275,7 +212,6 @@ mod tests {
         for code in [
             ConfigApiCode::PathNotFound,
             ConfigApiCode::ValidationFailed,
-            ConfigApiCode::ProviderFallbackDangling,
             ConfigApiCode::ConfigChangedExternally,
             ConfigApiCode::ReloadFailed,
             ConfigApiCode::OpNotSupported,
@@ -298,16 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_provider_fallback_dangling() {
-        assert_eq!(
-            classify_validation_message(
-                "providers.fallback references key 'unknown' which is not configured"
-            ),
-            ConfigApiCode::ProviderFallbackDangling
-        );
-    }
-
-    #[test]
     fn classify_unknown_property() {
         assert_eq!(
             classify_validation_message("Unknown property 'foo.bar'"),
@@ -324,20 +250,11 @@ mod tests {
     }
 
     #[test]
-    fn from_validation_picks_dangling_code_for_matching_message() {
-        let err = anyhow::anyhow!(
-            "providers.fallback references 'openrouter' which is not configured under providers.models"
-        );
-        let api = ConfigApiError::from_validation(err);
-        assert_eq!(api.code, ConfigApiCode::ProviderFallbackDangling);
-    }
-
-    #[test]
     fn path_not_found_carries_path() {
-        let err = ConfigApiError::path_not_found("providers.fallback");
+        let err = ConfigApiError::path_not_found("providers.models");
         assert_eq!(err.code, ConfigApiCode::PathNotFound);
-        assert_eq!(err.path.as_deref(), Some("providers.fallback"));
-        assert!(err.message.contains("providers.fallback"));
+        assert_eq!(err.path.as_deref(), Some("providers.models"));
+        assert!(err.message.contains("providers.models"));
     }
 
     #[test]
@@ -349,7 +266,7 @@ mod tests {
 
     #[test]
     fn from_validation_uses_message() {
-        let anyhow_err = anyhow::anyhow!("gateway.host must not be empty");
+        let anyhow_err = anyhow::Error::msg("gateway.host must not be empty");
         let api_err = ConfigApiError::from_validation(anyhow_err);
         assert_eq!(api_err.code, ConfigApiCode::ValidationFailed);
         assert!(api_err.message.contains("gateway.host"));

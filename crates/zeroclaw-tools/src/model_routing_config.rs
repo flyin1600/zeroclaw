@@ -1,12 +1,14 @@
 use crate::util_helpers::MaybeSet;
+use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
+use zeroclaw_config::schema::{ClassificationRule, Config, DelegateTargetConfig, ModelRouteConfig};
+use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
@@ -23,22 +25,44 @@ impl ModelRoutingConfigTool {
 
     fn load_config_without_env(&self) -> anyhow::Result<Config> {
         let contents = fs::read_to_string(&self.config.config_path).map_err(|error| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": self.config.config_path.display().to_string(),
+                        "error": format!("{}", error),
+                    })),
+                "model_routing_config: failed to read config file"
+            );
+            anyhow::Error::msg(format!(
                 "Failed to read config file {}: {error}",
                 self.config.config_path.display()
-            )
+            ))
         })?;
 
-        let compat: zeroclaw_config::migration::V1Compat =
-            toml::from_str(&contents).map_err(|error| {
-                anyhow::anyhow!(
+        let mut parsed =
+            zeroclaw_config::migration::migrate_to_current(&contents).map_err(|error| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "path": self.config.config_path.display().to_string(),
+                            "error": format!("{}", error),
+                        })),
+                    "model_routing_config: failed to parse config file"
+                );
+                anyhow::Error::msg(format!(
                     "Failed to parse config file {}: {error}",
                     self.config.config_path.display()
-                )
+                ))
             })?;
-        let mut parsed = compat.into_config();
         parsed.config_path = self.config.config_path.clone();
-        parsed.workspace_dir = self.config.workspace_dir.clone();
+        parsed.data_dir = self.config.data_dir.clone();
+        // This value was parsed from the file at `config_path`; it holds
+        // save-over provenance for the guard in `Config::save`.
+        parsed.loaded_from = Some(parsed.config_path.clone());
         Ok(parsed)
     }
 
@@ -46,7 +70,7 @@ impl ModelRoutingConfigTool {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -54,12 +78,47 @@ impl ModelRoutingConfigTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
 
         None
+    }
+
+    fn risk_profile_is_shared(cfg: &Config, profile: &str, owner: &str) -> bool {
+        cfg.agents.iter().any(|(agent_name, agent)| {
+            agent_name != owner && agent.risk_profile.as_str().trim() == profile
+        })
+    }
+
+    fn runtime_profile_is_shared(cfg: &Config, profile: &str, owner: &str) -> bool {
+        cfg.agents.iter().any(|(agent_name, agent)| {
+            agent_name != owner && agent.runtime_profile.as_str().trim() == profile
+        })
+    }
+
+    fn mark_serialized_profile_leaves<T: serde::Serialize + ?Sized>(
+        cfg: &mut Config,
+        prefix: &str,
+        profile: &T,
+    ) -> anyhow::Result<()> {
+        fn visit(cfg: &mut Config, path: &str, value: &toml::Value) {
+            if let toml::Value::Table(table) = value
+                && !table.is_empty()
+            {
+                for (key, value) in table {
+                    visit(cfg, &format!("{path}.{key}"), value);
+                }
+            } else {
+                cfg.mark_dirty(path);
+            }
+        }
+
+        let serialized = toml::Value::try_from(profile)
+            .context("failed to serialize isolated agent profile for persistence")?;
+        visit(cfg, prefix, &serialized);
+        Ok(())
     }
 
     fn parse_string_list(raw: &Value, field: &str) -> anyhow::Result<Vec<String>> {
@@ -75,9 +134,16 @@ impl ModelRoutingConfigTool {
         if let Some(array) = raw.as_array() {
             let mut out = Vec::new();
             for item in array {
-                let value = item
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("'{field}' array must only contain strings"))?;
+                let value = item.as_str().ok_or_else(|| {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"field": field})),
+                        "model_routing_config: array element must be a string"
+                    );
+                    anyhow::Error::msg(format!("'{field}' array must only contain strings"))
+                })?;
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
                     out.push(trimmed.to_string());
@@ -89,11 +155,70 @@ impl ModelRoutingConfigTool {
         anyhow::bail!("'{field}' must be a string or string[]")
     }
 
+    fn parse_delegate_targets(
+        raw: &Value,
+        field: &str,
+    ) -> anyhow::Result<Vec<DelegateTargetConfig>> {
+        // Keep the config-editing tool as permissive as the schema loader:
+        // operators may pass a comma-separated legacy string, a string array,
+        // or object entries with explicit mode. The stored config still uses
+        // `DelegateTargetConfig`, so mode semantics are not reimplemented here.
+        if let Some(raw_string) = raw.as_str() {
+            return Ok(raw_string
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(DelegateTargetConfig::bounded)
+                .collect());
+        }
+
+        if let Some(array) = raw.as_array() {
+            let mut out = Vec::new();
+            for item in array {
+                let mut target: DelegateTargetConfig =
+                    serde_json::from_value(item.clone()).map_err(|error| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "field": field,
+                                "error": format!("{}", error),
+                            })),
+                            "model_routing_config: delegate target element has invalid shape"
+                        );
+                        anyhow::Error::msg(format!(
+                            "'{field}' array must contain strings or objects with agent/mode: {error}"
+                        ))
+                    })?;
+                target.agent = target.agent.trim().to_string();
+                if !target.agent.is_empty() {
+                    out.push(target);
+                }
+            }
+            return Ok(out);
+        }
+
+        anyhow::bail!("'{field}' must be a string, string[], or delegate target object[]")
+    }
+
     fn parse_non_empty_string(args: &Value, field: &str) -> anyhow::Result<String> {
         let value = args
             .get(field)
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Missing '{field}'"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": field})),
+                    "model_routing_config: missing required string param"
+                );
+                anyhow::Error::msg(format!("Missing '{field}'"))
+            })?
             .trim();
 
         if value.is_empty() {
@@ -101,6 +226,20 @@ impl ModelRoutingConfigTool {
         }
 
         Ok(value.to_string())
+    }
+
+    fn reject_unknown_model_provider_family(family: &str, name: &str) -> anyhow::Result<()> {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider_family": family,
+                    "name": name,
+                })),
+            "model_routing_config: unknown model_provider family"
+        );
+        anyhow::bail!("unknown model_provider type `{family}`. no typed slot in ModelProviders")
     }
 
     fn parse_optional_string_update(args: &Value, field: &str) -> anyhow::Result<MaybeSet<String>> {
@@ -114,7 +253,16 @@ impl ModelRoutingConfigTool {
 
         let value = raw
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a string or null"))?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"field": field})),
+                    "model_routing_config: field must be string or null"
+                );
+                anyhow::Error::msg(format!("'{field}' must be a string or null"))
+            })?
             .trim()
             .to_string();
 
@@ -135,9 +283,16 @@ impl ModelRoutingConfigTool {
             return Ok(MaybeSet::Null);
         }
 
-        let value = raw
-            .as_f64()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a number or null"))?;
+        let value = raw.as_f64().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: field must be number or null"
+            );
+            anyhow::Error::msg(format!("'{field}' must be a number or null"))
+        })?;
         Ok(MaybeSet::Set(value))
     }
 
@@ -150,11 +305,26 @@ impl ModelRoutingConfigTool {
             return Ok(MaybeSet::Null);
         }
 
-        let raw_value = raw
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a non-negative integer or null"))?;
-        let value = usize::try_from(raw_value)
-            .map_err(|_| anyhow::anyhow!("'{field}' is too large for this platform"))?;
+        let raw_value = raw.as_u64().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: usize field must be non-negative integer or null"
+            );
+            anyhow::Error::msg(format!("'{field}' must be a non-negative integer or null"))
+        })?;
+        let value = usize::try_from(raw_value).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field, "raw_value": raw_value})),
+                "model_routing_config: usize value too large"
+            );
+            anyhow::Error::msg(format!("'{field}' is too large for this platform"))
+        })?;
         Ok(MaybeSet::Set(value))
     }
 
@@ -167,11 +337,26 @@ impl ModelRoutingConfigTool {
             return Ok(MaybeSet::Null);
         }
 
-        let raw_value = raw
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a non-negative integer or null"))?;
-        let value =
-            u32::try_from(raw_value).map_err(|_| anyhow::anyhow!("'{field}' must fit in u32"))?;
+        let raw_value = raw.as_u64().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: u32 field must be non-negative integer or null"
+            );
+            anyhow::Error::msg(format!("'{field}' must be a non-negative integer or null"))
+        })?;
+        let value = u32::try_from(raw_value).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field, "raw_value": raw_value})),
+                "model_routing_config: u32 value too large"
+            );
+            anyhow::Error::msg(format!("'{field}' must fit in u32"))
+        })?;
         Ok(MaybeSet::Set(value))
     }
 
@@ -184,11 +369,26 @@ impl ModelRoutingConfigTool {
             return Ok(MaybeSet::Null);
         }
 
-        let raw_value = raw
-            .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be an integer or null"))?;
-        let value =
-            i32::try_from(raw_value).map_err(|_| anyhow::anyhow!("'{field}' must fit in i32"))?;
+        let raw_value = raw.as_i64().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: i32 field must be integer or null"
+            );
+            anyhow::Error::msg(format!("'{field}' must be an integer or null"))
+        })?;
+        let value = i32::try_from(raw_value).map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field, "raw_value": raw_value})),
+                "model_routing_config: i32 value out of range"
+            );
+            anyhow::Error::msg(format!("'{field}' must fit in i32"))
+        })?;
         Ok(MaybeSet::Set(value))
     }
 
@@ -197,9 +397,16 @@ impl ModelRoutingConfigTool {
             return Ok(None);
         };
 
-        let value = raw
-            .as_bool()
-            .ok_or_else(|| anyhow::anyhow!("'{field}' must be a boolean"))?;
+        let value = raw.as_bool().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"field": field})),
+                "model_routing_config: field must be boolean"
+            );
+            anyhow::Error::msg(format!("'{field}' must be a boolean"))
+        })?;
         Ok(Some(value))
     }
 
@@ -216,7 +423,7 @@ impl ModelRoutingConfigTool {
 
         json!({
             "hint": route.hint,
-            "provider": route.provider,
+            "model_provider": route.model_provider,
             "model": route.model,
             "api_key_configured": route
                 .api_key
@@ -227,7 +434,7 @@ impl ModelRoutingConfigTool {
     }
 
     fn snapshot(cfg: &Config) -> Value {
-        let mut routes = cfg.providers.model_routes.clone();
+        let mut routes = cfg.model_routes.clone();
         routes.sort_by(|a, b| a.hint.cmp(&b.hint));
 
         let mut rules = cfg.query_classification.rules.clone();
@@ -260,31 +467,26 @@ impl ModelRoutingConfigTool {
 
         let mut agents: BTreeMap<String, Value> = BTreeMap::new();
         for (name, agent) in &cfg.agents {
+            let risk = cfg.risk_profiles.get(agent.risk_profile.as_str());
+            let runtime = cfg.runtime_profiles.get(agent.runtime_profile.as_str());
             agents.insert(
                 name.clone(),
                 json!({
-                    "provider": agent.provider,
-                    "model": agent.model,
-                    "system_prompt": agent.system_prompt,
-                    "api_key_configured": agent
-                        .api_key
-                        .as_ref()
-                        .is_some_and(|value| !value.trim().is_empty()),
-                    "temperature": agent.temperature,
-                    "max_depth": agent.max_depth,
-                    "agentic": agent.agentic,
-                    "allowed_tools": agent.allowed_tools,
-                    "max_iterations": agent.max_iterations,
+                    "model_provider": agent.model_provider,
+                    "risk_profile": agent.risk_profile,
+                    "runtime_profile": agent.runtime_profile,
+                    "max_delegation_depth": runtime.map(|r| r.max_delegation_depth),
+                    "agentic": runtime.map(|r| r.agentic),
+                    "allowed_tools": risk.map(|r| &r.allowed_tools),
+                    "deny_all_tools": risk.map(|r| r.deny_all_tools),
+                    "max_tool_iterations": runtime.map(|r| r.max_tool_iterations),
+                    "delegate_same_risk_profile": agent.delegate_same_risk_profile,
+                    "delegates": agent.delegates,
                 }),
             );
         }
 
         json!({
-            "default": {
-                "provider": cfg.providers.fallback,
-                "model": cfg.providers.fallback_provider().and_then(|e| e.model.as_deref()),
-                "temperature": cfg.providers.fallback_provider().and_then(|e| e.temperature).unwrap_or(0.7),
-            },
             "query_classification": {
                 "enabled": cfg.query_classification.enabled,
                 "rules_count": cfg.query_classification.rules.len(),
@@ -326,19 +528,15 @@ impl ModelRoutingConfigTool {
         let cfg = self.load_config_without_env()?;
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?,
+            output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?.into(),
             error: None,
         })
     }
 
     fn handle_list_hints(&self) -> anyhow::Result<ToolResult> {
         let cfg = self.load_config_without_env()?;
-        let mut route_hints: Vec<String> = cfg
-            .providers
-            .model_routes
-            .iter()
-            .map(|r| r.hint.clone())
-            .collect();
+        let mut route_hints: Vec<String> =
+            cfg.model_routes.iter().map(|r| r.hint.clone()).collect();
         route_hints.sort();
         route_hints.dedup();
 
@@ -360,14 +558,14 @@ impl ModelRoutingConfigTool {
                     "conversation": {
                         "action": "upsert_scenario",
                         "hint": "conversation",
-                        "provider": "kimi",
+                        "model_provider": "kimi",
                         "model": "moonshot-v1-8k",
                         "classification_enabled": false
                     },
                     "coding": {
                         "action": "upsert_scenario",
                         "hint": "coding",
-                        "provider": "openai",
+                        "model_provider": "openai",
                         "model": "gpt-5.3-codex",
                         "classification_enabled": true,
                         "keywords": ["code", "bug", "refactor", "test"],
@@ -375,13 +573,14 @@ impl ModelRoutingConfigTool {
                         "priority": 50
                     }
                 }
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
 
     async fn handle_set_default(&self, args: &Value) -> anyhow::Result<ToolResult> {
-        let provider_update = Self::parse_optional_string_update(args, "provider")?;
+        let provider_update = Self::parse_optional_string_update(args, "model_provider")?;
         let model_update = Self::parse_optional_string_update(args, "model")?;
         let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
 
@@ -390,37 +589,51 @@ impl ModelRoutingConfigTool {
             || !matches!(temperature_update, MaybeSet::Unset);
 
         if !any_update {
-            anyhow::bail!("set_default requires at least one of: provider, model, temperature");
+            anyhow::bail!(
+                "set_default requires at least one of: model_provider, model, temperature"
+            );
         }
 
         let mut cfg = self.load_config_without_env()?;
 
-        // Capture previous values for rollback on probe failure.
-        let previous_provider = cfg.providers.fallback.clone();
-        let previous_fallback_provider = cfg
-            .providers
-            .fallback
-            .as_deref()
-            .and_then(|name| cfg.providers.models.get(name))
-            .cloned();
-
-        let fallback_name = match &provider_update {
-            MaybeSet::Set(provider) => {
-                cfg.providers.fallback = Some(provider.clone());
-                provider.clone()
+        // Determine which models entry to update.
+        let (type_k, alias_k) = match &provider_update {
+            MaybeSet::Set(model_provider) => model_provider
+                .split_once('.')
+                .map(|(t, a)| (t.to_string(), a.to_string()))
+                .unwrap_or_else(|| (model_provider.clone(), "default".to_string())),
+            MaybeSet::Null | MaybeSet::Unset => {
+                // Update whichever entry already exists, or create a placeholder.
+                cfg.providers
+                    .models
+                    .iter_entries()
+                    .next()
+                    .map(|(t, a, _)| (t.to_string(), a.to_string()))
+                    .unwrap_or_else(|| ("custom".to_string(), "default".to_string()))
             }
-            MaybeSet::Null => {
-                cfg.providers.fallback = None;
-                "default".to_string()
-            }
-            MaybeSet::Unset => cfg.providers.fallback.clone().unwrap_or_else(|| {
-                let name = "default".to_string();
-                cfg.providers.fallback = Some(name.clone());
-                name
-            }),
         };
 
-        let entry = cfg.providers.models.entry(fallback_name).or_default();
+        // Capture previous provider entry for rollback on probe failure.
+        let previous_provider_entry = cfg.providers.models.find(&type_k, &alias_k).cloned();
+        let entry = cfg
+            .providers
+            .models
+            .ensure(&type_k, &alias_k)
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider_type": &type_k,
+                            "alias": &alias_k,
+                        })),
+                    "model_routing_config: unknown model_provider type"
+                );
+                anyhow::Error::msg(format!(
+                    "unknown model_provider type `{type_k}`. no typed slot in ModelProviders"
+                ))
+            })?;
 
         match model_update {
             MaybeSet::Set(model) => entry.model = Some(model),
@@ -445,27 +658,26 @@ impl ModelRoutingConfigTool {
 
         // Probe the new model with a minimal API call to catch invalid model IDs
         // before the channel hot-reload picks up the change.
-        let current_provider = cfg.providers.fallback.clone();
         let current_model = cfg
             .providers
-            .fallback_provider()
+            .models
+            .find(&type_k, &alias_k)
             .and_then(|e| e.model.clone());
-        if let (Some(provider_name), Some(model_name)) = (current_provider, current_model)
+        let provider_name = format!("{type_k}.{alias_k}");
+        if let Some(model_name) = current_model
             && let Err(probe_err) = self.probe_model(&provider_name, &model_name).await
         {
             if zeroclaw_providers::reliable::is_non_retryable(&probe_err) {
-                let reverted_model = previous_fallback_provider
+                let reverted_model = previous_provider_entry
                     .as_ref()
                     .and_then(|e| e.model.as_deref())
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback to previous config.
-                cfg.providers.fallback = previous_provider;
-                if let Some(prev_entry) = previous_fallback_provider
-                    && let Some(fb) = cfg.providers.fallback.as_deref()
+                if let Some(prev_entry) = previous_provider_entry
+                    && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
                 {
-                    cfg.providers.models.insert(fb.to_string(), prev_entry);
+                    *slot = prev_entry;
                 }
                 cfg.save().await?;
 
@@ -473,24 +685,22 @@ impl ModelRoutingConfigTool {
                     success: false,
                     output: format!(
                         "Model '{model_name}' is not available: {probe_err}. Reverted to '{reverted_model}'.",
-                    ),
+                    ).into(),
                     error: None,
                 });
             }
             // Retryable errors (e.g. transient network issues) — keep the
             // new config and let the resilient wrapper handle retries.
-            tracing::warn!(
-                model = %model_name,
-                "Model probe returned retryable error (keeping new config): {probe_err}"
-            );
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model": model_name, "probe_err": probe_err.to_string()})), "Model probe returned retryable error (keeping new config)");
         }
 
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "message": "Default provider/model settings updated",
+                "message": "Default model_provider/model settings updated",
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -498,26 +708,23 @@ impl ModelRoutingConfigTool {
     /// Send a minimal 1-token chat request to verify the model is accessible.
     /// Returns `Ok(())` if the probe succeeds **or** if no API key is available
     /// (the probe would fail with an auth error unrelated to model validity).
-    /// Provider construction failures are also treated as non-fatal.
+    /// ModelProvider construction failures are also treated as non-fatal.
     async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
         // Use the runtime config's API key (which includes env-sourced keys),
         // not the on-disk config (which may have no key at all).
-        let api_key = self
-            .config
-            .providers
-            .fallback_provider()
-            .and_then(|e| e.api_key.as_deref());
+        let (family, alias) = provider_name
+            .split_once('.')
+            .unwrap_or((provider_name, "default"));
+        let entry = self.config.providers.models.find(family, alias);
+        let api_key = entry.and_then(|e| e.api_key.as_deref());
         if api_key.is_none_or(|k| k.trim().is_empty()) {
             return Ok(());
         }
 
-        let provider = match zeroclaw_providers::create_provider_with_url(
+        let model_provider = match zeroclaw_providers::create_model_provider_with_url(
             provider_name,
             api_key,
-            self.config
-                .providers
-                .fallback_provider()
-                .and_then(|e| e.base_url.as_deref()),
+            entry.and_then(|e| e.uri.as_deref()),
         ) {
             Ok(p) => p,
             Err(_) => return Ok(()),
@@ -525,7 +732,7 @@ impl ModelRoutingConfigTool {
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
-        provider
+        ProviderDispatch::from_ref(&*model_provider)
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",
@@ -539,7 +746,7 @@ impl ModelRoutingConfigTool {
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let hint = Self::parse_non_empty_string(args, "hint")?;
-        let provider = Self::parse_non_empty_string(args, "provider")?;
+        let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
         let model = Self::parse_non_empty_string(args, "model")?;
         let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
 
@@ -568,7 +775,6 @@ impl ModelRoutingConfigTool {
         let mut cfg = self.load_config_without_env()?;
 
         let existing_route = cfg
-            .providers
             .model_routes
             .iter()
             .find(|route| route.hint == hint)
@@ -576,13 +782,13 @@ impl ModelRoutingConfigTool {
 
         let mut next_route = existing_route.unwrap_or(ModelRouteConfig {
             hint: hint.clone(),
-            provider: provider.clone(),
+            model_provider: model_provider.clone(),
             model: model.clone(),
             api_key: None,
         });
 
         next_route.hint = hint.clone();
-        next_route.provider = provider;
+        next_route.model_provider = model_provider;
         next_route.model = model;
 
         match api_key_update {
@@ -591,11 +797,9 @@ impl ModelRoutingConfigTool {
             MaybeSet::Unset => {}
         }
 
-        cfg.providers
-            .model_routes
-            .retain(|route| route.hint != hint);
-        cfg.providers.model_routes.push(next_route);
-        Self::normalize_and_sort_routes(&mut cfg.providers.model_routes);
+        cfg.model_routes.retain(|route| route.hint != hint);
+        cfg.model_routes.push(next_route);
+        Self::normalize_and_sort_routes(&mut cfg.model_routes);
 
         if should_touch_rule {
             if matches!(classification_enabled, Some(false)) {
@@ -668,7 +872,8 @@ impl ModelRoutingConfigTool {
                 "message": "Scenario route upserted",
                 "hint": hint,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -682,11 +887,9 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
-        let before_routes = cfg.providers.model_routes.len();
-        cfg.providers
-            .model_routes
-            .retain(|route| route.hint != hint);
-        let routes_removed = before_routes.saturating_sub(cfg.providers.model_routes.len());
+        let before_routes = cfg.model_routes.len();
+        cfg.model_routes.retain(|route| route.hint != hint);
+        let routes_removed = before_routes.saturating_sub(cfg.model_routes.len());
 
         let mut rules_removed = 0usize;
         if remove_classification {
@@ -701,7 +904,7 @@ impl ModelRoutingConfigTool {
             anyhow::bail!("No scenario found for hint '{hint}'");
         }
 
-        Self::normalize_and_sort_routes(&mut cfg.providers.model_routes);
+        Self::normalize_and_sort_routes(&mut cfg.model_routes);
         Self::normalize_and_sort_rules(&mut cfg.query_classification.rules);
         cfg.query_classification.enabled = !cfg.query_classification.rules.is_empty();
 
@@ -715,113 +918,403 @@ impl ModelRoutingConfigTool {
                 "routes_removed": routes_removed,
                 "classification_rules_removed": rules_removed,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
 
     async fn handle_upsert_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let name = Self::parse_non_empty_string(args, "name")?;
-        let provider = Self::parse_non_empty_string(args, "provider")?;
-        let model = Self::parse_non_empty_string(args, "model")?;
-
-        let system_prompt_update = Self::parse_optional_string_update(args, "system_prompt")?;
-        let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
-        let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
+        let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
+        let provider_ref_parts = model_provider.split_once('.');
+        let model = if provider_ref_parts.is_some() {
+            if args.get("model").is_some() {
+                anyhow::bail!(
+                    "'model' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            None
+        } else {
+            Some(Self::parse_non_empty_string(args, "model")?)
+        };
+        let api_key_update = if provider_ref_parts.is_some() {
+            if args.get("api_key").is_some() {
+                anyhow::bail!(
+                    "'api_key' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            MaybeSet::Unset
+        } else {
+            Self::parse_optional_string_update(args, "api_key")?
+        };
+        let temperature_update = if provider_ref_parts.is_some() {
+            if args.get("temperature").is_some() {
+                anyhow::bail!(
+                    "'temperature' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            MaybeSet::Unset
+        } else {
+            Self::parse_optional_f64_update(args, "temperature")?
+        };
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
         let max_iterations_update = Self::parse_optional_usize_update(args, "max_iterations")?;
         let agentic_update = Self::parse_optional_bool(args, "agentic")?;
 
-        let allowed_tools_update = if let Some(raw) = args.get("allowed_tools") {
-            Some(Self::parse_string_list(raw, "allowed_tools")?)
+        let allowed_tools_update = match args.get("allowed_tools") {
+            None => MaybeSet::Unset,
+            Some(raw) if raw.is_null() => MaybeSet::Null,
+            Some(raw) => MaybeSet::Set(Self::parse_string_list(raw, "allowed_tools")?),
+        };
+
+        let deny_all_tools_update = Self::parse_optional_bool(args, "deny_all_tools")?;
+        if deny_all_tools_update == Some(true)
+            && let MaybeSet::Set(tools) = &allowed_tools_update
+            && !tools.is_empty()
+        {
+            anyhow::bail!(
+                "'deny_all_tools' cannot be combined with a non-empty 'allowed_tools' list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
+            );
+        }
+
+        let delegate_same_risk_profile_update =
+            Self::parse_optional_bool(args, "delegate_same_risk_profile")?;
+        let delegates_update = if let Some(raw) = args.get("delegates") {
+            Some(Self::parse_delegate_targets(raw, "delegates")?)
         } else {
             None
         };
 
+        let risk_update_requested =
+            !matches!(&allowed_tools_update, MaybeSet::Unset) || deny_all_tools_update.is_some();
+        let runtime_update_requested = !matches!(&max_depth_update, MaybeSet::Unset)
+            || !matches!(&max_iterations_update, MaybeSet::Unset)
+            || agentic_update.is_some();
+        let delegates_update_requested = delegates_update.is_some();
+
+        zeroclaw_config::migration::ensure_disk_at_current_version(&self.config.config_path)?;
         let mut cfg = self.load_config_without_env()?;
+        let existing_agent = cfg.agents.get(&name).cloned();
 
-        let mut next_agent = cfg
-            .agents
-            .get(&name)
-            .cloned()
-            .unwrap_or(DelegateAgentConfig {
-                provider: provider.clone(),
-                model: model.clone(),
-                system_prompt: None,
-                api_key: None,
-                temperature: None,
-                max_depth: DEFAULT_AGENT_MAX_DEPTH,
-                agentic: false,
-                allowed_tools: Vec::new(),
-                max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
-                timeout_secs: None,
-                agentic_timeout_secs: None,
-                skills_directory: None,
-                memory_namespace: None,
-            });
-
-        next_agent.provider = provider;
-        next_agent.model = model;
-
-        match system_prompt_update {
-            MaybeSet::Set(value) => next_agent.system_prompt = Some(value),
-            MaybeSet::Null => next_agent.system_prompt = None,
-            MaybeSet::Unset => {}
-        }
-
-        match api_key_update {
-            MaybeSet::Set(value) => next_agent.api_key = Some(value),
-            MaybeSet::Null => next_agent.api_key = None,
-            MaybeSet::Unset => {}
-        }
-
-        match temperature_update {
-            MaybeSet::Set(value) => {
-                if !(0.0..=2.0).contains(&value) {
-                    anyhow::bail!("'temperature' must be between 0.0 and 2.0");
-                }
-                next_agent.temperature = Some(value);
+        // Validate the provider route before mutating any provider, profile, or agent state.
+        let agent_model_provider_ref = if let Some((family, alias)) = provider_ref_parts {
+            if !zeroclaw_config::providers::ModelProviders::slot_names().contains(&family) {
+                Self::reject_unknown_model_provider_family(family, &name)?;
             }
-            MaybeSet::Null => next_agent.temperature = None,
-            MaybeSet::Unset => {}
-        }
+            if cfg.providers.models.find(family, alias).is_none() {
+                anyhow::bail!(
+                    "model_provider ref `{model_provider}` is not configured in ModelProviders"
+                );
+            }
+            model_provider.clone()
+        } else {
+            if !zeroclaw_config::providers::ModelProviders::slot_names()
+                .contains(&model_provider.as_str())
+            {
+                Self::reject_unknown_model_provider_family(&model_provider, &name)?;
+            }
+            format!("{model_provider}.{name}")
+        };
 
-        match max_depth_update {
-            MaybeSet::Set(value) => next_agent.max_depth = value,
-            MaybeSet::Null => next_agent.max_depth = DEFAULT_AGENT_MAX_DEPTH,
-            MaybeSet::Unset => {}
+        // Validate all bounded updates before mutating the loaded config.
+        if let MaybeSet::Set(value) = &temperature_update
+            && !(0.0..=2.0).contains(value)
+        {
+            anyhow::bail!("'temperature' must be between 0.0 and 2.0");
         }
-
-        match max_iterations_update {
-            MaybeSet::Set(value) => next_agent.max_iterations = value,
-            MaybeSet::Null => next_agent.max_iterations = DEFAULT_AGENT_MAX_ITERATIONS,
-            MaybeSet::Unset => {}
+        if let MaybeSet::Set(iters) = &max_iterations_update
+            && *iters == 0
+        {
+            anyhow::bail!("'max_iterations' must be greater than 0");
         }
-
-        if let Some(agentic) = agentic_update {
-            next_agent.agentic = agentic;
-        }
-
-        if let Some(allowed_tools) = allowed_tools_update {
-            next_agent.allowed_tools = allowed_tools;
-        }
-
-        if next_agent.max_depth == 0 {
+        if let MaybeSet::Set(depth) = &max_depth_update
+            && *depth == 0
+        {
             anyhow::bail!("'max_depth' must be greater than 0");
         }
 
-        if next_agent.max_iterations == 0 {
-            anyhow::bail!("'max_iterations' must be greater than 0");
+        let mut risk_profile_update = None;
+        let mut risk_profile_is_new = false;
+        let next_risk_profile = if let Some(agent) = existing_agent.as_ref() {
+            let stored_current = agent.risk_profile.as_str();
+            let current = stored_current.trim();
+            if risk_update_requested {
+                let mut profile = cfg.risk_profiles.get(current).cloned().ok_or_else(|| {
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                        "tool-model-routing-config-error-missing-risk-profile",
+                        &[("agent", &name), ("profile", current)],
+                    ))
+                })?;
+
+                if current == name {
+                    if Self::risk_profile_is_shared(&cfg, current, &name) {
+                        anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                            "tool-model-routing-config-error-shared-risk-profile",
+                            &[("profile", current)],
+                        ));
+                    }
+                } else if cfg.risk_profiles.contains_key(&name) {
+                    anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                        "tool-model-routing-config-error-risk-profile-collision",
+                        &[("agent", &name), ("profile", &name)],
+                    ));
+                } else {
+                    risk_profile_is_new = true;
+                }
+
+                match &allowed_tools_update {
+                    MaybeSet::Set(tools) => {
+                        profile.allowed_tools = tools.clone();
+                        profile.deny_all_tools = false;
+                    }
+                    MaybeSet::Null => {
+                        profile.allowed_tools.clear();
+                        profile.deny_all_tools = false;
+                    }
+                    MaybeSet::Unset => {}
+                }
+                if let Some(deny_all) = deny_all_tools_update {
+                    profile.deny_all_tools = deny_all;
+                    if deny_all {
+                        profile.allowed_tools.clear();
+                    }
+                }
+                risk_profile_update = Some(profile);
+                name.clone()
+            } else {
+                stored_current.to_string()
+            }
+        } else {
+            let profile_exists = cfg.risk_profiles.contains_key(&name);
+            if risk_update_requested && Self::risk_profile_is_shared(&cfg, &name, &name) {
+                anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-shared-risk-profile",
+                    &[("profile", &name)],
+                ));
+            }
+
+            if risk_update_requested || !profile_exists {
+                let mut profile = cfg.risk_profiles.get(&name).cloned().unwrap_or_default();
+                match &allowed_tools_update {
+                    MaybeSet::Set(tools) => {
+                        profile.allowed_tools = tools.clone();
+                        profile.deny_all_tools = false;
+                    }
+                    MaybeSet::Null => {
+                        profile.allowed_tools.clear();
+                        profile.deny_all_tools = false;
+                    }
+                    MaybeSet::Unset => {}
+                }
+                if let Some(deny_all) = deny_all_tools_update {
+                    profile.deny_all_tools = deny_all;
+                    if deny_all {
+                        profile.allowed_tools.clear();
+                    }
+                }
+                risk_profile_is_new = !profile_exists;
+                risk_profile_update = Some(profile);
+            }
+            name.clone()
+        };
+
+        let mut runtime_profile_update = None;
+        let mut runtime_profile_is_new = false;
+        let next_runtime_profile = if let Some(agent) = existing_agent.as_ref() {
+            let stored_current = agent.runtime_profile.as_str();
+            let current = stored_current.trim();
+            if runtime_update_requested {
+                let mut profile = cfg.runtime_profiles.get(current).cloned().ok_or_else(|| {
+                    anyhow::Error::msg(crate::i18n::get_required_tool_string_with_args(
+                        "tool-model-routing-config-error-missing-runtime-profile",
+                        &[("agent", &name), ("profile", current)],
+                    ))
+                })?;
+
+                if current == name {
+                    if Self::runtime_profile_is_shared(&cfg, current, &name) {
+                        anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                            "tool-model-routing-config-error-shared-runtime-profile",
+                            &[("profile", current)],
+                        ));
+                    }
+                } else if cfg.runtime_profiles.contains_key(&name) {
+                    anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                        "tool-model-routing-config-error-runtime-profile-collision",
+                        &[("agent", &name), ("profile", &name)],
+                    ));
+                } else {
+                    runtime_profile_is_new = true;
+                }
+
+                if let Some(agentic) = agentic_update {
+                    profile.agentic = agentic;
+                }
+                match &max_iterations_update {
+                    MaybeSet::Set(iters) => profile.max_tool_iterations = *iters,
+                    MaybeSet::Null => profile.max_tool_iterations = DEFAULT_AGENT_MAX_ITERATIONS,
+                    MaybeSet::Unset => {}
+                }
+                match &max_depth_update {
+                    MaybeSet::Set(depth) => profile.max_delegation_depth = *depth,
+                    MaybeSet::Null => profile.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH,
+                    MaybeSet::Unset => {}
+                }
+                runtime_profile_update = Some(profile);
+                name.clone()
+            } else {
+                stored_current.to_string()
+            }
+        } else {
+            let profile_exists = cfg.runtime_profiles.contains_key(&name);
+            if runtime_update_requested && Self::runtime_profile_is_shared(&cfg, &name, &name) {
+                anyhow::bail!(crate::i18n::get_required_tool_string_with_args(
+                    "tool-model-routing-config-error-shared-runtime-profile",
+                    &[("profile", &name)],
+                ));
+            }
+
+            if runtime_update_requested || !profile_exists {
+                let mut profile = cfg.runtime_profiles.get(&name).cloned().unwrap_or_default();
+                if let Some(agentic) = agentic_update {
+                    profile.agentic = agentic;
+                }
+                match &max_iterations_update {
+                    MaybeSet::Set(iters) => profile.max_tool_iterations = *iters,
+                    MaybeSet::Null => profile.max_tool_iterations = DEFAULT_AGENT_MAX_ITERATIONS,
+                    MaybeSet::Unset if !profile_exists => {
+                        profile.max_tool_iterations = DEFAULT_AGENT_MAX_ITERATIONS
+                    }
+                    MaybeSet::Unset => {}
+                }
+                match &max_depth_update {
+                    MaybeSet::Set(depth) => profile.max_delegation_depth = *depth,
+                    MaybeSet::Null => profile.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH,
+                    MaybeSet::Unset if !profile_exists => {
+                        profile.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH
+                    }
+                    MaybeSet::Unset => {}
+                }
+                runtime_profile_is_new = !profile_exists;
+                runtime_profile_update = Some(profile);
+            }
+            name.clone()
+        };
+
+        // Bare families synthesize providers.models[family][agent] from inline params.
+        if let Some(model) = model {
+            let provider_is_new = cfg.providers.models.find(&model_provider, &name).is_none();
+            let provider_entry = cfg
+                .providers
+                .models
+                .ensure(&model_provider, &name)
+                .ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "unknown model_provider type `{model_provider}`. no typed slot in ModelProviders"
+                    ))
+                })?;
+            provider_entry.model = Some(model);
+            match &api_key_update {
+                MaybeSet::Set(v) => provider_entry.api_key = Some(v.clone()),
+                MaybeSet::Null => provider_entry.api_key = None,
+                MaybeSet::Unset => {}
+            }
+            match &temperature_update {
+                MaybeSet::Set(value) => provider_entry.temperature = Some(*value),
+                MaybeSet::Null => provider_entry.temperature = None,
+                MaybeSet::Unset => {}
+            }
+
+            if provider_is_new {
+                cfg.mark_dirty(&format!("providers.models.{model_provider}.{name}"));
+            } else {
+                cfg.mark_dirty(&format!("providers.models.{model_provider}.{name}.model"));
+                if !matches!(&api_key_update, MaybeSet::Unset) {
+                    cfg.mark_dirty(&format!("providers.models.{model_provider}.{name}.api_key"));
+                }
+                if !matches!(&temperature_update, MaybeSet::Unset) {
+                    cfg.mark_dirty(&format!(
+                        "providers.models.{model_provider}.{name}.temperature"
+                    ));
+                }
+            }
         }
 
-        if next_agent.agentic && next_agent.allowed_tools.is_empty() {
-            anyhow::bail!(
-                "Agent '{name}' has agentic=true but allowed_tools is empty. Set allowed_tools or disable agentic mode."
-            );
+        if let Some(profile) = risk_profile_update {
+            if risk_profile_is_new {
+                Self::mark_serialized_profile_leaves(
+                    &mut cfg,
+                    &format!("risk_profiles.{name}"),
+                    &profile,
+                )?;
+            } else {
+                if !matches!(&allowed_tools_update, MaybeSet::Unset) {
+                    cfg.mark_dirty(&format!("risk_profiles.{name}.allowed_tools"));
+                    cfg.mark_dirty(&format!("risk_profiles.{name}.deny_all_tools"));
+                }
+                if deny_all_tools_update.is_some() {
+                    cfg.mark_dirty(&format!("risk_profiles.{name}.deny_all_tools"));
+                    if deny_all_tools_update == Some(true) {
+                        cfg.mark_dirty(&format!("risk_profiles.{name}.allowed_tools"));
+                    }
+                }
+            }
+            cfg.risk_profiles.insert(name.clone(), profile);
         }
 
-        cfg.agents.insert(name.clone(), next_agent);
-        cfg.save().await?;
+        if let Some(profile) = runtime_profile_update {
+            if runtime_profile_is_new {
+                Self::mark_serialized_profile_leaves(
+                    &mut cfg,
+                    &format!("runtime_profiles.{name}"),
+                    &profile,
+                )?;
+            } else {
+                if agentic_update.is_some() {
+                    cfg.mark_dirty(&format!("runtime_profiles.{name}.agentic"));
+                }
+                if !matches!(&max_iterations_update, MaybeSet::Unset) {
+                    cfg.mark_dirty(&format!("runtime_profiles.{name}.max_tool_iterations"));
+                }
+                if !matches!(&max_depth_update, MaybeSet::Unset) {
+                    cfg.mark_dirty(&format!("runtime_profiles.{name}.max_delegation_depth"));
+                }
+            }
+            cfg.runtime_profiles.insert(name.clone(), profile);
+        }
+
+        let agent_is_new = existing_agent.is_none();
+        let next_agent = cfg.agents.entry(name.clone()).or_default();
+        next_agent.model_provider = agent_model_provider_ref.into();
+        next_agent.risk_profile = next_risk_profile.into();
+        next_agent.runtime_profile = next_runtime_profile.into();
+        if let Some(same_profile) = delegate_same_risk_profile_update {
+            next_agent.delegate_same_risk_profile = same_profile;
+        }
+        if let Some(delegates) = delegates_update {
+            next_agent.delegates = delegates;
+        }
+
+        if agent_is_new {
+            cfg.mark_dirty(&format!("agents.{name}"));
+        } else {
+            cfg.mark_dirty(&format!("agents.{name}.model_provider"));
+            if risk_update_requested {
+                cfg.mark_dirty(&format!("agents.{name}.risk_profile"));
+            }
+            if runtime_update_requested {
+                cfg.mark_dirty(&format!("agents.{name}.runtime_profile"));
+            }
+            if delegate_same_risk_profile_update.is_some() {
+                cfg.mark_dirty(&format!("agents.{name}.delegate_same_risk_profile"));
+            }
+            if delegates_update_requested {
+                cfg.mark_dirty(&format!("agents.{name}.delegates"));
+            }
+        }
+
+        cfg.save_dirty().await?;
 
         Ok(ToolResult {
             success: true,
@@ -829,7 +1322,8 @@ impl ModelRoutingConfigTool {
                 "message": "Delegate agent upserted",
                 "name": name,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -839,7 +1333,7 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
         if cfg.agents.remove(&name).is_none() {
-            anyhow::bail!("No delegate agent found with name '{name}'");
+            anyhow::bail!("No aliased agent found with name '{name}'");
         }
 
         cfg.save().await?;
@@ -847,10 +1341,11 @@ impl ModelRoutingConfigTool {
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "message": "Delegate agent removed",
+                "message": "Aliased agent removed",
                 "name": name,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -863,10 +1358,37 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn description(&self) -> &str {
-        "Manage default model settings, scenario-based provider/model routes, classification rules, and delegate sub-agent profiles"
+        "Manage default model settings, scenario-based model_provider/model routes, classification rules, and aliased agent profiles"
     }
 
     fn parameters_schema(&self) -> Value {
+        let delegates_schema = json!({
+            "description": "Explicit delegate roster. Accepts a comma-separated string, string array, or objects with {agent, mode}; mode is bounded or independent.",
+            "oneOf": [
+                {"type": "string"},
+                {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["agent"],
+                                "properties": {
+                                    "agent": {"type": "string", "minLength": 1},
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["bounded", "independent"],
+                                        "default": "bounded"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
         json!({
             "type": "object",
             "properties": {
@@ -887,13 +1409,13 @@ impl Tool for ModelRoutingConfigTool {
                     "type": "string",
                     "description": "Scenario hint name (for example: conversation, coding, reasoning)"
                 },
-                "provider": {
+                "model_provider": {
                     "type": "string",
-                    "description": "Provider for set_default/upsert_scenario/upsert_agent"
+                    "description": "ModelProvider for set_default/upsert_scenario/upsert_agent"
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for set_default/upsert_scenario/upsert_agent"
+                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref"
                 },
                 "temperature": {
                     "type": ["number", "null"],
@@ -901,7 +1423,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "api_key": {
                     "type": ["string", "null"],
-                    "description": "Optional API key override for scenario route or delegate agent"
+                    "description": "Optional API key override for scenario route or aliased agent"
                 },
                 "keywords": {
                     "description": "Classification keywords for upsert_scenario (string or string array)",
@@ -941,33 +1463,39 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Delegate sub-agent name for upsert_agent/remove_agent"
-                },
-                "system_prompt": {
-                    "type": ["string", "null"],
-                    "description": "Optional system prompt override for delegate agent"
+                    "description": "Aliased agent name for upsert_agent/remove_agent"
                 },
                 "max_depth": {
                     "type": ["integer", "null"],
                     "minimum": 1,
-                    "description": "Delegate max recursion depth"
+                    "description": "Delegate max recursion depth. Omit to preserve the current value; null restores the compatibility default of 3. An explicit update isolates an existing agent's runtime profile before mutation."
                 },
                 "agentic": {
                     "type": "boolean",
-                    "description": "Enable tool-call loop mode for delegate agent"
+                    "description": "Enable tool-call loop mode for aliased agent. Omit to preserve the current value. An explicit update isolates an existing agent's runtime profile before mutation."
                 },
                 "allowed_tools": {
-                    "description": "Allowed tools for agentic delegate mode (string or string array)",
+                    "description": "Risk-profile tool allowlist. Omit to leave the current value and profile reference unchanged; null or [] clears to unrestricted; a nonempty array is the explicit allowlist. An explicit update isolates an existing agent's risk profile before mutation. Use deny_all_tools for an explicit deny-all.",
                     "oneOf": [
+                        {"type": "null"},
                         {"type": "string"},
                         {"type": "array", "items": {"type": "string"}}
                     ]
                 },
+                "deny_all_tools": {
+                    "type": "boolean",
+                    "description": "Explicit deny-all for the agent's isolated risk profile: no tool may be called. Cannot be combined with a nonempty allowed_tools."
+                },
                 "max_iterations": {
                     "type": ["integer", "null"],
                     "minimum": 1,
-                    "description": "Maximum tool-call iterations for agentic delegate mode"
-                }
+                    "description": "Maximum tool-call iterations for agentic delegate mode. Omit to preserve the current value; null restores the compatibility default of 10. An explicit update isolates an existing agent's runtime profile before mutation."
+                },
+                "delegate_same_risk_profile": {
+                    "type": "boolean",
+                    "description": "Auto-allow delegation to same-risk-profile peers (default true). Set false to restrict reach to the explicit delegates list."
+                },
+                "delegates": delegates_schema
             },
             "additionalProperties": false
         })
@@ -995,7 +1523,9 @@ impl Tool for ModelRoutingConfigTool {
                     "remove_scenario" => Box::pin(self.handle_remove_scenario(&args)).await,
                     "upsert_agent" => Box::pin(self.handle_upsert_agent(&args)).await,
                     "remove_agent" => Box::pin(self.handle_remove_agent(&args)).await,
-                    _ => unreachable!("validated above"),
+                    _ => Err(anyhow::Error::msg(format!(
+                        "Unknown model-routing action after validation: {action}"
+                    ))),
                 }
             }
             _ => anyhow::bail!(
@@ -1007,7 +1537,7 @@ impl Tool for ModelRoutingConfigTool {
             Ok(outcome) => Ok(outcome),
             Err(error) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error.to_string()),
             }),
         }
@@ -1020,6 +1550,7 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
+    use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig, RuntimeProfileConfig};
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -1039,7 +1570,7 @@ mod tests {
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
@@ -1047,15 +1578,26 @@ mod tests {
         Arc::new(config)
     }
 
+    fn read_saved_provider_entry(
+        cfg_path: &std::path::Path,
+        family: &str,
+        alias: &str,
+    ) -> Option<zeroclaw_config::schema::ModelProviderConfig> {
+        let contents = std::fs::read_to_string(cfg_path).ok()?;
+        let cfg = zeroclaw_config::migration::migrate_to_current(&contents).ok()?;
+        cfg.providers.models.find(family, alias).cloned()
+    }
+
     #[tokio::test]
     async fn set_default_updates_provider_model_and_temperature() {
         let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "kimi",
+                "model_provider": "moonshot",
                 "model": "moonshot-v1-8k",
                 "temperature": 0.2
             }))
@@ -1063,19 +1605,10 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(
-            output["config"]["default"]["provider"].as_str(),
-            Some("kimi")
-        );
-        assert_eq!(
-            output["config"]["default"]["model"].as_str(),
-            Some("moonshot-v1-8k")
-        );
-        assert_eq!(
-            output["config"]["default"]["temperature"].as_f64(),
-            Some(0.2)
-        );
+        let entry = read_saved_provider_entry(&cfg_path, "moonshot", "default")
+            .expect("set_default must materialize the moonshot.default slot");
+        assert_eq!(entry.model.as_deref(), Some("moonshot-v1-8k"));
+        assert_eq!(entry.temperature, Some(0.2));
     }
 
     #[tokio::test]
@@ -1087,7 +1620,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_scenario",
                 "hint": "coding",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "classification_enabled": true,
                 "keywords": ["code", "bug", "refactor"],
@@ -1108,7 +1641,7 @@ mod tests {
         let scenarios = output["scenarios"].as_array().unwrap();
         assert!(scenarios.iter().any(|item| {
             item["hint"] == json!("coding")
-                && item["provider"] == json!("openai")
+                && item["model_provider"] == json!("openai")
                 && item["model"] == json!("gpt-5.3-codex")
         }));
     }
@@ -1122,7 +1655,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_scenario",
                 "hint": "coding",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "classification_enabled": true,
                 "keywords": ["code"]
@@ -1154,7 +1687,7 @@ mod tests {
             .execute(json!({
                 "action": "upsert_agent",
                 "name": "coder",
-                "provider": "openai",
+                "model_provider": "openai",
                 "model": "gpt-5.3-codex",
                 "agentic": true,
                 "allowed_tools": ["file_read", "file_write", "shell"],
@@ -1166,9 +1699,21 @@ mod tests {
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
-        assert_eq!(output["agents"]["coder"]["provider"], json!("openai"));
-        assert_eq!(output["agents"]["coder"]["model"], json!("gpt-5.3-codex"));
+        // V3 surfaces the dotted alias ref on the agent. The actual model
+        // string lives under model_providers.openai.coder (synthesized
+        // from the `model` upsert arg).
+        assert_eq!(
+            output["agents"]["coder"]["model_provider"],
+            json!("openai.coder")
+        );
+        assert_eq!(output["agents"]["coder"]["risk_profile"], json!("coder"));
+        assert_eq!(output["agents"]["coder"]["runtime_profile"], json!("coder"));
         assert_eq!(output["agents"]["coder"]["agentic"], json!(true));
+        assert_eq!(output["agents"]["coder"]["max_tool_iterations"], json!(6));
+        assert_eq!(
+            output["agents"]["coder"]["allowed_tools"],
+            json!(["file_read", "file_write", "shell"])
+        );
 
         let remove = tool
             .execute(json!({
@@ -1185,6 +1730,852 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_agent_provider_only_preserves_profiles_limits_and_toml() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: cfg_path.clone(),
+            ..Config::default()
+        };
+        config.secrets.encrypt = false;
+
+        for (alias, model) in [("oldroute", "old-model"), ("newroute", "new-model")] {
+            config
+                .providers
+                .models
+                .ensure("custom", alias)
+                .unwrap()
+                .model = Some(model.to_string());
+        }
+        config.risk_profiles.insert(
+            "yolo".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                workspace_only: false,
+                allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "unbounded".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 600,
+                max_delegation_depth: 8,
+                max_actions_per_hour: u32::MAX,
+                max_cost_per_day_cents: u32::MAX,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "experiment_ox".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.oldroute".into(),
+                risk_profile: "yolo".into(),
+                runtime_profile: "unbounded".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let serialized = std::fs::read_to_string(&cfg_path).unwrap();
+        let with_agent_sentinels = serialized.replacen(
+            "[agents.experiment_ox]\n",
+            "[agents.experiment_ox]\n# preserve agent comment\noperator_extension = \"keep-me\"\n",
+            1,
+        );
+        assert_ne!(
+            serialized, with_agent_sentinels,
+            "fixture must locate the agent table"
+        );
+        let before = with_agent_sentinels;
+        std::fs::write(&cfg_path, &before).unwrap();
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "experiment_ox",
+                "model_provider": "custom.newroute"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let after = std::fs::read_to_string(&cfg_path).unwrap();
+        let expected = before.replacen(
+            "model_provider = \"custom.oldroute\"",
+            "model_provider = \"custom.newroute\"",
+            1,
+        );
+        assert_ne!(before, expected, "fixture must locate the provider ref");
+        assert_eq!(after, expected, "only the requested leaf may change");
+
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&after).unwrap();
+        let agent = reloaded.agents.get("experiment_ox").unwrap();
+        assert_eq!(agent.risk_profile.as_str(), "yolo");
+        assert_eq!(agent.runtime_profile.as_str(), "unbounded");
+        let runtime = reloaded.runtime_profiles.get("unbounded").unwrap();
+        assert!(runtime.agentic);
+        assert_eq!(runtime.max_tool_iterations, 600);
+        assert_eq!(runtime.max_delegation_depth, 8);
+        assert!(!reloaded.risk_profiles.contains_key("experiment_ox"));
+        assert!(!reloaded.runtime_profiles.contains_key("experiment_ox"));
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_isolation_preserves_explicit_empty_security_lists() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: cfg_path.clone(),
+            ..Config::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .providers
+            .models
+            .ensure("custom", "route")
+            .unwrap()
+            .model = Some("model".to_string());
+        config.risk_profiles.insert(
+            "restricted".to_string(),
+            RiskProfileConfig {
+                allowed_commands: Vec::new(),
+                auto_approve: Vec::new(),
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .runtime_profiles
+            .insert("runtime".to_string(), RuntimeProfileConfig::default());
+        for agent_name in ["coder", "observer"] {
+            config.agents.insert(
+                agent_name.to_string(),
+                AliasedAgentConfig {
+                    model_provider: "custom.route".into(),
+                    risk_profile: "restricted".into(),
+                    runtime_profile: "runtime".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.save().await.unwrap();
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route",
+                "deny_all_tools": false
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let saved = std::fs::read_to_string(&cfg_path).unwrap();
+        let reloaded = zeroclaw_config::migration::migrate_to_current(&saved).unwrap();
+        let coder = reloaded.agents.get("coder").unwrap();
+        assert_eq!(coder.risk_profile.as_str(), "coder");
+        let isolated = reloaded.risk_profiles.get("coder").unwrap();
+        assert!(isolated.allowed_commands.is_empty());
+        assert!(isolated.auto_approve.is_empty());
+        assert!(saved.contains("allowed_commands = []"));
+        assert!(saved.contains("auto_approve = []"));
+        assert_eq!(
+            reloaded
+                .agents
+                .get("observer")
+                .unwrap()
+                .risk_profile
+                .as_str(),
+            "restricted"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_isolates_runtime_profile_and_preserves_omitted_limits() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: cfg_path.clone(),
+            ..Config::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .providers
+            .models
+            .ensure("custom", "route")
+            .unwrap()
+            .model = Some("model".to_string());
+        let original = RuntimeProfileConfig {
+            agentic: false,
+            max_tool_iterations: 600,
+            max_delegation_depth: 8,
+            max_actions_per_hour: 42,
+            max_cost_per_day_cents: 900,
+            ..RuntimeProfileConfig::default()
+        };
+        config
+            .runtime_profiles
+            .insert("unbounded".to_string(), original.clone());
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.route".into(),
+                runtime_profile: "unbounded".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.save().await.unwrap();
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route",
+                "max_iterations": 700
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+
+        let saved = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let coder = saved.agents.get("coder").unwrap();
+        assert_eq!(coder.runtime_profile.as_str(), "coder");
+        let isolated = saved.runtime_profiles.get("coder").unwrap();
+        assert_eq!(isolated.max_tool_iterations, 700);
+        assert_eq!(isolated.max_delegation_depth, 8);
+        assert_eq!(isolated.max_actions_per_hour, 42);
+        assert_eq!(isolated.max_cost_per_day_cents, 900);
+        let unchanged = saved.runtime_profiles.get("unbounded").unwrap();
+        assert_eq!(unchanged.agentic, original.agentic);
+        assert_eq!(unchanged.max_tool_iterations, original.max_tool_iterations);
+        assert_eq!(
+            unchanged.max_delegation_depth,
+            original.max_delegation_depth
+        );
+        assert_eq!(
+            unchanged.max_actions_per_hour,
+            original.max_actions_per_hour
+        );
+        assert_eq!(
+            unchanged.max_cost_per_day_cents,
+            original.max_cost_per_day_cents
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_profile_collision_or_shared_mutation_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: cfg_path.clone(),
+            ..Config::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .providers
+            .models
+            .ensure("custom", "route")
+            .unwrap()
+            .model = Some("model".to_string());
+        config
+            .risk_profiles
+            .insert("shared".to_string(), RiskProfileConfig::default());
+        config
+            .risk_profiles
+            .insert("coder".to_string(), RiskProfileConfig::default());
+        config
+            .runtime_profiles
+            .insert("runtime".to_string(), RuntimeProfileConfig::default());
+        config
+            .runtime_profiles
+            .insert("coder".to_string(), RuntimeProfileConfig::default());
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.route".into(),
+                risk_profile: "shared".into(),
+                runtime_profile: "runtime".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route",
+                "allowed_tools": ["file_read"]
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("refusing to overwrite")),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), before);
+
+        let runtime_collision = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route",
+                "agentic": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!runtime_collision.success);
+        assert!(
+            runtime_collision
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("refusing to overwrite")),
+            "{:?}",
+            runtime_collision.error
+        );
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), before);
+
+        let shared_tmp = TempDir::new().unwrap();
+        let shared_path = shared_tmp.path().join("config.toml");
+        let mut shared_config = Config {
+            data_dir: shared_tmp.path().join("data"),
+            config_path: shared_path.clone(),
+            ..Config::default()
+        };
+        shared_config.secrets.encrypt = false;
+        shared_config
+            .providers
+            .models
+            .ensure("custom", "route")
+            .unwrap()
+            .model = Some("model".to_string());
+        shared_config
+            .risk_profiles
+            .insert("coder".to_string(), RiskProfileConfig::default());
+        shared_config
+            .runtime_profiles
+            .insert("coder".to_string(), RuntimeProfileConfig::default());
+        for agent_name in ["coder", "observer"] {
+            shared_config.agents.insert(
+                agent_name.to_string(),
+                AliasedAgentConfig {
+                    model_provider: "custom.route".into(),
+                    risk_profile: if agent_name == "observer" {
+                        " coder ".into()
+                    } else {
+                        "coder".into()
+                    },
+                    runtime_profile: if agent_name == "coder" {
+                        " coder ".into()
+                    } else {
+                        "coder".into()
+                    },
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        shared_config.save().await.unwrap();
+        let shared_before = std::fs::read_to_string(&shared_path).unwrap();
+
+        let shared_tool = ModelRoutingConfigTool::new(Arc::new(shared_config), test_security());
+        let shared_risk_result = shared_tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route",
+                "allowed_tools": ["file_read"]
+            }))
+            .await
+            .unwrap();
+
+        assert!(!shared_risk_result.success);
+        assert!(
+            shared_risk_result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("shared by another agent")),
+            "{:?}",
+            shared_risk_result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(&shared_path).unwrap(),
+            shared_before
+        );
+
+        let shared_runtime_result = shared_tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route",
+                "agentic": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!shared_runtime_result.success);
+        assert!(
+            shared_runtime_result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("shared by another agent")),
+            "{:?}",
+            shared_runtime_result.error
+        );
+        assert_eq!(
+            std::fs::read_to_string(&shared_path).unwrap(),
+            shared_before
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_legacy_schema_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: cfg_path.clone(),
+            ..Config::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .providers
+            .models
+            .ensure("custom", "route")
+            .unwrap()
+            .model = Some("model".to_string());
+        config.save().await.unwrap();
+
+        let current = std::fs::read_to_string(&cfg_path).unwrap();
+        let legacy = current.replacen("schema_version = 3", "schema_version = 2", 1);
+        assert_ne!(current, legacy, "fixture must downgrade the schema label");
+        std::fs::write(&cfg_path, &legacy).unwrap();
+
+        let tool = ModelRoutingConfigTool::new(Arc::new(config), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.route"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("zeroclaw config migrate")),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), legacy);
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_explicit_null_restores_runtime_compatibility_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let created = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom",
+                "model": "model",
+                "agentic": true,
+                "max_iterations": 600,
+                "max_depth": 8
+            }))
+            .await
+            .unwrap();
+        assert!(created.success, "{:?}", created.error);
+
+        let reset = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.coder",
+                "max_iterations": null,
+                "max_depth": null
+            }))
+            .await
+            .unwrap();
+        assert!(reset.success, "{:?}", reset.error);
+
+        let saved = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let runtime = saved.runtime_profiles.get("coder").unwrap();
+        assert_eq!(runtime.max_tool_iterations, DEFAULT_AGENT_MAX_ITERATIONS);
+        assert_eq!(runtime.max_delegation_depth, DEFAULT_AGENT_MAX_DEPTH);
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_reuses_configured_dotted_provider_ref() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let provision = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "truefoundry",
+                "model_provider": "custom",
+                "model": "provider-model",
+                "temperature": 0.4
+            }))
+            .await
+            .unwrap();
+        assert!(provision.success, "{:?}", provision.error);
+
+        let provider_before = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("bare family upsert must create custom.truefoundry"),
+        )
+        .unwrap();
+
+        let reuse = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.truefoundry",
+                "allowed_tools": ["file_read"]
+            }))
+            .await
+            .unwrap();
+        assert!(reuse.success, "{:?}", reuse.error);
+
+        let provider_after = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("reused provider must remain configured"),
+        )
+        .unwrap();
+        assert_eq!(provider_after, provider_before);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(
+            output["agents"]["coder"]["model_provider"],
+            json!("custom.truefoundry")
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_invalid_provider_requests_without_mutation() {
+        let cases = [
+            ("unknown family", json!("unknown"), true),
+            ("unknown dotted family", json!("unknown.alias"), false),
+            ("missing dotted alias", json!("custom.missing"), false),
+            ("bare family without model", json!("custom"), false),
+        ];
+
+        for (case, model_provider, has_model) in cases {
+            let tmp = TempDir::new().unwrap();
+            let cfg_path = tmp.path().join("config.toml");
+            let tool =
+                ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+            let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+            let mut args = json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": model_provider
+            });
+            if has_model {
+                args["model"] = json!("model");
+            }
+
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success, "{case} unexpectedly succeeded");
+            assert_eq!(
+                std::fs::read_to_string(&cfg_path).unwrap(),
+                before,
+                "{case}"
+            );
+
+            let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+            let output: Value = serde_json::from_str(&get_result.output).unwrap();
+            assert!(output["agents"].as_object().unwrap().is_empty(), "{case}");
+            assert!(
+                read_saved_provider_entry(&cfg_path, "custom", "missing").is_none(),
+                "{case} must not create a provider alias"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_provider_mutations_on_reused_ref() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        for (name, model_provider) in [("truefoundry", "custom"), ("coder", "openai")] {
+            let result = tool
+                .execute(json!({
+                    "action": "upsert_agent",
+                    "name": name,
+                    "model_provider": model_provider,
+                    "model": "original-model"
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+        }
+
+        let before = std::fs::read_to_string(&cfg_path).unwrap();
+        let provider_before = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("provider setup must create custom.truefoundry"),
+        )
+        .unwrap();
+
+        for (field, value) in [
+            ("model", json!("replacement-model")),
+            ("api_key", json!("replacement-key")),
+            ("temperature", json!(1.2)),
+        ] {
+            let mut args = json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.truefoundry"
+            });
+            args[field] = value;
+
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success, "{field} unexpectedly accepted");
+            assert_eq!(
+                std::fs::read_to_string(&cfg_path).unwrap(),
+                before,
+                "{field}"
+            );
+            let provider_after = serde_json::to_value(
+                read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                    .expect("reused provider must remain configured"),
+            )
+            .unwrap();
+            assert_eq!(provider_after, provider_before, "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_allowed_tools_null_and_empty_clear_to_unrestricted() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let upsert = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(upsert.success, "{:?}", upsert.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.risk_profiles.get("coder").unwrap().allowed_tools,
+            vec!["shell".to_string()]
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+
+        let clear = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": null
+            }))
+            .await
+            .unwrap();
+        assert!(clear.success, "{:?}", clear.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg.risk_profiles
+                .get("coder")
+                .unwrap()
+                .allowed_tools
+                .is_empty(),
+            "null must restore unrestricted"
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+
+        let legacy_empty = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": []
+            }))
+            .await
+            .unwrap();
+        assert!(legacy_empty.success, "{:?}", legacy_empty.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg.risk_profiles
+                .get("coder")
+                .unwrap()
+                .allowed_tools
+                .is_empty(),
+            "[] is the legacy unrestricted state, not deny-all"
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_deny_all_tools_flag_and_contradiction_check() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let deny = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "deny_all_tools": true
+            }))
+            .await
+            .unwrap();
+        assert!(deny.success, "{:?}", deny.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let risk = cfg.risk_profiles.get("coder").unwrap();
+        assert!(risk.deny_all_tools, "deny_all_tools must be stored");
+        assert!(
+            risk.allowed_tools.is_empty(),
+            "deny_all_tools must not leave a stray allowlist behind"
+        );
+
+        // Re-allowing via a nonempty list clears the flag.
+        let allow = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(allow.success, "{:?}", allow.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let risk = cfg.risk_profiles.get("coder").unwrap();
+        assert!(!risk.deny_all_tools);
+        assert_eq!(risk.allowed_tools, vec!["shell".to_string()]);
+
+        // The contradictory combination fails loudly instead of one side
+        // silently winning.
+        let contradiction = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "deny_all_tools": true,
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(!contradiction.success, "must be rejected");
+        let err = contradiction.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("deny_all_tools"),
+            "error must name deny_all_tools, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_writes_delegate_roster_fields() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        // Create the explicit delegate target first so the roster names a
+        // real agent (snapshot/readback does not validate, but keep it real).
+        let _ = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "aaalore",
+                "model_provider": "openai",
+                "model": "gpt-5.3"
+            }))
+            .await
+            .unwrap();
+
+        let upsert = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "aaa",
+                "model_provider": "openai",
+                "model": "gpt-5.3",
+                "delegate_same_risk_profile": false,
+                "delegates": [{"agent": "aaalore", "mode": "independent"}]
+            }))
+            .await
+            .unwrap();
+        assert!(upsert.success, "{:?}", upsert.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(
+            output["agents"]["aaa"]["delegate_same_risk_profile"],
+            json!(false)
+        );
+        assert_eq!(
+            output["agents"]["aaa"]["delegates"],
+            json!([{"agent": "aaalore", "mode": "independent"}])
+        );
+    }
+
+    #[tokio::test]
     async fn read_only_mode_blocks_mutating_actions() {
         let tmp = TempDir::new().unwrap();
         let tool =
@@ -1193,7 +2584,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "openai"
+                "model_provider": "openai"
             }))
             .await
             .unwrap();
@@ -1204,34 +2595,29 @@ mod tests {
 
     #[tokio::test]
     async fn set_default_skips_probe_without_api_key() {
-        // When no API key is configured (test_config has none), the probe is
-        // skipped and any model string is accepted. This verifies the probe-
-        // skip path doesn't accidentally reject valid config changes.
         let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({
                 "action": "set_default",
-                "provider": "anthropic",
+                "model_provider": "anthropic",
                 "model": "totally-fake-model-12345"
             }))
             .await
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(
-            output["config"]["default"]["model"].as_str(),
-            Some("totally-fake-model-12345")
-        );
+        let entry = read_saved_provider_entry(&cfg_path, "anthropic", "default")
+            .expect("set_default must materialize the anthropic.default slot");
+        assert_eq!(entry.model.as_deref(), Some("totally-fake-model-12345"));
     }
 
     #[tokio::test]
     async fn set_default_temperature_only_skips_probe() {
-        // Temperature-only changes don't set a new model, so the probe should
-        // not fire at all (no provider/model to probe).
         let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
@@ -1243,10 +2629,8 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
-        let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(
-            output["config"]["default"]["temperature"].as_f64(),
-            Some(1.5)
-        );
+        let entry = read_saved_provider_entry(&cfg_path, "custom", "default")
+            .expect("temperature-only set_default must create the custom.default placeholder slot");
+        assert_eq!(entry.temperature, Some(1.5));
     }
 }

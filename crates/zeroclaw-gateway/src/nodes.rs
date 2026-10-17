@@ -1,17 +1,4 @@
 //! WebSocket endpoint for dynamic node discovery and capability advertisement.
-//!
-//! External processes/devices connect to `/ws/nodes` and advertise their
-//! capabilities at runtime. The gateway exposes these as dynamically available
-//! tools to the agent.
-//!
-//! ## Protocol
-//!
-//! ```text
-//! Node -> Gateway: {"type":"register","node_id":"phone-1","capabilities":[{"name":"camera.snap","description":"Take a photo","parameters":{...}}]}
-//! Gateway -> Node: {"type":"registered","node_id":"phone-1","capabilities_count":1}
-//! Gateway -> Node: {"type":"invoke","call_id":"uuid","capability":"camera.snap","args":{...}}
-//! Node -> Gateway: {"type":"result","call_id":"uuid","success":true,"output":"..."}
-//! ```
 
 use super::AppState;
 use axum::{
@@ -28,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq};
+
+pub mod mdns;
 
 /// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
 const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
@@ -167,13 +157,6 @@ enum NodeMessage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum GatewayMessage {
-    #[allow(dead_code)] // Serialized gateway protocol message
-    Registered {
-        node_id: String,
-        capabilities_count: usize,
-    },
-    #[allow(dead_code)] // Serialized gateway protocol message
-    Error { message: String },
     Invoke {
         call_id: String,
         capability: String,
@@ -227,36 +210,72 @@ fn extract_node_ws_token<'a>(
     None
 }
 
-/// GET /ws/nodes — WebSocket upgrade for node connections
+pub(crate) fn check_node_auth(
+    nodes_config: &zeroclaw_config::schema::NodesConfig,
+    pairing: &PairingGuard,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Option<(axum::http::StatusCode, &'static str)> {
+    if !nodes_config.enabled {
+        return Some((
+            axum::http::StatusCode::NOT_FOUND,
+            "Not Found — node discovery is disabled (set nodes.enabled=true to enable)",
+        ));
+    }
+    if let Some(ref expected_token) = nodes_config.auth_token {
+        // Fail-closed: a whitespace-only / empty configured token must not
+        // authenticate missing or arbitrary tokens (trimming both sides
+        // would produce `constant_time_eq("", "")` = true and bypass auth).
+        if expected_token.trim().is_empty() {
+            return Some((
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable — nodes.auth_token must not be empty or whitespace-only",
+            ));
+        }
+        let token = extract_node_ws_token(headers, query_token).unwrap_or("");
+        // SECURITY: route through `constant_time_eq` (not `==`) to prevent
+        // a remote timing attack that could leak `nodes.auth_token` one
+        // byte at a time. Both sides are `.trim()`-normalized to match
+        // the canonical pattern at
+        // `crates/zeroclaw-config/src/pairing.rs:139`.
+        if !constant_time_eq(token.trim(), expected_token.trim()) {
+            return Some((
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide a valid node auth token",
+            ));
+        }
+    } else if pairing.require_pairing() {
+        let token = extract_node_ws_token(headers, query_token).unwrap_or("");
+        if !pairing.is_authenticated(token) {
+            return Some((
+                axum::http::StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide Authorization header or ?token= query param",
+            ));
+        }
+    } else {
+        return Some((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable — node registration is disabled because no auth method is configured. \
+             Set nodes.auth_token OR enable gateway.require_pairing.",
+        ));
+    }
+    None
+}
+
 pub async fn handle_ws_nodes(
     State(state): State<AppState>,
     Query(params): Query<NodeWsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Auth: check node auth token if configured
-    let nodes_config = state.config.lock().nodes.clone();
-    if let Some(ref expected_token) = nodes_config.auth_token {
-        let token = extract_node_ws_token(&headers, params.token.as_deref()).unwrap_or("");
-        if token != expected_token {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide a valid node auth token",
-            )
-                .into_response();
-        }
-    }
-
-    // Fall back to pairing auth if no node-specific token
-    if nodes_config.auth_token.is_none() && state.pairing.require_pairing() {
-        let token = extract_node_ws_token(&headers, params.token.as_deref()).unwrap_or("");
-        if !state.pairing.is_authenticated(token) {
-            return (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization header or ?token= query param",
-            )
-                .into_response();
-        }
+    let nodes_config = state.config.read().nodes.clone();
+    if let Some((status, body)) = check_node_auth(
+        &nodes_config,
+        &state.pairing,
+        &headers,
+        params.token.as_deref(),
+    ) {
+        return (status, body).into_response();
     }
 
     // Echo sub-protocol if client requests it
@@ -289,7 +308,7 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
     let pending_clone = Arc::clone(&pending);
 
     // Task to forward invocations to the node via WebSocket
-    let send_task = tokio::spawn(async move {
+    let send_task = zeroclaw_spawn::spawn!(async move {
         while let Some(invocation) = invoke_rx.recv().await {
             let msg = GatewayMessage::Invoke {
                 call_id: invocation.call_id.clone(),
@@ -333,7 +352,12 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
             } => {
                 // Validate node_id
                 if node_id.is_empty() || node_id.len() > 128 {
-                    tracing::warn!("Node registration rejected: invalid node_id length");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Node registration rejected: invalid node_id length"
+                    );
                     continue;
                 }
 
@@ -345,18 +369,22 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
                 };
 
                 if registry.register(info) {
-                    tracing::info!("Node registered: {node_id} with {caps_count} capabilities");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(
+                                ::serde_json::json!({"node_id": node_id, "caps_count": caps_count})
+                            ),
+                        "Node registered: with capabilities"
+                    );
                     registered_node_id = Some(node_id.clone());
-
-                    // Send ack — we can't use `sender` here since it's moved
-                    // into the send task. Instead, send ack via the invoke channel
-                    // pattern isn't ideal. We'll use a workaround: send the ack
-                    // through a special invocation that the send task converts to
-                    // a registered message. For simplicity, we just log and the
-                    // ack is implicit in the protocol.
                 } else {
-                    tracing::warn!(
-                        "Node registration rejected: registry at capacity for {node_id}"
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"node_id": node_id})),
+                        "Node registration rejected: registry at capacity for"
                     );
                 }
             }
@@ -380,7 +408,12 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
     // Cleanup: unregister node on disconnect
     if let Some(node_id) = registered_node_id {
         registry.unregister(&node_id);
-        tracing::info!("Node disconnected and unregistered: {node_id}");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"node_id": node_id})),
+            "Node disconnected and unregistered"
+        );
     }
 
     send_task.abort();
@@ -389,6 +422,138 @@ async fn handle_node_socket(socket: WebSocket, registry: Arc<NodeRegistry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+    use zeroclaw_config::schema::NodesConfig;
+    use zeroclaw_runtime::security::pairing::PairingGuard;
+
+    // ── Auth matrix tests (via check_node_auth — no WS handshake required) ──
+
+    fn empty_headers() -> HeaderMap {
+        HeaderMap::new()
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        h
+    }
+
+    fn make_pairing(require: bool) -> PairingGuard {
+        PairingGuard::new(
+            require,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        )
+    }
+
+    #[test]
+    fn nodes_disabled_returns_404() {
+        let cfg = NodesConfig {
+            enabled: false,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn nodes_enabled_no_auth_no_pairing_returns_503() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: None,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, no token provided → 503
+    /// (fail-closed: empty-trimmed config must not match missing token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_missing_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents a token → 503
+    /// (fail-closed: empty-trimmed config must not authenticate any token).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_any_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("anything");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set to whitespace-only, caller presents matching
+    /// whitespace token → 503 (same fail-closed path).
+    #[test]
+    fn nodes_auth_token_whitespace_only_rejects_matching_whitespace_token() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("   ".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("   ");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert_eq!(
+            result.map(|(s, _)| s),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
+
+    /// nodes.auth_token set, caller presents wrong/missing token → 401.
+    #[test]
+    fn nodes_auth_token_wrong_token_returns_401() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("secret".into()),
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(false), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn nodes_auth_token_correct_token_passes() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("secret".into()),
+            ..NodesConfig::default()
+        };
+        let headers = bearer_headers("secret");
+        let result = check_node_auth(&cfg, &make_pairing(false), &headers, None);
+        assert!(result.is_none(), "correct token must pass auth gate");
+    }
+
+    #[test]
+    fn nodes_pairing_required_wrong_token_returns_401() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: None,
+            ..NodesConfig::default()
+        };
+        let result = check_node_auth(&cfg, &make_pairing(true), &empty_headers(), None);
+        assert_eq!(result.map(|(s, _)| s), Some(StatusCode::UNAUTHORIZED));
+    }
 
     #[test]
     fn node_registry_register_and_unregister() {
@@ -572,18 +737,6 @@ mod tests {
     }
 
     #[test]
-    fn gateway_message_serialize() {
-        let msg = GatewayMessage::Registered {
-            node_id: "phone-1".to_string(),
-            capabilities_count: 3,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"registered\""));
-        assert!(json.contains("\"node_id\":\"phone-1\""));
-        assert!(json.contains("\"capabilities_count\":3"));
-    }
-
-    #[test]
     fn gateway_invoke_message_serialize() {
         let msg = GatewayMessage::Invoke {
             call_id: "call-1".to_string(),
@@ -615,5 +768,74 @@ mod tests {
     fn extract_node_ws_token_none_when_empty() {
         let headers = HeaderMap::new();
         assert_eq!(extract_node_ws_token(&headers, None), None);
+    }
+
+    /// Regression for non-constant-time `nodes.auth_token` comparison.
+    ///
+    /// The old code used `if token != expected_token`, which short-circuits
+    /// on the first differing byte and leaks the configured `nodes.auth_token`
+    /// one byte at a time via response timing. The fix routes through
+    /// `constant_time_eq` (from `zeroclaw_config::pairing`) and trims both
+    /// sides — matching the canonical pairing pattern at
+    /// `crates/zeroclaw-config/src/pairing.rs:139`.
+    ///
+    /// We can't measure wall-clock timing in a unit test, but we can lock
+    /// in the behavior contract: trim-normalized inputs match, wrong
+    /// tokens still reject. A future refactor that drops the
+    /// `constant_time_eq` call (e.g., back to `==`) would still pass the
+    /// "wrong token rejected" half — the trim half is what proves the new
+    /// shape is in place.
+    #[test]
+    fn nodes_auth_token_compare_uses_constant_time_eq_and_trims() {
+        let cfg = NodesConfig {
+            enabled: true,
+            auth_token: Some("node-secret-token".into()),
+            ..NodesConfig::default()
+        };
+
+        // Whitespace-padded Authorization header still passes
+        // (trim-normalized on both sides, per the canonical pairing pattern).
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer   node-secret-token   ".parse().unwrap(),
+        );
+        assert_eq!(
+            check_node_auth(&cfg, &make_pairing(false), &headers, None),
+            None,
+            "auth_token comparison must trim both sides (canonical pairing pattern)"
+        );
+
+        // Wrong token via Authorization header is rejected.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong-token".parse().unwrap());
+        assert_eq!(
+            check_node_auth(&cfg, &make_pairing(false), &headers, None).map(|(s, _)| s),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        // Wrong token via `?token=` query parameter is also rejected.
+        let empty_headers = HeaderMap::new();
+        assert_eq!(
+            check_node_auth(
+                &cfg,
+                &make_pairing(false),
+                &empty_headers,
+                Some("wrong-token"),
+            )
+            .map(|(s, _)| s),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+
+        // Correct token via `?token=` (with no trim ambiguity) passes.
+        assert_eq!(
+            check_node_auth(
+                &cfg,
+                &make_pairing(false),
+                &empty_headers,
+                Some("node-secret-token"),
+            ),
+            None
+        );
     }
 }

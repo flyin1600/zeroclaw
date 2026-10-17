@@ -1,73 +1,46 @@
 //! Comprehensive agent-loop test suite.
-//!
-//! Tests exercise the full `Agent.turn()` cycle with mock providers and tools,
-//! covering every edge case an agentic tool loop must handle:
-//!
-//!   1. Simple text response (no tools)
-//!   2. Single tool call → final response
-//!   3. Multi-step tool chain (tool A → tool B → response)
-//!   4. Max-iteration bailout
-//!   5. Unknown tool name recovery
-//!   6. Tool execution failure recovery
-//!   7. Parallel tool dispatch
-//!   8. History trimming during long conversations
-//!   9. Memory auto-save round-trip
-//!  10. Native vs XML dispatcher integration
-//!  11. Empty / whitespace-only LLM responses
-//!  12. Mixed text + tool call responses
-//!  13. Multi-tool batch in a single response
-//!  14. System prompt generation & tool instructions
-//!  15. Context enrichment from memory loader
-//!  16. ConversationMessage serialization round-trip
-//!  17. Tool call with stringified JSON arguments
-//!  18. Conversation history fidelity (tool call → tool result → assistant)
-//!  19. Builder validation (missing required fields)
-//!  20. Idempotent system prompt insertion
 
 use crate::agent::agent::Agent;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::approval::ApprovalManager;
 use crate::observability::{NoopObserver, Observer};
-use crate::tools::{Tool, ToolResult};
+use crate::security::AutonomyLevel;
+use crate::tools::{Tool, ToolOutput, ToolResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use zeroclaw_config::schema::{AgentConfig, MemoryConfig};
+use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig, RiskProfileConfig};
 use zeroclaw_memory::{self, Memory};
+
+zeroclaw_api::mock_tool_attribution!(CountingTool, EchoTool, FailingTool, PanickingTool);
 use zeroclaw_providers::{
-    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, Provider, ToolCall,
+    ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider, ToolCall,
     ToolResultMessage,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test Helpers — Mock Provider, Mock Tool, Mock Memory
+// Test Helpers — Mock ModelProvider, Mock Tool, Mock Memory
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A mock LLM provider that returns pre-scripted responses in order.
+/// A mock LLM model_provider that returns pre-scripted responses in order.
 /// When the queue is exhausted it returns a simple "done" text response.
-struct ScriptedProvider {
+struct ScriptedModelProvider {
     responses: Mutex<Vec<ChatResponse>>,
-    /// Records every request for assertion.
-    requests: Mutex<Vec<Vec<ChatMessage>>>,
 }
 
-impl ScriptedProvider {
+impl ScriptedModelProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
-            requests: Mutex::new(Vec::new()),
         }
-    }
-
-    #[allow(dead_code)]
-    fn request_count(&self) -> usize {
-        self.requests.lock().unwrap().len()
     }
 }
 
 #[async_trait]
-impl Provider for ScriptedProvider {
+impl ModelProvider for ScriptedModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -80,15 +53,10 @@ impl Provider for ScriptedProvider {
 
     async fn chat(
         &self,
-        request: ChatRequest<'_>,
+        _request: ChatRequest<'_>,
         _model: &str,
         _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        self.requests
-            .lock()
-            .unwrap()
-            .push(request.messages.to_vec());
-
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
@@ -101,12 +69,24 @@ impl Provider for ScriptedProvider {
         Ok(guard.remove(0))
     }
 }
+impl ::zeroclaw_api::attribution::Attributable for ScriptedModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "ScriptedModelProvider"
+    }
+}
 
-/// A mock provider that always returns an error.
-struct FailingProvider;
+/// A mock model_provider that always returns an error.
+struct FailingModelProvider;
 
 #[async_trait]
-impl Provider for FailingProvider {
+impl ModelProvider for FailingModelProvider {
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
@@ -114,7 +94,7 @@ impl Provider for FailingProvider {
         _model: &str,
         _temperature: Option<f64>,
     ) -> Result<String> {
-        anyhow::bail!("provider error")
+        anyhow::bail!("model_provider error")
     }
 
     async fn chat(
@@ -123,7 +103,19 @@ impl Provider for FailingProvider {
         _model: &str,
         _temperature: Option<f64>,
     ) -> Result<ChatResponse> {
-        anyhow::bail!("provider error")
+        anyhow::bail!("model_provider error")
+    }
+}
+impl ::zeroclaw_api::attribution::Attributable for FailingModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "FailingModelProvider"
     }
 }
 
@@ -157,7 +149,7 @@ impl Tool for EchoTool {
             .to_string();
         Ok(ToolResult {
             success: true,
-            output: msg,
+            output: msg.into(),
             error: None,
         })
     }
@@ -183,7 +175,7 @@ impl Tool for FailingTool {
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         Ok(ToolResult {
             success: false,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: Some("intentional failure".into()),
         })
     }
@@ -247,9 +239,73 @@ impl Tool for CountingTool {
         *c += 1;
         Ok(ToolResult {
             success: true,
-            output: format!("call #{}", *c),
+            output: format!("call #{}", *c).into(),
             error: None,
         })
+    }
+}
+
+struct ToolSpecCaptureModelProvider {
+    tools_received: Arc<Mutex<Vec<bool>>>,
+    responses: Mutex<Vec<ChatResponse>>,
+}
+
+impl ToolSpecCaptureModelProvider {
+    fn new(responses: Vec<ChatResponse>) -> (Self, Arc<Mutex<Vec<bool>>>) {
+        let tools_received = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                tools_received: tools_received.clone(),
+                responses: Mutex::new(responses),
+            },
+            tools_received,
+        )
+    }
+}
+
+#[async_trait]
+impl ModelProvider for ToolSpecCaptureModelProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<String> {
+        Ok("fallback".into())
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<ChatResponse> {
+        self.tools_received
+            .lock()
+            .unwrap()
+            .push(request.tools.is_some());
+        let mut guard = self.responses.lock().unwrap();
+        if guard.is_empty() {
+            return Ok(text_response("done"));
+        }
+        Ok(guard.remove(0))
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+}
+impl ::zeroclaw_api::attribution::Attributable for ToolSpecCaptureModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "ToolSpecCaptureModelProvider"
     }
 }
 
@@ -276,13 +332,15 @@ fn make_observer() -> Arc<dyn Observer> {
 }
 
 fn build_agent_with(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     dispatcher: Box<dyn ToolDispatcher>,
 ) -> Agent {
     Agent::builder()
-        .provider(provider)
-        .tools(tools)
+        .model_provider(model_provider)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(dispatcher)
@@ -292,14 +350,16 @@ fn build_agent_with(
 }
 
 fn build_agent_with_memory(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
     mem: Arc<dyn Memory>,
     auto_save: bool,
 ) -> Agent {
     Agent::builder()
-        .provider(provider)
-        .tools(tools)
+        .model_provider(model_provider)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(mem)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -310,13 +370,15 @@ fn build_agent_with_memory(
 }
 
 fn build_agent_with_config(
-    provider: Box<dyn Provider>,
+    model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
-    config: AgentConfig,
+    config: AliasedAgentConfig,
 ) -> Agent {
     Agent::builder()
-        .provider(provider)
-        .tools(tools)
+        .model_provider(model_provider)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -364,9 +426,11 @@ fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
 
 #[tokio::test]
 async fn turn_returns_text_when_no_tools_called() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("Hello world")]));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "Hello world",
+    )]));
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -374,7 +438,55 @@ async fn turn_returns_text_when_no_tools_called() {
     let response = agent.turn("hi").await.unwrap();
     assert!(
         !response.is_empty(),
-        "Expected non-empty text response from provider"
+        "Expected non-empty text response from model_provider"
+    );
+}
+
+#[tokio::test]
+async fn turn_with_no_effective_tools_treats_xml_tool_call_as_text() {
+    let provider = Box::new(ScriptedModelProvider::new(vec![xml_tool_response(
+        "echo",
+        r#"{"message":"hi"}"#,
+    )]));
+    let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert!(
+        response.contains("<tool_call>"),
+        "no-tools turns should preserve tool-like text instead of executing it"
+    );
+    assert!(
+        response.contains("\"name\": \"echo\""),
+        "tool-like payload should remain visible as ordinary response text"
+    );
+}
+
+#[tokio::test]
+async fn turn_with_no_effective_tools_still_strips_reasoning_tags() {
+    let provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "<think>hidden scratchpad</think>visible answer",
+    )]));
+    let mut agent = build_agent_with(provider, vec![], Box::new(XmlToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert_eq!(response, "visible answer");
+}
+
+#[tokio::test]
+async fn turn_with_no_effective_tools_does_not_send_empty_native_tool_specs() {
+    let (provider, tools_received) =
+        ToolSpecCaptureModelProvider::new(vec![text_response("plain response")]);
+    let mut agent = build_agent_with(Box::new(provider), vec![], Box::new(NativeToolDispatcher));
+
+    let response = agent.turn("hi").await.unwrap();
+
+    assert_eq!(response, "plain response");
+    assert_eq!(
+        tools_received.lock().unwrap().as_slice(),
+        &[false],
+        "native providers should receive no tools field when the effective tool list is empty"
     );
 }
 
@@ -384,7 +496,7 @@ async fn turn_returns_text_when_no_tools_called() {
 
 #[tokio::test]
 async fn turn_executes_single_tool_then_returns() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
@@ -395,7 +507,7 @@ async fn turn_executes_single_tool_then_returns() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -415,7 +527,7 @@ async fn turn_executes_single_tool_then_returns() {
 async fn turn_handles_multi_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "counter".into(),
@@ -438,7 +550,7 @@ async fn turn_handles_multi_step_tool_chain() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(counting_tool)],
         Box::new(NativeToolDispatcher),
     );
@@ -469,14 +581,17 @@ async fn turn_bails_out_at_max_iterations() {
         }]));
     }
 
-    let provider = Box::new(ScriptedProvider::new(responses));
+    let model_provider = Box::new(ScriptedModelProvider::new(responses));
 
-    let config = AgentConfig {
-        max_tool_iterations: max_iters,
-        ..AgentConfig::default()
+    let config = AliasedAgentConfig {
+        resolved: zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: max_iters,
+            ..Default::default()
+        },
+        ..AliasedAgentConfig::default()
     };
 
-    let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
+    let mut agent = build_agent_with_config(model_provider, vec![Box::new(EchoTool)], config);
 
     let result = agent.turn("infinite loop").await;
     assert!(result.is_err());
@@ -493,7 +608,7 @@ async fn turn_bails_out_at_max_iterations() {
 
 #[tokio::test]
 async fn turn_handles_unknown_tool_gracefully() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
@@ -504,7 +619,7 @@ async fn turn_handles_unknown_tool_gracefully() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -534,7 +649,7 @@ async fn turn_handles_unknown_tool_gracefully() {
 
 #[tokio::test]
 async fn turn_recovers_from_tool_failure() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "fail".into(),
@@ -545,7 +660,7 @@ async fn turn_recovers_from_tool_failure() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(FailingTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -559,7 +674,7 @@ async fn turn_recovers_from_tool_failure() {
 
 #[tokio::test]
 async fn turn_recovers_from_tool_error() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "panicker".into(),
@@ -570,7 +685,7 @@ async fn turn_recovers_from_tool_error() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(PanickingTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -583,19 +698,22 @@ async fn turn_recovers_from_tool_error() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 7. Provider error propagation
+// 7. ModelProvider error propagation
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn turn_propagates_provider_error() {
     let mut agent = build_agent_with(
-        Box::new(FailingProvider),
+        Box::new(FailingModelProvider),
         vec![],
         Box::new(NativeToolDispatcher),
     );
 
     let result = agent.turn("hello").await;
-    assert!(result.is_err(), "Expected provider error to propagate");
+    assert!(
+        result.is_err(),
+        "Expected model_provider error to propagate"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -603,33 +721,56 @@ async fn turn_propagates_provider_error() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn history_trims_after_max_messages() {
+async fn history_trims_after_max_turns() {
     let max_history = 6;
     let mut responses = vec![];
     for _ in 0..max_history + 5 {
         responses.push(text_response("ok"));
     }
 
-    let provider = Box::new(ScriptedProvider::new(responses));
-    let config = AgentConfig {
-        max_history_messages: max_history,
-        ..AgentConfig::default()
+    let model_provider = Box::new(ScriptedModelProvider::new(responses));
+    let config = AliasedAgentConfig {
+        resolved: zeroclaw_config::schema::ResolvedRuntime {
+            max_history_messages: max_history,
+            ..Default::default()
+        },
+        ..AliasedAgentConfig::default()
     };
 
-    let mut agent = build_agent_with_config(provider, vec![], config);
+    let mut agent = build_agent_with_config(model_provider, vec![], config);
 
     for i in 0..max_history + 5 {
         let _ = agent.turn(&format!("msg {i}")).await.unwrap();
     }
 
-    // System prompt (1) + trimmed messages
-    // Should not exceed max_history + 1 (system prompt)
+    let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+    let retained_messages: Vec<_> = agent
+        .history()
+        .iter()
+        .filter(|message| match message {
+            ConversationMessage::Chat(chat) => chat.role != "system" && chat.content != breadcrumb,
+            _ => true,
+        })
+        .collect();
+
+    let (turns, remainder) = retained_messages.as_chunks::<2>();
+    assert!(remainder.is_empty(), "history must retain whole turns");
     assert!(
-        agent.history().len() <= max_history + 1,
-        "History length {} exceeds max {} + 1 (system)",
-        agent.history().len(),
+        turns.len() <= max_history,
+        "Retained turn count {} exceeds max {}",
+        turns.len(),
         max_history,
     );
+    assert!(turns.iter().all(|turn| matches!(
+        turn,
+        [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
+            if user.role == "user" && assistant.role == "assistant"
+    )));
+    assert!(agent.history().iter().any(|message| matches!(
+        message,
+        ConversationMessage::Chat(chat)
+            if chat.role == "user" && chat.content.ends_with("msg 10")
+    )));
 
     // System prompt should always be preserved
     let first = &agent.history()[0];
@@ -643,12 +784,12 @@ async fn history_trims_after_max_messages() {
 #[tokio::test]
 async fn auto_save_stores_only_user_messages_in_memory() {
     let (mem, _tmp) = make_sqlite_memory();
-    let provider = Box::new(ScriptedProvider::new(vec![text_response(
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
         "I remember everything",
     )]));
 
     let mut agent = build_agent_with_memory(
-        provider,
+        model_provider,
         vec![],
         mem.clone(),
         true, // auto_save enabled
@@ -681,10 +822,10 @@ async fn auto_save_stores_only_user_messages_in_memory() {
 #[tokio::test]
 async fn auto_save_disabled_does_not_store() {
     let (mem, _tmp) = make_sqlite_memory();
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("hello")]));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("hello")]));
 
     let mut agent = build_agent_with_memory(
-        provider,
+        model_provider,
         vec![],
         mem.clone(),
         false, // auto_save disabled
@@ -702,13 +843,13 @@ async fn auto_save_disabled_does_not_store() {
 
 #[tokio::test]
 async fn xml_dispatcher_parses_and_loops() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         xml_tool_response("echo", r#"{"message": "xml-test"}"#),
         text_response("XML tool completed"),
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(XmlToolDispatcher),
     );
@@ -722,9 +863,9 @@ async fn xml_dispatcher_parses_and_loops() {
 
 #[tokio::test]
 async fn native_dispatcher_sends_tool_specs() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("ok")]));
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -747,34 +888,84 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn turn_handles_empty_text_response() {
-    let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
+async fn turn_rejects_empty_text_response() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
     }]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+    let err = agent
+        .turn("hi")
+        .await
+        .expect_err("empty terminal response must fail");
+    assert_eq!(
+        err.to_string(),
+        "provider completed without final text or tool calls"
+    );
 }
 
 #[tokio::test]
-async fn turn_handles_none_text_response() {
-    let provider = Box::new(ScriptedProvider::new(vec![ChatResponse {
+async fn turn_rejects_none_text_response() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
         usage: None,
         reasoning_content: None,
     }]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    // Should not panic — falls back to empty string
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+    let err = agent
+        .turn("hi")
+        .await
+        .expect_err("missing terminal text must fail");
+    assert_eq!(
+        err.to_string(),
+        "provider completed without final text or tool calls"
+    );
+}
+
+#[tokio::test]
+async fn turn_rejects_think_tag_only_response_and_records_usage() {
+    use crate::agent::cost::{
+        TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+        TurnUsage,
+    };
+
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+        text: Some("<think>internal reasoning</think>".to_string()),
+        tool_calls: vec![],
+        usage: Some(zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cached_input_tokens: None,
+            cache_creation_input_tokens: None,
+        }),
+        reasoning_content: None,
+    }]));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
+    let cost_context = ToolLoopCostTrackingContext::usage_only();
+    let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+
+    let error = TOOL_LOOP_TURN_USAGE
+        .scope(
+            Some(Arc::clone(&turn_usage)),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), agent.turn("hi")),
+        )
+        .await
+        .expect_err("think-only terminal response must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "provider completed without final text or tool calls"
+    );
+    let recorded = *turn_usage.lock();
+    assert_eq!(recorded.input_tokens, 10);
+    assert_eq!(recorded.output_tokens, 5);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -783,7 +974,7 @@ async fn turn_handles_none_text_response() {
 
 #[tokio::test]
 async fn turn_preserves_text_alongside_tool_calls() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         ChatResponse {
             text: Some("Let me check...".into()),
             tool_calls: vec![ToolCall {
@@ -799,7 +990,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -829,7 +1020,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
 async fn turn_handles_multiple_tools_in_one_response() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![
             ToolCall {
                 id: "tc1".into(),
@@ -854,7 +1045,7 @@ async fn turn_handles_multiple_tools_in_one_response() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(counting_tool)],
         Box::new(NativeToolDispatcher),
     );
@@ -877,9 +1068,9 @@ async fn turn_handles_multiple_tools_in_one_response() {
 
 #[tokio::test]
 async fn system_prompt_injected_on_first_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("ok")]));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("ok")]));
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -898,12 +1089,12 @@ async fn system_prompt_injected_on_first_turn() {
 
 #[tokio::test]
 async fn system_prompt_not_duplicated_on_second_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         text_response("first"),
         text_response("second"),
     ]));
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
@@ -920,12 +1111,193 @@ async fn system_prompt_not_duplicated_on_second_turn() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 14b. Construction boundary: prompt text and enforcement share one manager
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A tool named `shell` that records whether it actually executed.
+struct RecordingShellTool {
+    executions: Arc<Mutex<usize>>,
+}
+
+impl RecordingShellTool {
+    fn new() -> (Self, Arc<Mutex<usize>>) {
+        let executions = Arc::new(Mutex::new(0));
+        (
+            Self {
+                executions: executions.clone(),
+            },
+            executions,
+        )
+    }
+}
+
+#[async_trait]
+impl Tool for RecordingShellTool {
+    fn name(&self) -> &str {
+        "shell"
+    }
+
+    fn description(&self) -> &str {
+        "Records execution attempts"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+        *self.executions.lock().unwrap() += 1;
+        Ok(ToolResult {
+            success: true,
+            output: ToolOutput::text("ran"),
+            error: None,
+        })
+    }
+}
+
+zeroclaw_api::mock_tool_attribution!(RecordingShellTool);
+
+/// Extract the system prompt the agent actually injected into history.
+fn system_prompt_of(agent: &Agent) -> String {
+    agent
+        .history()
+        .first()
+        .and_then(|msg| match msg {
+            ConversationMessage::Chat(c) if c.role == "system" => Some(c.content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn construction_boundary_full_always_ask_prompt_matches_enforcement() {
+    // The real construction boundary: one ApprovalManager feeds both the
+    // rendered prompt and the execution gate, so the model-facing text and
+    // the runtime behavior cannot diverge.
+    let profile = RiskProfileConfig {
+        level: AutonomyLevel::Full,
+        always_ask: vec![" shell ".into()],
+        ..RiskProfileConfig::default()
+    };
+    let (shell_tool, shell_executions) = RecordingShellTool::new();
+    let (counting_tool, count) = CountingTool::new();
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
+        tool_response(vec![
+            ToolCall {
+                id: "tc1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "ls"}).to_string(),
+                extra_content: None,
+            },
+            ToolCall {
+                id: "tc2".into(),
+                name: "counter".into(),
+                arguments: serde_json::json!({}).to_string(),
+                extra_content: None,
+            },
+        ]),
+        text_response("done"),
+    ]));
+    let mut agent = Agent::builder()
+        .model_provider(model_provider)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![Box::new(shell_tool), Box::new(counting_tool)],
+        ))
+        .memory(make_memory())
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
+            &profile,
+        ))))
+        .build()
+        .unwrap();
+
+    let _ = agent.turn("run ls and count").await.unwrap();
+
+    // Prompt side: the rendered system prompt must describe the same
+    // Full+always_ask policy the manager enforces.
+    let prompt = system_prompt_of(&agent);
+    assert!(
+        prompt.contains("Full autonomy auto-approves tools that are not listed in `always_ask`"),
+        "prompt must state the Full-autonomy contract, got: {prompt}"
+    );
+    assert!(
+        prompt.contains("fail closed when no approver is present: shell"),
+        "prompt must name the exact always_ask tool, got: {prompt}"
+    );
+    assert!(
+        !prompt.contains("No tools are listed in `always_ask`"),
+        "prompt must not claim the always_ask list is empty"
+    );
+    assert!(
+        !prompt.contains("You have full access to all configured tools"),
+        "prompt must not claim unconditional Full access while shell is gated"
+    );
+
+    // Enforcement side: the same manager fails the listed tool closed (no
+    // approver on this surface) while the uncovered tool still executes.
+    assert_eq!(
+        *shell_executions.lock().unwrap(),
+        0,
+        "always_ask tool must not execute without an approver"
+    );
+    assert_eq!(
+        *count.lock().unwrap(),
+        1,
+        "uncovered Full tool must execute"
+    );
+    assert!(
+        agent.history().iter().any(|msg| match msg {
+            ConversationMessage::ToolResults(results) => results
+                .iter()
+                .any(|r| r.content.contains("requires approval")),
+            _ => false,
+        }),
+        "the gated tool's denial must reach the model as a tool result"
+    );
+}
+
+#[tokio::test]
+async fn build_system_prompt_without_manager_stays_generic() {
+    // A builder without an approval manager cannot see a real policy, so its
+    // prompt must stay generic: no Full-autonomy promises, no invented
+    // always_ask exceptions.
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response("ok")]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let _ = agent.turn("hi").await.unwrap();
+
+    let prompt = system_prompt_of(&agent);
+    assert!(
+        prompt.contains("Ask for approval when the runtime policy requires it"),
+        "managerless prompt must render generic safety guidance, got: {prompt}"
+    );
+    assert!(
+        !prompt.contains("no extra approval needed"),
+        "managerless prompt must not promise unconditioned execution"
+    );
+    assert!(
+        !prompt.contains("You have full access to all configured tools"),
+        "managerless prompt must not claim Full autonomy"
+    );
+    assert!(
+        !prompt.contains("always_ask"),
+        "managerless prompt must not invent always_ask facts, got: {prompt}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 15. Conversation history fidelity
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
 async fn history_contains_all_expected_entries_after_tool_loop() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
@@ -936,19 +1308,13 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
     ]));
 
     let mut agent = build_agent_with(
-        provider,
+        model_provider,
         vec![Box::new(EchoTool)],
         Box::new(NativeToolDispatcher),
     );
 
     let _ = agent.turn("test").await.unwrap();
 
-    // Expected history entries:
-    //   0: system prompt
-    //   1: user message "test"
-    //   2: AssistantToolCalls
-    //   3: ToolResults
-    //   4: assistant "final answer"
     let history = agent.history();
     assert!(
         history.len() >= 5,
@@ -975,14 +1341,19 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 #[tokio::test]
 async fn builder_fails_without_provider() {
     let result = Agent::builder()
-        .tools(vec![])
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![],
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::path::PathBuf::from("/tmp"))
         .build();
 
-    assert!(result.is_err(), "Building without provider should fail");
+    assert!(
+        result.is_err(),
+        "Building without model_provider should fail"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -991,13 +1362,13 @@ async fn builder_fails_without_provider() {
 
 #[tokio::test]
 async fn multi_turn_maintains_growing_history() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         text_response("response 1"),
         text_response("response 2"),
         text_response("response 3"),
     ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
     let r1 = agent.turn("msg 1").await.unwrap();
     let len_after_1 = agent.history().len();
@@ -1132,6 +1503,7 @@ fn conversation_message_serialization_roundtrip() {
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),
             content: "ok".into(),
+            tool_name: String::new(),
         }]),
         ConversationMessage::Chat(ChatMessage::assistant("done")),
     ];
@@ -1206,11 +1578,19 @@ fn xml_format_results_includes_status_and_output() {
 
 #[test]
 fn native_format_results_maps_tool_call_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("generated.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
     let dispatcher = NativeToolDispatcher;
     let results = vec![
         ToolExecutionResult {
             name: "a".into(),
-            output: "out1".into(),
+            output: format!("File: {}", image_path.display().to_string()),
             success: true,
             tool_call_id: Some("tc-001".into()),
         },
@@ -1223,16 +1603,67 @@ fn native_format_results_maps_tool_call_ids() {
     ];
 
     let msg = dispatcher.format_results(&results);
-    match msg {
+    match &msg {
         ConversationMessage::ToolResults(r) => {
             assert_eq!(r.len(), 2);
             assert_eq!(r[0].tool_call_id, "tc-001");
-            assert_eq!(r[0].content, "out1");
+            // The body stays verbatim: a bare image path is text, and no
+            // attachment is inferred from it on the read side either.
+            assert!(!r[0].content.contains("[IMAGE:"));
+            assert!(r[0].content.contains(&image_path.display().to_string()));
             assert_eq!(r[1].tool_call_id, "tc-002");
             assert_eq!(r[1].content, "out2");
         }
         _ => panic!("Expected ToolResults"),
     }
+
+    // The read side keeps the boundary: no attachment is promoted from the
+    // stored text, and the carrier still declares the (empty) array.
+    let messages = dispatcher.to_provider_messages(&[msg]);
+    assert_eq!(messages.len(), 2);
+    let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    assert_eq!(
+        payload["content"].as_str(),
+        Some(format!("File: {}", image_path.display().to_string()).as_str())
+    );
+    assert_eq!(
+        payload["attachments"],
+        serde_json::json!([]),
+        "a bare image path in stored tool text must yield zero attachments"
+    );
+}
+
+#[test]
+fn xml_format_results_keeps_local_image_paths_as_text() {
+    // A bare existing image path in a tool result is text: no marker is
+    // written and the carrier declares zero attachments — the
+    // attachment-identity boundary, nothing in tool text promoted unless
+    // the tool declared it.
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("xml-generated.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
+    let dispatcher = XmlToolDispatcher;
+    let results = vec![ToolExecutionResult {
+        name: "shell".into(),
+        output: format!("Saved image to {}", image_path.display().to_string()),
+        success: true,
+        tool_call_id: None,
+    }];
+
+    let msg = dispatcher.format_results(&results);
+    let content = match msg {
+        ConversationMessage::Chat(c) => c.content,
+        _ => panic!("Expected Chat variant"),
+    };
+
+    assert!(!content.contains("[IMAGE:"));
+    assert!(content.contains(&image_path.display().to_string()));
+    assert!(content.contains("[Tool attachments: 0]"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1258,6 +1689,7 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
         ConversationMessage::ToolResults(vec![ToolResultMessage {
             tool_call_id: "tc1".into(),
             content: "ok".into(),
+            tool_name: String::new(),
         }]),
         ConversationMessage::Chat(ChatMessage::assistant("done")),
     ];
@@ -1272,15 +1704,25 @@ fn xml_dispatcher_converts_history_to_provider_messages() {
 
 #[test]
 fn native_dispatcher_converts_tool_results_to_tool_messages() {
+    let temp = tempfile::tempdir().unwrap();
+    let image_path = temp.path().join("history.png");
+    std::fs::write(
+        &image_path,
+        [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+    )
+    .unwrap();
+
     let dispatcher = NativeToolDispatcher;
     let history = vec![ConversationMessage::ToolResults(vec![
         ToolResultMessage {
             tool_call_id: "tc1".into(),
-            content: "output1".into(),
+            content: format!("Saved image to {}", image_path.display().to_string()),
+            tool_name: String::new(),
         },
         ToolResultMessage {
             tool_call_id: "tc2".into(),
             content: "output2".into(),
+            tool_name: String::new(),
         },
     ])];
 
@@ -1288,6 +1730,22 @@ fn native_dispatcher_converts_tool_results_to_tool_messages() {
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "tool");
     assert_eq!(messages[1].role, "tool");
+    let payload: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+    let content = payload["content"].as_str().unwrap();
+    // A bare image path in stored tool text is text: typed replay declares no
+    // attachments — the attachment-identity boundary — and the body keeps
+    // the path.
+    assert_eq!(
+        payload["attachments"],
+        serde_json::json!([]),
+        "no attachment may be inferred from a bare path in replayed text"
+    );
+    assert!(!content.contains("[IMAGE:"));
+    assert!(content.contains(&image_path.display().to_string()));
+    // The second result declared nothing.
+    let second: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
+    assert_eq!(second["attachments"], serde_json::json!([]));
+    assert_eq!(second["content"].as_str(), Some("output2"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1310,6 +1768,41 @@ fn xml_dispatcher_generates_tool_instructions() {
     );
 }
 
+/// This builder used to carry an abridged copy of the tool-call
+/// guidance (no `CRITICAL:` line, no worked example) while `loop_`'s builder
+/// carried the full text, so tool-use behavior depended on which builder
+/// produced the prompt. It must now emit the shared block verbatim.
+#[test]
+fn xml_dispatcher_emits_shared_tool_call_guidance() {
+    use crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS;
+
+    let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+    let instructions = XmlToolDispatcher.prompt_instructions(&tools);
+
+    assert!(
+        instructions.contains(TOOL_CALL_PROTOCOL_INSTRUCTIONS),
+        "dispatcher prompt drifted from the shared tool-call block:\n{instructions}"
+    );
+    assert!(
+        instructions.contains("CRITICAL: Output actual <tool_call> tags"),
+        "dispatcher prompt lost the emit-real-tags directive"
+    );
+    assert!(
+        instructions
+            .contains("You MUST respond with a real call naming one of your available tools"),
+        "dispatcher prompt lost the worked example"
+    );
+}
+
+#[test]
+fn xml_dispatcher_omits_tool_instructions_without_tools() {
+    let tools: Vec<Box<dyn Tool>> = vec![];
+    let dispatcher = XmlToolDispatcher;
+    let instructions = dispatcher.prompt_instructions(&tools);
+
+    assert!(instructions.is_empty());
+}
+
 #[test]
 fn native_dispatcher_returns_empty_instructions() {
     let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -1324,12 +1817,12 @@ fn native_dispatcher_returns_empty_instructions() {
 
 #[tokio::test]
 async fn clear_history_resets_conversation() {
-    let provider = Box::new(ScriptedProvider::new(vec![
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![
         text_response("first"),
         text_response("second"),
     ]));
 
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
     let _ = agent.turn("hi").await.unwrap();
     assert!(!agent.history().is_empty());
@@ -1351,12 +1844,135 @@ async fn clear_history_resets_conversation() {
 
 #[tokio::test]
 async fn run_single_delegates_to_turn() {
-    let provider = Box::new(ScriptedProvider::new(vec![text_response("via run_single")]));
-    let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "via run_single",
+    )]));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
     let response = agent.run_single("test").await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty response from run_single"
+    );
+}
+
+#[tokio::test]
+async fn turn_history_has_exact_one_user_one_assistant() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "hello back",
+    )]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let _ = agent.turn("hi").await.unwrap();
+    let history = agent.history();
+
+    // First turn: system + user + assistant = 3
+    assert_eq!(
+        history.len(),
+        3,
+        "single-exchange turn should produce system + user + assistant, got {}: {history:?}",
+        history.len()
+    );
+
+    let roles: Vec<&str> = history
+        .iter()
+        .filter_map(|m| match m {
+            ConversationMessage::Chat(c) => Some(c.role.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["system", "user", "assistant"],
+        "history role sequence"
+    );
+
+    // No duplicate user messages
+    let user_count = roles.iter().filter(|&&r| r == "user").count();
+    assert_eq!(user_count, 1, "exactly one user message, no duplicates");
+}
+
+#[tokio::test]
+async fn turn_streamed_history_no_duplicate_user_message() {
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![text_response(
+        "streamed back",
+    )]));
+    let mut agent = build_agent_with(
+        model_provider,
+        vec![Box::new(EchoTool)],
+        Box::new(NativeToolDispatcher),
+    );
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+    let (_response, new_msgs) = agent.turn_streamed("hi", event_tx, None).await.unwrap();
+    // Drain events
+    while event_rx.try_recv().is_ok() {}
+
+    // Returned messages: exactly one user and one assistant.
+    let returned_user_count = new_msgs
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"))
+        .count();
+    assert_eq!(
+        returned_user_count, 1,
+        "returned new_msgs must have exactly one user, got {returned_user_count}: {new_msgs:?}"
+    );
+    assert!(
+        new_msgs
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "assistant")),
+        "returned new_msgs must include an assistant: {new_msgs:?}"
+    );
+
+    // Durable history: exactly one user message (no duplicates).
+    let history = agent.history();
+    let history_user_count = history
+        .iter()
+        .filter(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "user"))
+        .count();
+    assert_eq!(
+        history_user_count, 1,
+        "exactly one user message after turn_streamed, got {history_user_count}: {history:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 26. Runtime-approved argument tool names are built-in tool names
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `is_runtime_approved_arg_tool` matches literal names, so this test keeps a
+/// second copy of the five names. It checks that each is inventoried and
+/// approved, and that the predicate approves no other inventoried tool. It
+/// cannot see a new `matches!` arm for a name the inventory does not list.
+#[test]
+fn runtime_approved_arg_tool_names_are_inventoried() {
+    use std::collections::BTreeSet;
+    use zeroclaw_tools::inventory::{BUILTIN_TOOLS, is_builtin_tool_name};
+
+    let expected = BTreeSet::from(["shell", "schedule", "cron_add", "cron_update", "cron_run"]);
+    for name in &expected {
+        assert!(
+            is_builtin_tool_name(name),
+            "`{name}` receives the runtime-approved argument but is missing from the built-in inventory"
+        );
+        assert!(
+            crate::agent::is_runtime_approved_arg_tool(name),
+            "`{name}` must receive the runtime-approved argument"
+        );
+    }
+
+    let approved: BTreeSet<&str> = BUILTIN_TOOLS
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| crate::agent::is_runtime_approved_arg_tool(name))
+        .collect();
+    assert_eq!(
+        approved, expected,
+        "is_runtime_approved_arg_tool changed which built-in tools receive the \
+         runtime-approved argument; update this test to the intended set"
     );
 }

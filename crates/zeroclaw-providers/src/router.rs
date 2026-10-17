@@ -1,90 +1,230 @@
-use super::Provider;
+use super::ModelProvider;
+use super::dispatch::{
+    ProviderDispatch, mark_current_dispatch_composite, stream_with_exact_dispatch_route,
+    with_exact_dispatch_route,
+};
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
 use async_trait::async_trait;
-use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
+use futures_util::stream::{self, BoxStream};
 use std::collections::HashMap;
-use zeroclaw_config::schema::ModelPricing;
+use std::sync::Arc;
+use zeroclaw_api::model_provider::StreamError;
 
-/// A single route: maps a task hint to a provider + model combo.
+/// Score a model against a user-keyed pricing map. Sums any entry matching
+/// the model directly, plus optional `.input` and `.output` dimension keys.
+/// Returns `None` when nothing matches.
+fn score_model(pricing: &HashMap<String, f64>, model: &str) -> Option<f64> {
+    let mut total = 0.0;
+    let mut matched = false;
+    if let Some(v) = pricing.get(model) {
+        total += *v;
+        matched = true;
+    }
+    if let Some(v) = pricing.get(&format!("{model}.input")) {
+        total += *v;
+        matched = true;
+    }
+    if let Some(v) = pricing.get(&format!("{model}.output")) {
+        total += *v;
+        matched = true;
+    }
+    matched.then_some(total)
+}
+
+/// A single route: maps a task hint to a model_provider + model combo.
 #[derive(Debug, Clone)]
 pub struct Route {
     pub provider_name: String,
     pub model: String,
 }
 
-/// Multi-model router — routes requests to different provider+model combos
-/// based on a task hint encoded in the model parameter.
-///
-/// The model parameter can be:
-/// - A regular model name (e.g. "anthropic/claude-sonnet-4") → uses default provider
-/// - A hint-prefixed string (e.g. "hint:reasoning") → resolves via route table
-///
-/// This wraps multiple pre-created providers and selects the right one per request.
-pub struct RouterProvider {
-    routes: HashMap<String, (usize, String)>, // hint → (provider_index, model)
-    providers: Vec<(String, Box<dyn Provider>)>,
-    default_index: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteResolutionKind {
+    Direct,
+    MatchedHint,
+    UnknownHintFallback,
+}
+
+/// Provider profile and model selected by the same immutable route table the
+/// router uses for dispatch. Callers may retain the selector separately when
+/// the provider still needs `hint:<name>` to perform the actual dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModelRoute {
+    pub provider_name: String,
+    pub model: String,
+    pub kind: RouteResolutionKind,
+}
+
+/// One route-selection source shared by the router and its owning Agent.
+/// This avoids parallel hint lookup tables that can disagree about which
+/// provider/model actually serves a turn.
+#[derive(Debug)]
+pub struct ModelRouteResolver {
+    routes: HashMap<String, Route>,
+    default_provider_name: String,
     default_model: String,
 }
 
-impl RouterProvider {
-    /// Create a new router with a default provider and optional routes.
-    ///
-    /// `providers` is a list of (name, provider) pairs. The first one is the default.
+impl ModelRouteResolver {
+    #[must_use]
+    pub fn new(
+        routes: Vec<(String, Route)>,
+        default_provider_name: String,
+        default_model: String,
+    ) -> Self {
+        Self {
+            routes: routes.into_iter().collect(),
+            default_provider_name,
+            default_model,
+        }
+    }
+
+    #[must_use]
+    pub fn resolve(&self, selector: &str) -> ResolvedModelRoute {
+        if let Some(hint) = selector.strip_prefix("hint:") {
+            if let Some(route) = self.routes.get(hint) {
+                return ResolvedModelRoute {
+                    provider_name: route.provider_name.clone(),
+                    model: route.model.clone(),
+                    kind: RouteResolutionKind::MatchedHint,
+                };
+            }
+            return ResolvedModelRoute {
+                provider_name: self.default_provider_name.clone(),
+                model: selector.to_string(),
+                kind: RouteResolutionKind::UnknownHintFallback,
+            };
+        }
+
+        ResolvedModelRoute {
+            provider_name: self.default_provider_name.clone(),
+            model: selector.to_string(),
+            kind: RouteResolutionKind::Direct,
+        }
+    }
+
+    #[must_use]
+    pub fn has_hint(&self, hint: &str) -> bool {
+        self.routes.contains_key(hint)
+    }
+
+    #[must_use]
+    pub fn configured_model_for_hint(&self, hint: &str) -> Option<&str> {
+        self.routes.get(hint).map(|route| route.model.as_str())
+    }
+}
+
+/// Synthesize the streaming event sequence for a complete non-streaming
+/// response. Used when the resolved route disclaims streaming: the route is
+/// dispatched non-streaming and its result is delivered through the same
+/// event contract a streaming route would emit (durable reasoning first,
+/// then visible text, tool calls, usage, final), so consumers need no
+/// special-casing. `count_tokens` mirrors the SSE paths: when set, the text
+/// delta carries the same token estimate a genuine stream would.
+fn synthesize_stream_events(
+    response: ChatResponse,
+    count_tokens: bool,
+) -> Vec<StreamResult<StreamEvent>> {
+    let mut events = Vec::new();
+    if let Some(reasoning) = response.reasoning_content {
+        events.push(Ok(StreamEvent::ReasoningFinalized(reasoning)));
+    }
+    if let Some(text) = response.text
+        && !text.is_empty()
+    {
+        let mut chunk = StreamChunk::delta(text);
+        if count_tokens {
+            chunk = chunk.with_token_estimate();
+        }
+        events.push(Ok(StreamEvent::TextDelta(chunk)));
+    }
+    for tool_call in response.tool_calls {
+        events.push(Ok(StreamEvent::ToolCall(tool_call)));
+    }
+    if let Some(usage) = response.usage {
+        events.push(Ok(StreamEvent::Usage(usage)));
+    }
+    events.push(Ok(StreamEvent::Final));
+    events
+}
+
+pub struct RouterModelProvider {
+    /// `[providers.models.<family>.<alias>]` config-key alias.
+    alias: String,
+    route_resolver: Arc<ModelRouteResolver>,
+    provider_indices: HashMap<String, usize>,
+    model_providers: Vec<(String, Arc<dyn ModelProvider>)>,
+    default_index: usize,
+}
+
+impl RouterModelProvider {
+    /// Create a new router with a default model_provider and optional routes.
+    /// `model_providers` is a list of (name, model_provider) pairs. The first one is the default.
     /// `routes` maps hint names to Route structs containing provider_name and model.
     pub fn new(
-        providers: Vec<(String, Box<dyn Provider>)>,
+        alias: &str,
+        model_providers: Vec<(String, Box<dyn ModelProvider>)>,
         routes: Vec<(String, Route)>,
         default_model: String,
     ) -> Self {
-        // Build provider name → index lookup
-        let name_to_index: HashMap<&str, usize> = providers
-            .iter()
-            .enumerate()
-            .map(|(i, (name, _))| (name.as_str(), i))
+        // Routes are stored as Arcs so stream dispatch can hand a resolved
+        // non-streaming route to an owned synthesized stream.
+        let model_providers: Vec<(String, Arc<dyn ModelProvider>)> = model_providers
+            .into_iter()
+            .map(|(name, provider)| (name, Arc::from(provider)))
             .collect();
 
-        // Resolve routes to provider indices
-        let resolved_routes: HashMap<String, (usize, String)> = routes
+        // Build model_provider name → index lookup.
+        let provider_indices: HashMap<String, usize> = model_providers
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| (name.clone(), i))
+            .collect();
+
+        // Keep only routes whose provider was constructed successfully. The
+        // resulting resolver is then shared with Agent metadata resolution.
+        let resolved_routes: Vec<(String, Route)> = routes
             .into_iter()
             .filter_map(|(hint, route)| {
-                let index = name_to_index.get(route.provider_name.as_str()).copied();
-                match index {
-                    Some(i) => Some((hint, (i, route.model))),
+                match provider_indices.get(&route.provider_name) {
+                    Some(_) => Some((hint, route)),
                     None => {
-                        tracing::warn!(
-                            hint = hint,
-                            provider = route.provider_name,
-                            "Route references unknown provider, skipping"
-                        );
+                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"hint": hint, "model_provider": route.provider_name})), "Route references unknown model_provider, skipping");
                         None
                     }
                 }
             })
             .collect();
+        let default_provider_name = model_providers
+            .first()
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| alias.to_string());
+        let route_resolver = Arc::new(ModelRouteResolver::new(
+            resolved_routes,
+            default_provider_name,
+            default_model,
+        ));
 
         Self {
-            routes: resolved_routes,
-            providers,
+            alias: alias.to_string(),
+            route_resolver,
+            provider_indices,
+            model_providers,
             default_index: 0,
-            default_model,
         }
     }
 
-    /// Resolve a model parameter to the cheapest qualifying route based on pricing.
-    ///
-    /// If the model starts with `"hint:cost-optimized"` or `"hint:cheapest"`, this
-    /// method scores each route by `input_price + output_price` (a simple proxy for
-    /// total cost), optionally filtering by capability requirements, and returns the
-    /// cheapest qualifying route.
-    ///
-    /// Falls back to the default route when no pricing data matches.
+    #[must_use]
+    pub fn route_resolver(&self) -> Arc<ModelRouteResolver> {
+        Arc::clone(&self.route_resolver)
+    }
     pub fn resolve_cost_optimized(
         &self,
         model: &str,
-        prices: &HashMap<String, ModelPricing>,
+        model_provider_pricing: &HashMap<String, HashMap<String, f64>>,
         required_vision: bool,
         required_tools: bool,
     ) -> (usize, String) {
@@ -97,20 +237,27 @@ impl RouterProvider {
 
         let mut candidates: Vec<(usize, String, f64)> = Vec::new();
 
-        for (idx, route_model) in self.routes.values() {
+        for route in self.route_resolver.routes.values() {
+            let Some(idx) = self.provider_indices.get(&route.provider_name).copied() else {
+                continue;
+            };
             // Capability filtering
-            if let Some((_, provider)) = self.providers.get(*idx) {
-                if required_vision && !provider.supports_vision() {
+            if let Some((_, model_provider)) = self.model_providers.get(idx) {
+                if required_vision && !model_provider.supports_vision() {
                     continue;
                 }
-                if required_tools && !provider.supports_native_tools() {
+                if required_tools && !model_provider.supports_native_tools() {
                     continue;
                 }
             }
 
-            if let Some(pricing) = prices.get(route_model) {
-                let total_cost = pricing.input + pricing.output;
-                candidates.push((*idx, route_model.clone(), total_cost));
+            let Some((model_provider_name, _)) = self.model_providers.get(idx) else {
+                continue;
+            };
+            if let Some(pricing) = model_provider_pricing.get(model_provider_name)
+                && let Some(total_cost) = score_model(pricing, &route.model)
+            {
+                candidates.push((idx, route.model.clone(), total_cost));
             }
         }
 
@@ -122,43 +269,44 @@ impl RouterProvider {
         }
 
         // Fallback to default
-        tracing::warn!(
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "No cost-optimized route found with matching pricing data, \
              falling back to default"
         );
-        (self.default_index, self.default_model.clone())
+        (
+            self.default_index,
+            self.route_resolver.default_model.clone(),
+        )
     }
 
-    /// Resolve a model parameter to a (provider, actual_model) pair.
-    ///
-    /// If the model starts with "hint:", look up the hint in the route table.
-    /// Otherwise, use the default provider with the given model name.
-    /// Resolve a model parameter to a (provider_index, actual_model) pair.
     fn resolve(&self, model: &str) -> (usize, String) {
-        if let Some(hint) = model.strip_prefix("hint:") {
-            if let Some((idx, resolved_model)) = self.routes.get(hint) {
-                return (*idx, resolved_model.clone());
-            }
-            tracing::warn!(
-                hint = hint,
-                "Unknown route hint, falling back to default provider"
+        let resolved = self.route_resolver.resolve(model);
+        if resolved.kind == RouteResolutionKind::UnknownHintFallback {
+            let hint = model.strip_prefix("hint:").unwrap_or_default();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"hint": hint})),
+                "Unknown route hint, falling back to default model_provider"
             );
         }
-
-        // Not a hint or hint not found — use default provider with the model as-is
-        (self.default_index, model.to_string())
+        let index = self
+            .provider_indices
+            .get(&resolved.provider_name)
+            .copied()
+            .unwrap_or(self.default_index);
+        (index, resolved.model)
     }
 }
 
-/// A cost-optimized routing strategy that selects the cheapest qualifying
-/// provider from the route table based on `ModelPricing` data.
-///
-/// This wraps pricing config and capability requirements, scoring candidates
-/// by their combined input + output cost per 1M tokens.
 #[derive(Debug, Clone)]
 pub struct CostOptimizedStrategy {
-    /// Per-model pricing data (keyed by model name).
-    pub prices: HashMap<String, ModelPricing>,
+    /// Per-provider pricing data (model_provider name → user-keyed pricing map).
+    pub model_provider_pricing: HashMap<String, HashMap<String, f64>>,
     /// Whether the request requires vision support.
     pub required_vision: bool,
     /// Whether the request requires native tool support.
@@ -166,10 +314,11 @@ pub struct CostOptimizedStrategy {
 }
 
 impl CostOptimizedStrategy {
-    /// Create a new cost-optimized strategy with the given pricing data.
-    pub fn new(prices: HashMap<String, ModelPricing>) -> Self {
+    /// Create a new cost-optimized strategy with the given per-provider
+    /// pricing data.
+    pub fn new(model_provider_pricing: HashMap<String, HashMap<String, f64>>) -> Self {
         Self {
-            prices,
+            model_provider_pricing,
             required_vision: false,
             required_tools: false,
         }
@@ -187,15 +336,35 @@ impl CostOptimizedStrategy {
         self
     }
 
-    /// Score a model by total cost (input + output per 1M tokens).
-    /// Returns `None` if no pricing data is available for the model.
-    pub fn score(&self, model: &str) -> Option<f64> {
-        self.prices.get(model).map(|p| p.input + p.output)
+    /// Score a route by summing pricing entries that match the model.
+    /// Returns `None` if no pricing data is available for the route.
+    pub fn score(&self, model_provider_name: &str, model: &str) -> Option<f64> {
+        let pricing = self.model_provider_pricing.get(model_provider_name)?;
+        score_model(pricing, model)
     }
 }
 
 #[async_trait]
-impl Provider for RouterProvider {
+impl ModelProvider for RouterModelProvider {
+    fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .is_some_and(|(_, provider)| {
+                provider.supports_exact_request_replay(request, &resolved_model)
+            })
+    }
+
+    fn has_stable_request_identity(&self, model: &str) -> bool {
+        if model.starts_with("hint:") {
+            return false;
+        }
+
+        self.model_providers
+            .get(self.default_index)
+            .is_some_and(|(_, provider)| provider.has_stable_request_identity(model))
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -203,18 +372,26 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
 
-        let (provider_name, provider) = &self.providers[provider_idx];
-        tracing::info!(
-            provider = provider_name.as_str(),
-            model = resolved_model.as_str(),
-            "Router dispatching request"
-        );
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        // `provider_name` is the configured `<type>.<alias>` key the
+        // caller registered with `RouterModelProvider::new` — already a
+        // composite. Layer's `set_composite` splits it on emit.
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name.as_str(), "model": resolved_model.as_str()})), "router dispatching request");
 
-        provider
-            .chat_with_system(system_prompt, message, &resolved_model, temperature)
-            .await
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat_with_system(
+                system_prompt,
+                message,
+                &resolved_model,
+                temperature,
+            ),
+        )
+        .await
     }
 
     async fn chat_with_history(
@@ -223,11 +400,19 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider
-            .chat_with_history(messages, &resolved_model, temperature)
-            .await
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat_with_history(
+                messages,
+                &resolved_model,
+                temperature,
+            ),
+        )
+        .await
     }
 
     async fn chat(
@@ -236,9 +421,36 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider.chat(request, &resolved_model, temperature).await
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat_with_tool_round_policy(
+                request,
+                &resolved_model,
+                temperature,
+                policy,
+            ),
+        )
+        .await
     }
 
     async fn chat_with_tools(
@@ -248,30 +460,63 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider
-            .chat_with_tools(messages, tools, &resolved_model, temperature)
-            .await
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat_with_tools(
+                messages,
+                tools,
+                &resolved_model,
+                temperature,
+            ),
+        )
+        .await
     }
 
     fn supports_native_tools(&self) -> bool {
-        self.providers
+        self.model_providers
             .get(self.default_index)
             .map(|(_, p)| p.supports_native_tools())
             .unwrap_or(false)
     }
 
     fn supports_streaming(&self) -> bool {
-        self.providers
+        self.model_providers
             .iter()
-            .any(|(_, provider)| provider.supports_streaming())
+            .any(|(_, model_provider)| model_provider.supports_streaming())
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
-        self.providers
+        self.model_providers
             .iter()
-            .any(|(_, provider)| provider.supports_streaming_tool_events())
+            .any(|(_, model_provider)| model_provider.supports_streaming_tool_events())
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        mark_current_dispatch_composite();
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        stream_with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_system(
+                system_prompt,
+                message,
+                &resolved_model,
+                temperature,
+                options,
+            ),
+        )
     }
 
     fn stream_chat_with_history(
@@ -281,9 +526,19 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        stream_with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_history(
+                messages,
+                &resolved_model,
+                temperature,
+                options,
+            ),
+        )
     }
 
     fn stream_chat(
@@ -293,49 +548,215 @@ impl Provider for RouterProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider.stream_chat(request, &resolved_model, temperature, options)
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        if options.enabled && !model_provider.supports_streaming() {
+            // Only an ENABLED stream synthesizes. Capabilities describe the
+            // served route: a resolved route that disclaims streaming is
+            // dispatched non-streaming and its complete response is
+            // synthesized into the event sequence; streaming a route that
+            // cannot preserve its own contract (or skipping it for a later
+            // fallback) would invert the operator's route ranking. A DISABLED
+            // stream is not the router's to synthesize: the leaf provider
+            // owns that contract (the compatible and OpenRouter leaves return
+            // a terminal Final event and make no request), so the request
+            // falls through to the leaf's own stream_chat below, exactly as
+            // it did before route synthesis existed.
+            let provider = Arc::clone(model_provider);
+            let provider_name = provider_name.clone();
+            let resolved_model = resolved_model.clone();
+            let count_tokens = options.count_tokens;
+            let messages: Vec<ChatMessage> = request.messages.to_vec();
+            let tools: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
+                request.tools.map(<[zeroclaw_api::tool::ToolSpec]>::to_vec);
+            let thinking = request.thinking;
+            return stream::once(async move {
+                let request = ChatRequest {
+                    messages: &messages,
+                    tools: tools.as_deref(),
+                    thinking,
+                };
+                // The synthesized call is still a routed dispatch: the
+                // configured route identity must reach the accounting node
+                // exactly as it does on the streaming arm below.
+                match with_exact_dispatch_route(
+                    provider_name,
+                    resolved_model.clone(),
+                    ProviderDispatch::from_ref(&*provider).chat_with_tool_round_policy(
+                        request,
+                        &resolved_model,
+                        temperature,
+                        policy,
+                    ),
+                )
+                .await
+                {
+                    Ok(response) => synthesize_stream_events(response, count_tokens),
+                    // The non-streaming call is complete by the time this arm
+                    // runs: its failure already survived the provider's own
+                    // retry/fallback budget. Mark the stream error terminal so
+                    // the runtime recovers it as a plain failed chat instead of
+                    // re-running the whole non-streaming call. The typed
+                    // failure rides the payload, relocated into the box as the
+                    // original error (anyhow's reallocate conversion, so the
+                    // box keeps the original vtable and the terminal
+                    // projection can downcast the typed layer).
+                    Err(error) => vec![Err(StreamError::Terminal(
+                        error.reallocate_into_boxed_dyn_error_without_backtrace(),
+                    ))],
+                }
+            })
+            .flat_map(stream::iter)
+            .boxed();
+        }
+        stream_with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_tool_round_policy(
+                request,
+                &resolved_model,
+                temperature,
+                options,
+                policy,
+            ),
+        )
+    }
+
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        let (index, resolved_model) = self.resolve(model);
+        self.model_providers[index]
+            .1
+            .supports_single_tool_rounds(&resolved_model)
+    }
+
+    fn capabilities(&self) -> crate::traits::ProviderCapabilities {
+        // Mirror `supports_vision()`'s delegation to the default provider so the
+        // wrapped surface's `capabilities().vision` stays consistent with
+        // `supports_vision()` when an inner capability decorator (e.g. the config
+        // `vision` override) has patched it. Without this, `capabilities()` would
+        // fall back to the trait default and disagree with `supports_vision()`.
+        self.model_providers
+            .get(self.default_index)
+            .map(|(_, p)| p.capabilities())
+            .unwrap_or_default()
+    }
+
+    fn capabilities_for_model(&self, model: &str) -> crate::traits::ProviderCapabilities {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .map(|(_, provider)| provider.capabilities_for_model(&resolved_model))
+            .unwrap_or_default()
+    }
+
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .and_then(|(_, provider)| provider.vision_limited_by(&resolved_model))
+    }
+
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .is_some_and(|(_, provider)| {
+                provider.has_mixed_native_tool_support_for_model(&resolved_model)
+            })
     }
 
     fn supports_vision(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_vision())
+        self.model_providers
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_vision())
+            .unwrap_or(false)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        for (name, provider) in &self.providers {
-            tracing::info!(provider = name, "Warming up routed provider");
-            if let Err(e) = provider.warmup().await {
-                tracing::warn!(provider = name, "Warmup failed (non-fatal): {e}");
+        for (name, model_provider) in &self.model_providers {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"model_provider": name})),
+                "Warming up routed model_provider"
+            );
+            if let Err(e) = ProviderDispatch::from_ref(&**model_provider).warmup().await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": format!("{}", e), "model_provider": name})
+                        ),
+                    "Warmup failed (non-fatal)"
+                );
             }
         }
         Ok(())
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for RouterModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Router,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::AccountedChatScope;
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::model_provider::{TokenUsage, ToolCall};
     use zeroclaw_api::tool::ToolSpec;
 
-    struct MockProvider {
+    struct MockModelProvider {
         calls: Arc<AtomicUsize>,
         response: &'static str,
         last_model: parking_lot::Mutex<String>,
+        vision: bool,
     }
 
-    impl MockProvider {
+    impl MockModelProvider {
         fn new(response: &'static str) -> Self {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
                 response,
                 last_model: parking_lot::Mutex::new(String::new()),
+                vision: false,
             }
+        }
+
+        fn with_vision(mut self, vision: bool) -> Self {
+            self.vision = vision;
+            self
         }
 
         fn call_count(&self) -> usize {
@@ -348,7 +769,15 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl ModelProvider for MockModelProvider {
+        fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
+            self.vision && model == "replay-model" && request.tools.is_none()
+        }
+
+        fn has_stable_request_identity(&self, _model: &str) -> bool {
+            true
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -360,24 +789,44 @@ mod tests {
             *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
         }
+
+        fn supports_vision(&self) -> bool {
+            self.vision
+        }
+
+        fn vision_limited_by(&self, model: &str) -> Option<String> {
+            Some(format!("limiter-for-{model}"))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockModelProvider"
+        }
     }
 
     fn make_router(
-        providers: Vec<(&'static str, &'static str)>,
+        model_providers: Vec<(&'static str, &'static str)>,
         routes: Vec<(&str, &str, &str)>,
-    ) -> (RouterProvider, Vec<Arc<MockProvider>>) {
-        let mocks: Vec<Arc<MockProvider>> = providers
+    ) -> (RouterModelProvider, Vec<Arc<MockModelProvider>>) {
+        let mocks: Vec<Arc<MockModelProvider>> = model_providers
             .iter()
-            .map(|(_, response)| Arc::new(MockProvider::new(response)))
+            .map(|(_, response)| Arc::new(MockModelProvider::new(response)))
             .collect();
 
-        let provider_list: Vec<(String, Box<dyn Provider>)> = providers
+        let provider_list: Vec<(String, Box<dyn ModelProvider>)> = model_providers
             .iter()
             .zip(mocks.iter())
             .map(|((name, _), mock)| {
                 (
                     (*name).to_string(),
-                    Box::new(Arc::clone(mock)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(mock)) as Box<dyn ModelProvider>,
                 )
             })
             .collect();
@@ -395,20 +844,58 @@ mod tests {
             })
             .collect();
 
-        let router = RouterProvider::new(provider_list, route_list, "default-model".to_string());
+        let router = RouterModelProvider::new(
+            "test",
+            provider_list,
+            route_list,
+            "default-model".to_string(),
+        );
 
         (router, mocks)
     }
 
-    // Arc<MockProvider> Provider impl provided by blanket impl in zeroclaw-types.
+    #[tokio::test]
+    async fn accounted_router_success_uses_selected_physical_route() {
+        let (router, _) = make_router(
+            vec![("configured.leaf", "ok")],
+            vec![("fast", "configured.leaf", "served-model")],
+        );
+        let messages = vec![ChatMessage::user("hello")];
 
-    struct StreamingMockProvider {
+        let outcome = ProviderDispatch::from_ref(&router)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:fast",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(leaf.provider_ref(), "configured.leaf");
+        assert_eq!(leaf.model(), "served-model");
+        let accepted = outcome
+            .accounting
+            .accepted_route()
+            .expect("the accepted route must be the physical leaf");
+        assert_eq!(accepted.provider_ref(), "configured.leaf");
+        assert_eq!(accepted.model(), "served-model");
+    }
+
+    // Arc<MockModelProvider> ModelProvider impl provided by blanket impl in zeroclaw-types.
+
+    struct StreamingMockModelProvider {
         stream_calls: Arc<AtomicUsize>,
         last_stream_model: parking_lot::Mutex<String>,
         response: &'static str,
     }
 
-    impl StreamingMockProvider {
+    impl StreamingMockModelProvider {
         fn new(response: &'static str) -> Self {
             Self {
                 stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -416,10 +903,20 @@ mod tests {
                 response,
             }
         }
+
+        fn stream_response(&self, model: &str) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_stream_model.lock() = model.to_string();
+            let chunks = vec![
+                Ok(StreamChunk::delta(self.response)),
+                Ok(StreamChunk::final_chunk()),
+            ];
+            futures_util::stream::iter(chunks).boxed()
+        }
     }
 
     #[async_trait]
-    impl Provider for StreamingMockProvider {
+    impl ModelProvider for StreamingMockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -434,6 +931,17 @@ mod tests {
             true
         }
 
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_response(model)
+        }
+
         fn stream_chat_with_history(
             &self,
             _messages: &[ChatMessage],
@@ -441,25 +949,31 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-            self.stream_calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_stream_model.lock() = model.to_string();
-            let chunks = vec![
-                Ok(StreamChunk::delta(self.response)),
-                Ok(StreamChunk::final_chunk()),
-            ];
-            futures_util::stream::iter(chunks).boxed()
+            self.stream_response(model)
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for StreamingMockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StreamingMockModelProvider"
         }
     }
 
-    // Arc<StreamingMockProvider> Provider impl provided by blanket impl in zeroclaw-types.
+    // Arc<StreamingMockModelProvider> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
-    struct ToolEventStreamingMockProvider {
+    struct ToolEventStreamingMockModelProvider {
         stream_calls: Arc<AtomicUsize>,
         tool_event_calls: Arc<AtomicUsize>,
         last_stream_model: parking_lot::Mutex<String>,
     }
 
-    impl ToolEventStreamingMockProvider {
+    impl ToolEventStreamingMockModelProvider {
         fn new() -> Self {
             Self {
                 stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -470,7 +984,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for ToolEventStreamingMockProvider {
+    impl ModelProvider for ToolEventStreamingMockModelProvider {
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -513,8 +1027,20 @@ mod tests {
             .boxed()
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for ToolEventStreamingMockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolEventStreamingMockModelProvider"
+        }
+    }
 
-    // Arc<ToolEventStreamingMockProvider> Provider impl provided by blanket impl in zeroclaw-types.
+    // Arc<ToolEventStreamingMockModelProvider> ModelProvider impl provided by blanket impl in zeroclaw-types.
 
     #[tokio::test]
     async fn routes_hint_to_correct_provider() {
@@ -610,6 +1136,17 @@ mod tests {
     }
 
     #[test]
+    fn routed_hint_request_identity_is_unstable() {
+        let (router, _) = make_router(
+            vec![("fast", "ok"), ("smart", "ok")],
+            vec![("reasoning", "smart", "claude-opus")],
+        );
+
+        assert!(!router.has_stable_request_identity("hint:reasoning"));
+        assert!(router.has_stable_request_identity("claude-opus"));
+    }
+
+    #[test]
     fn skips_routes_with_unknown_provider() {
         let (router, _) = make_router(
             vec![("default", "ok")],
@@ -617,7 +1154,90 @@ mod tests {
         );
 
         // Route should not exist
-        assert!(!router.routes.contains_key("broken"));
+        assert!(!router.route_resolver().has_hint("broken"));
+    }
+
+    #[test]
+    fn shared_resolver_reports_the_route_used_for_hint_dispatch() {
+        let (router, _) = make_router(
+            vec![("default.profile", "default"), ("fast.profile", "fast")],
+            vec![("fast", "fast.profile", "fast-model")],
+        );
+        let resolver = router.route_resolver();
+
+        let selected = resolver.resolve("hint:fast");
+        assert_eq!(selected.provider_name, "fast.profile");
+        assert_eq!(selected.model, "fast-model");
+        assert_eq!(selected.kind, RouteResolutionKind::MatchedHint);
+        assert_eq!(router.resolve("hint:fast"), (1, "fast-model".to_string()));
+
+        let unknown = resolver.resolve("hint:missing");
+        assert_eq!(unknown.provider_name, "default.profile");
+        assert_eq!(unknown.model, "hint:missing");
+        assert_eq!(unknown.kind, RouteResolutionKind::UnknownHintFallback);
+    }
+
+    #[test]
+    fn exact_replay_uses_selected_provider_and_model() {
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockModelProvider::new("no replay")),
+                ),
+                (
+                    "replay".into(),
+                    Box::new(MockModelProvider::new("ok").with_vision(true)),
+                ),
+            ],
+            vec![
+                (
+                    "safe".into(),
+                    Route {
+                        provider_name: "replay".into(),
+                        model: "replay-model".into(),
+                    },
+                ),
+                (
+                    "unsafe".into(),
+                    Route {
+                        provider_name: "replay".into(),
+                        model: "other-model".into(),
+                    },
+                ),
+            ],
+            "replay-model".into(),
+        );
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        assert!(router.supports_exact_request_replay(request, "hint:safe"));
+        for model in ["hint:unsafe", "hint:unknown", "replay-model"] {
+            assert!(!router.supports_exact_request_replay(request, model));
+        }
+        assert!(!router.supports_exact_request_replay(
+            ChatRequest {
+                tools: Some(&[]),
+                ..request
+            },
+            "hint:safe"
+        ));
+    }
+
+    #[test]
+    fn vision_attribution_uses_the_hinted_route_model() {
+        let (router, _) = make_router(
+            vec![("default", "default"), ("vision", "vision")],
+            vec![("images", "vision", "routed-vision-model")],
+        );
+
+        assert_eq!(
+            router.vision_limited_by("hint:images").as_deref(),
+            Some("limiter-for-routed-vision-model")
+        );
     }
 
     #[tokio::test]
@@ -630,11 +1250,12 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_passes_system_prompt() {
-        let mock = Arc::new(MockProvider::new("response"));
-        let router = RouterProvider::new(
+        let mock = Arc::new(MockModelProvider::new("response"));
+        let router = RouterModelProvider::new(
+            "test",
             vec![(
                 "default".into(),
-                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+                Box::new(Arc::clone(&mock)) as Box<dyn ModelProvider>,
             )],
             vec![],
             "model".into(),
@@ -650,11 +1271,12 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_delegates_to_resolved_provider() {
-        let mock = Arc::new(MockProvider::new("tool-response"));
-        let router = RouterProvider::new(
+        let mock = Arc::new(MockModelProvider::new("tool-response"));
+        let router = RouterModelProvider::new(
+            "test",
             vec![(
                 "default".into(),
-                Box::new(Arc::clone(&mock)) as Box<dyn Provider>,
+                Box::new(Arc::clone(&mock)) as Box<dyn ModelProvider>,
             )],
             vec![],
             "model".into(),
@@ -674,7 +1296,7 @@ mod tests {
         })];
 
         // chat_with_tools should delegate through the router to the mock.
-        // MockProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
+        // MockModelProvider's default chat_with_tools calls chat_with_history -> chat_with_system.
         let result = router
             .chat_with_tools(&messages, &tools, "model", Some(0.7))
             .await
@@ -711,14 +1333,14 @@ mod tests {
 
     use crate::traits::ProviderCapabilities;
 
-    /// Mock provider with configurable capability flags.
-    struct CapableMockProvider {
+    /// Mock model_provider with configurable capability flags.
+    struct CapableMockModelProvider {
         response: &'static str,
         vision: bool,
         tools: bool,
     }
 
-    impl CapableMockProvider {
+    impl CapableMockModelProvider {
         fn new(response: &'static str, vision: bool, tools: bool) -> Self {
             Self {
                 response,
@@ -729,12 +1351,13 @@ mod tests {
     }
 
     #[async_trait]
-    impl Provider for CapableMockProvider {
+    impl ModelProvider for CapableMockModelProvider {
         fn capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 native_tool_calling: self.tools,
                 vision: self.vision,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -748,24 +1371,41 @@ mod tests {
             Ok(self.response.to_string())
         }
     }
+    impl ::zeroclaw_api::attribution::Attributable for CapableMockModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CapableMockModelProvider"
+        }
+    }
 
-    fn make_pricing(entries: Vec<(&str, f64, f64)>) -> HashMap<String, ModelPricing> {
-        entries
-            .into_iter()
-            .map(|(model, input, output)| (model.to_string(), ModelPricing { input, output }))
-            .collect()
+    /// Build a per-provider pricing map for tests. Each tuple is
+    /// `(provider_name, model, input_per_mtok, output_per_mtok)`.
+    fn make_pricing(entries: Vec<(&str, &str, f64, f64)>) -> HashMap<String, HashMap<String, f64>> {
+        let mut map: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        for (model_provider, model, input, output) in entries {
+            let inner = map.entry(model_provider.to_string()).or_default();
+            inner.insert(format!("{model}.input"), input);
+            inner.insert(format!("{model}.output"), output);
+        }
+        map
     }
 
     #[test]
     fn cost_optimized_selects_cheapest_provider() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![
             (
                 "expensive".into(),
-                Box::new(CapableMockProvider::new("exp", false, false)),
+                Box::new(CapableMockModelProvider::new("exp", false, false)),
             ),
             (
                 "cheap".into(),
-                Box::new(CapableMockProvider::new("chp", false, false)),
+                Box::new(CapableMockModelProvider::new("chp", false, false)),
             ),
         ];
         let routes = vec![
@@ -784,9 +1424,13 @@ mod tests {
                 },
             ),
         ];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router =
+            RouterModelProvider::new("test", model_providers, routes, "default-model".into());
 
-        let prices = make_pricing(vec![("big-model", 15.0, 75.0), ("small-model", 0.25, 1.25)]);
+        let prices = make_pricing(vec![
+            ("expensive", "big-model", 15.0, 75.0),
+            ("cheap", "small-model", 0.25, 1.25),
+        ]);
 
         let (idx, model) =
             router.resolve_cost_optimized("hint:cost-optimized", &prices, false, false);
@@ -796,14 +1440,14 @@ mod tests {
 
     #[test]
     fn cost_optimized_respects_vision_requirement() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![
             (
                 "no-vision".into(),
-                Box::new(CapableMockProvider::new("nv", false, false)),
+                Box::new(CapableMockModelProvider::new("nv", false, false)),
             ),
             (
                 "has-vision".into(),
-                Box::new(CapableMockProvider::new("hv", true, false)),
+                Box::new(CapableMockModelProvider::new("hv", true, false)),
             ),
         ];
         let routes = vec![
@@ -822,11 +1466,12 @@ mod tests {
                 },
             ),
         ];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router =
+            RouterModelProvider::new("test", model_providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
-            ("cheap-model", 0.10, 0.40),
-            ("vision-model", 3.0, 15.0),
+            ("no-vision", "cheap-model", 0.10, 0.40),
+            ("has-vision", "vision-model", 3.0, 15.0),
         ]);
 
         // With vision required, the cheap model (no vision) is filtered out
@@ -836,14 +1481,14 @@ mod tests {
 
     #[test]
     fn cost_optimized_respects_tools_requirement() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![
             (
                 "no-tools".into(),
-                Box::new(CapableMockProvider::new("nt", false, false)),
+                Box::new(CapableMockModelProvider::new("nt", false, false)),
             ),
             (
                 "has-tools".into(),
-                Box::new(CapableMockProvider::new("ht", false, true)),
+                Box::new(CapableMockModelProvider::new("ht", false, true)),
             ),
         ];
         let routes = vec![
@@ -862,11 +1507,12 @@ mod tests {
                 },
             ),
         ];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router =
+            RouterModelProvider::new("test", model_providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
-            ("basic-model", 0.10, 0.40),
-            ("tools-model", 5.0, 15.0),
+            ("no-tools", "basic-model", 0.10, 0.40),
+            ("has-tools", "tools-model", 5.0, 15.0),
         ]);
 
         // With tools required, the basic model (no tools) is filtered out
@@ -882,7 +1528,7 @@ mod tests {
         );
 
         // Empty pricing map — no matches possible
-        let prices: HashMap<String, ModelPricing> = HashMap::new();
+        let prices: HashMap<String, HashMap<String, f64>> = HashMap::new();
         let (idx, model) =
             router.resolve_cost_optimized("hint:cost-optimized", &prices, false, false);
         assert_eq!(idx, 0);
@@ -891,9 +1537,9 @@ mod tests {
 
     #[test]
     fn cost_optimized_with_single_route() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![(
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![(
             "only".into(),
-            Box::new(CapableMockProvider::new("ok", false, false)),
+            Box::new(CapableMockModelProvider::new("ok", false, false)),
         )];
         let routes = vec![(
             "single".to_string(),
@@ -902,9 +1548,10 @@ mod tests {
                 model: "the-model".into(),
             },
         )];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router =
+            RouterModelProvider::new("test", model_providers, routes, "default-model".into());
 
-        let prices = make_pricing(vec![("the-model", 1.0, 2.0)]);
+        let prices = make_pricing(vec![("only", "the-model", 1.0, 2.0)]);
 
         let (idx, model) = router.resolve_cost_optimized("hint:cheapest", &prices, false, false);
         assert_eq!(idx, 0);
@@ -913,18 +1560,18 @@ mod tests {
 
     #[test]
     fn cost_optimized_prefers_lower_total_cost() {
-        let providers: Vec<(String, Box<dyn Provider>)> = vec![
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![
             (
                 "p1".into(),
-                Box::new(CapableMockProvider::new("r1", false, false)),
+                Box::new(CapableMockModelProvider::new("r1", false, false)),
             ),
             (
                 "p2".into(),
-                Box::new(CapableMockProvider::new("r2", false, false)),
+                Box::new(CapableMockModelProvider::new("r2", false, false)),
             ),
             (
                 "p3".into(),
-                Box::new(CapableMockProvider::new("r3", false, false)),
+                Box::new(CapableMockModelProvider::new("r3", false, false)),
             ),
         ];
         let routes = vec![
@@ -950,12 +1597,13 @@ mod tests {
                 },
             ),
         ];
-        let router = RouterProvider::new(providers, routes, "default-model".into());
+        let router =
+            RouterModelProvider::new("test", model_providers, routes, "default-model".into());
 
         let prices = make_pricing(vec![
-            ("model-a", 10.0, 50.0), // total: 60
-            ("model-b", 0.15, 0.60), // total: 0.75 (cheapest)
-            ("model-c", 3.0, 15.0),  // total: 18
+            ("p1", "model-a", 10.0, 50.0), // total: 60
+            ("p2", "model-b", 0.15, 0.60), // total: 0.75 (cheapest)
+            ("p3", "model-c", 3.0, 15.0),  // total: 18
         ]);
 
         let (idx, model) =
@@ -966,26 +1614,40 @@ mod tests {
 
     #[test]
     fn cost_optimized_strategy_score() {
-        let prices = make_pricing(vec![("cheap", 0.10, 0.40), ("expensive", 15.0, 75.0)]);
+        let prices = make_pricing(vec![
+            ("cheap-provider", "cheap-model", 0.10, 0.40),
+            ("expensive-provider", "expensive-model", 15.0, 75.0),
+        ]);
         let strategy = CostOptimizedStrategy::new(prices);
 
-        assert!((strategy.score("cheap").unwrap() - 0.50).abs() < f64::EPSILON);
-        assert!((strategy.score("expensive").unwrap() - 90.0).abs() < f64::EPSILON);
-        assert!(strategy.score("unknown").is_none());
+        assert!(
+            (strategy.score("cheap-provider", "cheap-model").unwrap() - 0.50).abs() < f64::EPSILON
+        );
+        assert!(
+            (strategy
+                .score("expensive-provider", "expensive-model")
+                .unwrap()
+                - 90.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(strategy.score("cheap-provider", "unknown").is_none());
+        assert!(strategy.score("unknown-provider", "cheap-model").is_none());
     }
 
     #[tokio::test]
     async fn supports_streaming_returns_true_when_any_provider_supports_it() {
-        let streaming = Arc::new(StreamingMockProvider::new("stream"));
-        let router = RouterProvider::new(
+        let streaming = Arc::new(StreamingMockModelProvider::new("stream"));
+        let router = RouterModelProvider::new(
+            "test",
             vec![
                 (
                     "default".into(),
-                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
                 ),
                 (
                     "streaming".into(),
-                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
                 ),
             ],
             vec![(
@@ -1001,18 +1663,711 @@ mod tests {
         assert!(router.supports_streaming());
     }
 
+    struct NonStreamingChatMock {
+        chat_calls: Arc<AtomicUsize>,
+        stream_calls: Arc<AtomicUsize>,
+        reasoning_line: &'static str,
+    }
+
+    impl NonStreamingChatMock {
+        fn new(reasoning_line: &'static str) -> Self {
+            Self {
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                reasoning_line,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for NonStreamingChatMock {
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: Some(self.reasoning_line.to_string()),
+            })
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !options.enabled {
+                // Mirror the compatible leaf's disabled contract: no
+                // request, a terminal Final event.
+                return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+            }
+            stream::once(async {
+                Err(StreamError::ModelProvider(
+                    "non-streaming route must never be streamed".to_string(),
+                ))
+            })
+            .boxed()
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for NonStreamingChatMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NonStreamingChatMock"
+        }
+    }
+
+    /// Non-streaming leaf whose chat response carries a tool call, usage,
+    /// and signed reasoning: the full payload a synthesized sequence must
+    /// preserve through nested wrappers.
+    struct NonStreamingToolCallMock {
+        chat_calls: Arc<AtomicUsize>,
+        stream_calls: Arc<AtomicUsize>,
+    }
+
+    impl NonStreamingToolCallMock {
+        fn new() -> Self {
+            Self {
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for NonStreamingToolCallMock {
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "get_weather".to_string(),
+                    arguments: r#"{"city": "SF"}"#.to_string(),
+                    extra_content: None,
+                }],
+                usage: Some(TokenUsage {
+                    input_tokens: Some(13),
+                    output_tokens: Some(7),
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                }),
+                reasoning_content: Some(r#"{"thinking":"t","signature":"sig"}"#.to_string()),
+            })
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::once(async {
+                Err(StreamError::ModelProvider(
+                    "non-streaming leaf must never be streamed".to_string(),
+                ))
+            })
+            .boxed()
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for NonStreamingToolCallMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "NonStreamingToolCallMock"
+        }
+    }
+
     #[tokio::test]
-    async fn stream_chat_with_history_routes_hint_to_correct_provider_and_model() {
-        let streaming = Arc::new(StreamingMockProvider::new("streamed response"));
-        let router = RouterProvider::new(
+    async fn synthesized_stream_attributes_the_configured_route_not_the_leaf_alias() {
+        // The synthesized non-streaming arm is a routed dispatch like any
+        // other: the accounting leaf must carry the configured route name
+        // and resolved model, not the wrapped provider's own alias.
+        let leaf = Arc::new(NonStreamingToolCallMock::new());
+        let router = RouterModelProvider::new(
+            "test",
+            vec![(
+                "gateway-primary".into(),
+                Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+            )],
+            vec![(
+                "route".to_string(),
+                crate::router::Route {
+                    provider_name: "gateway-primary".to_string(),
+                    model: "inner-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+        let events: Vec<_> = scope
+            .scope(async {
+                ProviderDispatch::from_ref(&router)
+                    .stream_chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "hint:route",
+                        None,
+                        StreamOptions::new(true),
+                    )
+                    .collect()
+                    .await
+            })
+            .await;
+        scope.mark_logical_success();
+        let report = scope.take();
+
+        assert!(events.iter().all(Result::is_ok));
+        assert_eq!(leaf.chat_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            report.attempts().len(),
+            1,
+            "one physical leaf; the router itself is a composite"
+        );
+        let attempt = &report.attempts()[0];
+        assert_eq!(
+            attempt.provider_ref(),
+            "gateway-primary",
+            "the synthesized arm must record the configured route, not the leaf alias"
+        );
+        assert_eq!(attempt.model(), "inner-model");
+        let accepted = report
+            .accepted_route()
+            .expect("a successful synthesized call has an accepted route");
+        assert_eq!(accepted.provider_ref(), "gateway-primary");
+        assert_eq!(accepted.model(), "inner-model");
+    }
+
+    #[tokio::test]
+    async fn nested_router_reliable_synthesizes_full_payload_without_streaming_leg() {
+        // Production shape: Router → Reliable → leaf, where the resolved
+        // reliability domain is all-non-streaming while an unrelated route
+        // streams. The router must serve the resolved domain non-streaming
+        // and synthesize the complete event sequence, tool calls and usage
+        // included, with every streaming leg idle.
+        let leaf = Arc::new(NonStreamingToolCallMock::new());
+        let streaming = Arc::new(ToolEventStreamingMockModelProvider::new());
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "leaf".into(),
+                Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "test",
             vec![
                 (
-                    "default".into(),
-                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                    "reliable".into(),
+                    Box::new(reliable) as Box<dyn ModelProvider>,
                 ),
                 (
                     "streaming".into(),
-                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "route".to_string(),
+                crate::router::Route {
+                    provider_name: "reliable".to_string(),
+                    model: "inner-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+
+        assert!(router.supports_streaming());
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let events: Vec<_> = router
+            .stream_chat(request, "hint:route", None, StreamOptions::new(true))
+            .collect()
+            .await;
+
+        assert_eq!(
+            events.len(),
+            5,
+            "synthesized: reasoning, text, tool call, usage, final"
+        );
+        assert!(events.iter().all(Result::is_ok));
+        assert!(
+            matches!(&events[0], Ok(StreamEvent::ReasoningFinalized(reasoning)) if reasoning.contains("sig")),
+            "durable signed reasoning must survive the nested synthesis"
+        );
+        assert!(matches!(&events[1], Ok(StreamEvent::TextDelta(chunk)) if chunk.delta == "ok"),);
+        assert!(
+            matches!(&events[2], Ok(StreamEvent::ToolCall(call))
+                if call.id == "call_1" && call.name == "get_weather" && call.arguments.contains("SF")),
+            "the tool call must reach consumers intact through the nesting"
+        );
+        assert!(
+            matches!(&events[3], Ok(StreamEvent::Usage(usage))
+                if usage.input_tokens == Some(13) && usage.output_tokens == Some(7)),
+            "usage must reach consumers intact through the nesting"
+        );
+        assert!(matches!(&events[4], Ok(StreamEvent::Final)));
+
+        assert_eq!(
+            leaf.chat_calls.load(Ordering::SeqCst),
+            1,
+            "the nested non-streaming leaf must serve the request"
+        );
+        assert_eq!(
+            leaf.stream_calls.load(Ordering::SeqCst),
+            0,
+            "the nested leaf must never be streamed"
+        );
+        assert_eq!(
+            streaming.stream_calls.load(Ordering::SeqCst),
+            0,
+            "the unrelated streaming route must stay idle"
+        );
+    }
+
+    /// R4 pin: the synthesized arm is the ONLY legitimate producer of
+    /// `StreamError::Terminal` (enforced workspace-wide by the
+    /// stream_error_terminal architecture gate). A resolved non-streaming
+    /// route that fails has already exhausted its own retry budget inside
+    /// the completed `chat()` call, so the synthesized failure event must
+    /// carry the terminal identity verbatim.
+    struct FailingNonStreamingLeaf;
+
+    #[async_trait]
+    impl ModelProvider for FailingNonStreamingLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            anyhow::bail!("401 Unauthorized: invalid api key")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            false
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            stream::once(async {
+                Err(StreamError::ModelProvider(
+                    "non-streaming leaf must never be streamed".to_string(),
+                ))
+            })
+            .boxed()
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FailingNonStreamingLeaf {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "FailingNonStreamingLeaf"
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_failure_emits_terminal_error() {
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable",
+            vec![(
+                "leaf".into(),
+                Box::new(FailingNonStreamingLeaf) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let router = RouterModelProvider::new(
+            "test",
+            vec![("reliable".into(), Box::new(reliable))],
+            vec![],
+            "default-model".to_string(),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let events: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(true))
+            .collect()
+            .await;
+
+        assert_eq!(
+            events.len(),
+            1,
+            "a failed synthesized call surfaces as a single error event"
+        );
+        match &events[0] {
+            Err(StreamError::Terminal(source)) => {
+                let message = source.to_string();
+                assert!(
+                    message.contains("All model providers/models failed"),
+                    "the reliability domain's terminal cause must survive synthesis verbatim: {message}"
+                );
+            }
+            other => panic!("the synthesized arm must emit Terminal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_streaming_options_delegate_to_the_leaf_contract() {
+        // Disabled streaming is a no-request terminal event owned by the
+        // leaf provider, not synthesis territory: the router forwards the
+        // request to the leaf's stream_chat exactly as it did before route
+        // synthesis, never dispatching a chat call behind a disabled flag.
+        // Enabled streaming on the same disclaiming route still synthesizes,
+        // so the split is pinned from both sides.
+        let leaf = Arc::new(NonStreamingChatMock::new(
+            r#"{"thinking":"t","signature":"sig"}"#,
+        ));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![(
+                "leaf".into(),
+                Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+            )],
+            vec![],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let events: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(false))
+            .collect()
+            .await;
+        assert_eq!(
+            events.len(),
+            1,
+            "disabled streaming yields the leaf's single terminal event"
+        );
+        assert!(
+            matches!(&events[0], Ok(StreamEvent::Final)),
+            "the leaf's disabled contract is a no-request Final event, got {:?}",
+            events[0]
+        );
+        assert_eq!(
+            leaf.chat_calls.load(Ordering::SeqCst),
+            0,
+            "a disabled stream must not dispatch a chat call"
+        );
+        assert_eq!(
+            leaf.stream_calls.load(Ordering::SeqCst),
+            1,
+            "the leaf's stream_chat owns the disabled contract"
+        );
+
+        let events: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(true))
+            .collect()
+            .await;
+        assert_eq!(
+            leaf.chat_calls.load(Ordering::SeqCst),
+            1,
+            "an enabled stream on the same disclaiming route synthesizes one chat call"
+        );
+        assert_eq!(
+            leaf.stream_calls.load(Ordering::SeqCst),
+            1,
+            "no streaming leg may touch the disclaiming route"
+        );
+        assert!(
+            events.iter().all(Result::is_ok),
+            "the synthesized sequence must complete: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Final))),
+            "the synthesized sequence ends in Final: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event, Ok(StreamEvent::TextDelta(_))) }),
+            "the synthesized sequence carries visible text: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn synthesized_stream_text_delta_honors_count_tokens() {
+        // The synthesized text delta must mirror the SSE paths: a token
+        // estimate when counting is on, none when it is off.
+        let leaf = Arc::new(NonStreamingChatMock::new(
+            r#"{"thinking":"t","signature":"sig"}"#,
+        ));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![(
+                "leaf".into(),
+                Box::new(Arc::clone(&leaf)) as Box<dyn ModelProvider>,
+            )],
+            vec![],
+            "default-model".to_string(),
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let counting: Vec<_> = router
+            .stream_chat(
+                request,
+                "default-model",
+                None,
+                StreamOptions::new(true).with_token_count(),
+            )
+            .collect()
+            .await;
+        let delta = counting
+            .iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::TextDelta(chunk)) => Some(chunk.token_count),
+                _ => None,
+            })
+            .expect("the synthesized sequence carries a text delta");
+        // The mock's text is "ok" (2 bytes); the estimate is len/4 rounded up.
+        assert_eq!(delta, 1, "counting on: the delta carries the estimate");
+
+        let plain: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(true))
+            .collect()
+            .await;
+        let plain_delta = plain
+            .iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::TextDelta(chunk)) => Some(chunk.token_count),
+                _ => None,
+            })
+            .expect("the synthesized sequence carries a text delta");
+        assert_eq!(
+            plain_delta, 0,
+            "counting off: the delta carries no estimate"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_serves_non_streaming_resolved_route_without_streaming_leg() {
+        // Composite attack regression: the router advertises streaming
+        // because an unrelated route streams, but the resolved route is a
+        // passthrough leaf that disclaims streaming. The resolved route must
+        // be served non-streaming with a synthesized event sequence; no
+        // streaming leg may touch it and the streaming route must stay idle.
+        let non_streaming = Arc::new(NonStreamingChatMock::new(
+            r#"{"thinking":"t","signature":"sig"}"#,
+        ));
+        let streaming = Arc::new(ToolEventStreamingMockModelProvider::new());
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "nonstreaming".into(),
+                    Box::new(Arc::clone(&non_streaming)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![],
+            "default-model".to_string(),
+        );
+
+        assert!(
+            router.supports_streaming(),
+            "aggregate advertises streaming because an unrelated route streams"
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let events: Vec<_> = router
+            .stream_chat(request, "default-model", None, StreamOptions::new(true))
+            .collect()
+            .await;
+
+        assert_eq!(events.len(), 3, "synthesized: reasoning, text, final");
+        assert!(events.iter().all(Result::is_ok));
+        assert!(
+            matches!(&events[0], Ok(StreamEvent::ReasoningFinalized(reasoning)) if reasoning.contains("sig")),
+            "durable signed reasoning must flow through the synthesized sequence"
+        );
+        assert!(
+            matches!(&events[1], Ok(StreamEvent::TextDelta(chunk)) if chunk.delta == "ok"),
+            "visible text must flow through the synthesized sequence"
+        );
+        assert!(matches!(&events[2], Ok(StreamEvent::Final)));
+
+        assert_eq!(
+            non_streaming.chat_calls.load(Ordering::SeqCst),
+            1,
+            "the resolved non-streaming route must serve the request"
+        );
+        assert_eq!(
+            non_streaming.stream_calls.load(Ordering::SeqCst),
+            0,
+            "the resolved route must never be streamed"
+        );
+        assert_eq!(
+            streaming.stream_calls.load(Ordering::SeqCst),
+            0,
+            "an unrelated streaming route must stay idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_system_routes_hint_to_correct_provider_and_model() {
+        let streaming = Arc::new(StreamingMockModelProvider::new("streamed system response"));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "reasoning".into(),
+                Route {
+                    provider_name: "streaming".into(),
+                    model: "claude-opus".into(),
+                },
+            )],
+            "model".into(),
+        );
+
+        let mut stream = router.stream_chat_with_system(
+            Some("system"),
+            "hello",
+            "hint:reasoning",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+
+        let mut collected = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("stream chunk should be ok");
+            collected.push_str(&chunk.delta);
+        }
+
+        assert_eq!(collected, "streamed system response");
+        assert_eq!(streaming.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_routes_hint_to_correct_provider_and_model() {
+        let streaming = Arc::new(StreamingMockModelProvider::new("streamed response"));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
                 ),
             ],
             vec![(
@@ -1046,16 +2401,17 @@ mod tests {
 
     #[tokio::test]
     async fn stream_chat_routes_hint_with_structured_tool_events() {
-        let streaming = Arc::new(ToolEventStreamingMockProvider::new());
-        let router = RouterProvider::new(
+        let streaming = Arc::new(ToolEventStreamingMockModelProvider::new());
+        let router = RouterModelProvider::new(
+            "test",
             vec![
                 (
                     "default".into(),
-                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
                 ),
                 (
                     "streaming".into(),
-                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
                 ),
             ],
             vec![(
@@ -1069,21 +2425,22 @@ mod tests {
         );
 
         let messages = vec![ChatMessage::user("hello")];
-        let tools = vec![ToolSpec {
-            name: "shell".to_string(),
-            description: "run shell commands".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run shell commands",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" }
                 }
             }),
-        }];
+        )];
 
         let mut stream = router.stream_chat(
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking: None,
             },
             "hint:reasoning",
             Some(0.0),
@@ -1105,5 +2462,206 @@ mod tests {
         assert_eq!(streaming.stream_calls.load(Ordering::SeqCst), 1);
         assert_eq!(streaming.tool_event_calls.load(Ordering::SeqCst), 1);
         assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
+    }
+
+    // supports_vision() must reflect the default provider,
+    // not .any() across all sub-providers. Otherwise the multimodal.vision_provider
+    // fallback in run_tool_call_loop and the image-marker stripping in the context
+    // compressor are silently bypassed in mixed-provider configurations.
+    #[test]
+    fn supports_vision_reflects_default_provider_not_any_route() {
+        let default_provider = Box::new(MockModelProvider::new("nope").with_vision(false));
+        let vision_route_provider = Box::new(MockModelProvider::new("ok").with_vision(true));
+
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                ("default".into(), default_provider as Box<dyn ModelProvider>),
+                (
+                    "vision".into(),
+                    vision_route_provider as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "hint:vision".into(),
+                Route {
+                    provider_name: "vision".into(),
+                    model: "vision-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(
+            !router.supports_vision(),
+            "router with non-vision default must report supports_vision()=false even when a vision-capable route exists"
+        );
+    }
+
+    #[test]
+    fn supports_vision_true_when_default_provider_supports_vision() {
+        let default_provider = Box::new(MockModelProvider::new("ok").with_vision(true));
+        let aux_provider = Box::new(MockModelProvider::new("nope").with_vision(false));
+
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                ("default".into(), default_provider as Box<dyn ModelProvider>),
+                ("aux".into(), aux_provider as Box<dyn ModelProvider>),
+            ],
+            vec![],
+            "default-model".into(),
+        );
+
+        assert!(router.supports_vision());
+    }
+
+    #[tokio::test]
+    async fn model_capability_matches_the_route_that_receives_dispatch() {
+        let default = Arc::new(MockModelProvider::new("default").with_vision(true));
+        let text_route = Arc::new(MockModelProvider::new("text").with_vision(false));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(Arc::clone(&default)) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text".into(),
+                    Box::new(Arc::clone(&text_route)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "text".into(),
+                Route {
+                    provider_name: "text".into(),
+                    model: "text-model".into(),
+                },
+            )],
+            "vision-model".into(),
+        );
+
+        assert!(
+            router.capabilities_for_model("vision-model").vision,
+            "an unhinted request dispatches to the vision-capable default"
+        );
+        assert!(
+            !router.capabilities_for_model("hint:text").vision,
+            "the hinted request must report the selected text route"
+        );
+        assert_eq!(
+            router
+                .chat_with_system(None, "hello", "hint:text", None)
+                .await
+                .expect("text route succeeds"),
+            "text"
+        );
+        assert_eq!(default.call_count(), 0);
+        assert_eq!(text_route.call_count(), 1);
+        assert_eq!(text_route.last_model(), "text-model");
+    }
+
+    #[test]
+    fn mixed_tool_capability_matches_the_selected_route_and_model() {
+        struct ModelScopedMixedProvider {
+            mixed_model: &'static str,
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for ModelScopedMixedProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "ModelScopedMixedProvider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for ModelScopedMixedProvider {
+            fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+                model == self.mixed_model
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(ModelScopedMixedProvider {
+                        mixed_model: "not-the-default-model",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "mixed".into(),
+                    Box::new(ModelScopedMixedProvider {
+                        mixed_model: "routed-model",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "mixed".into(),
+                Route {
+                    provider_name: "mixed".into(),
+                    model: "routed-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(
+            !router.has_mixed_native_tool_support_for_model("default-model"),
+            "the unhinted request must inspect only the default route"
+        );
+        assert!(
+            router.has_mixed_native_tool_support_for_model("hint:mixed"),
+            "the hinted request must forward mixed-chain detection to the selected provider using the resolved model"
+        );
+    }
+
+    #[test]
+    fn capabilities_vision_matches_supports_vision_on_final_wrapped_router() {
+        // Regression: the final wrapped RouterModelProvider must report the SAME
+        // `vision` on `capabilities().vision` and `supports_vision()`. The default
+        // provider carries the config `vision` decorator forcing vision ON; the
+        // outer surface must reflect it on BOTH accessors. Before `capabilities()`
+        // delegated to the default provider, the outer returned the trait default
+        // (vision=false) and disagreed with the delegated `supports_vision()`.
+        let default_provider = crate::vision_override::VisionOverrideProvider::new(
+            Box::new(MockModelProvider::new("forced").with_vision(false)) as Box<dyn ModelProvider>,
+            true,
+        );
+        let router = RouterModelProvider::new(
+            "test",
+            vec![(
+                "default".into(),
+                Box::new(default_provider) as Box<dyn ModelProvider>,
+            )],
+            vec![],
+            "default-model".into(),
+        );
+
+        assert!(router.supports_vision());
+        assert!(
+            router.capabilities().vision,
+            "outer capabilities().vision must match the delegated supports_vision()"
+        );
+        assert_eq!(router.capabilities().vision, router.supports_vision());
     }
 }

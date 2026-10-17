@@ -1,6 +1,8 @@
 # Testing
 
-ZeroClaw uses a five-level testing taxonomy backed by filesystem layout. Each level has a different boundary and a different cost — pick the lowest level that proves what you need to prove.
+ZeroClaw uses a five-level testing taxonomy backed by filesystem layout. Each level has a different boundary and a different cost; pick the lowest level that proves what you need to prove.
+
+When a PR claims behavior that a user directly runs, clicks, sends, installs, or observes, use [User-boundary proof](./user-boundary-proof.md) to identify the smallest test or manual check that reaches that boundary.
 
 ## The five levels
 
@@ -16,12 +18,16 @@ Plus two non-test directories:
 
 | Directory | Purpose |
 |---|---|
-| `tests/manual/` | Human-driven test scripts (shell, Python) — run directly, not via cargo |
-| `tests/support/` | Shared mock infrastructure — not a test binary, included as `mod support;` from each level |
+| `tests/manual/` | Human-driven test scripts (shell, Python), run directly, not via cargo |
+| `tests/support/` | Shared mock infrastructure, not a test binary, included as `mod support;` from each level |
 
 ## Running tests
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo test                                  # unit + component + integration + system
 cargo test --lib                            # unit only
 cargo test --test component                 # component only
@@ -29,9 +35,30 @@ cargo test --test integration               # integration only
 cargo test --test system                    # system only
 cargo test --test live -- --ignored         # live (requires API credentials)
 cargo test --test integration agent         # filter within a level
-./dev/ci.sh all                             # full CI battery
-./dev/ci.sh test-component                  # level-specific CI commands
+cargo nextest run --locked --workspace --exclude zeroclaw-desktop  # what CI runs
+./scripts/ci/parallel_runtime_test_gate.sh  # repeated same-process runtime/channel tests
+./dev/ci.sh all                             # full CI battery (Docker)
+./dev/ci.sh firmware-protocol               # standalone firmware protocol host gate (Docker)
+./dev/ci.sh test-component                  # level-specific CI commands (Docker)
 ```
+
+</div>
+
+The `firmware-protocol` command checks the standalone
+`firmware/zeroclaw-fw-protocol` crate, which is outside the root Cargo
+workspace. `scripts/ci/firmware_protocol_gate.sh` is the canonical definition
+of its formatting, strict Clippy, and locked-test checks; required CI and the
+pre-push hook invoke the same helper.
+
+The parallel runtime gate repeats the complete `zeroclaw-runtime` and
+`zeroclaw-channels` library test binaries with 16 harness threads. Running the
+whole binaries is intentional: it detects interference between state-mutating
+tests and otherwise unrelated agent turns that filtered test runs cannot expose.
+Required CI runs this gate in a separate job for changes to either crate, the
+workspace dependency manifests, or the gate's own CI files. Other PRs skip it;
+pushes to `master` and merge queue runs retain the full regression backstop.
+Override repetitions with `ZEROCLAW_PARALLEL_TEST_RUNS` and harness threads
+with `ZEROCLAW_PARALLEL_TEST_THREADS`.
 
 ## Picking a level for a new test
 
@@ -48,27 +75,27 @@ Every test binary includes `mod support;`, making the shared mocks available as 
 
 | Module | Contents |
 |---|---|
-| `mock_provider.rs` | `MockProvider` (FIFO scripted), `RecordingProvider` (captures requests), `TraceLlmProvider` (JSON fixture replay) |
+| `mock_model_provider.rs` | `MockModelProvider` (FIFO scripted), `RecordingModelProvider` (captures requests), `TraceLlmModelProvider` (JSON fixture replay) |
 | `mock_tools.rs` | `EchoTool`, `CountingTool`, `FailingTool`, `RecordingTool` |
 | `mock_channel.rs` | `TestChannel` (captures sends, records typing events) |
-| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticMemoryLoader` |
+| `helpers.rs` | `make_memory()`, `make_observer()`, `build_agent()`, `text_response()`, `tool_response()`, `StaticRecallMemory` |
 | `trace.rs` | `LlmTrace`, `TraceTurn`, `TraceStep` types + `LlmTrace::from_file()` |
 | `assertions.rs` | `verify_expects()` for declarative trace assertion |
 
 Typical usage:
 
 ```rust
-use crate::support::{MockProvider, EchoTool, CountingTool};
+use crate::support::{MockModelProvider, EchoTool, CountingTool};
 use crate::support::helpers::{build_agent, text_response, tool_response};
 ```
 
 ## JSON trace fixtures
 
-Trace fixtures are canned LLM response scripts stored as JSON files in `tests/fixtures/traces/`. They replace inline mock setup with declarative conversation scripts — much easier to read and edit than `mockall` chains.
+Trace fixtures are canned LLM response scripts stored as JSON files in `tests/fixtures/traces/`. They replace inline mock setup with declarative conversation scripts, much easier to read and edit than `mockall` chains.
 
 How it works:
 
-1. `TraceLlmProvider` loads a fixture and implements the `Provider` trait.
+1. `TraceLlmModelProvider` loads a fixture and implements the `ModelProvider` trait.
 2. Each `provider.chat()` call returns the next step from the fixture in FIFO order.
 3. Real tools execute normally (`EchoTool` actually processes its arguments).
 4. After all turns, `verify_expects()` checks declarative assertions.
@@ -108,15 +135,15 @@ Expects fields: `response_contains`, `response_not_contains`, `tools_used`, `too
 
 ## Live test conventions
 
-Live tests hit real external services and cost real money — they are `#[ignore]` by default and only run with explicit opt-in.
+Live tests hit real external services and cost real money; they are `#[ignore]` by default and only run with explicit opt-in.
 
 - Always `#[ignore]`. Never let a live test run on a normal `cargo test`.
-- Read credentials from `env::var("ZEROCLAW_TEST_*")`. Don't read from `~/.zeroclaw/config.toml` — live tests should be hermetic.
+- Read credentials from `env::var("ZEROCLAW_TEST_*")`. Don't read the operator's config; live tests should be hermetic.
 - Run with `cargo test --test live -- --ignored --nocapture`.
 
 ## Database tests are integration tests
 
-Don't mock SQLite for tests that exercise schema or SQL — integration tests must hit a real database. The mock-passes-but-prod-fails class of bug is real and we've eaten it before.
+Don't mock SQLite for tests that exercise schema or SQL; integration tests must hit a real database. The mock-passes-but-prod-fails class of bug is real and we've eaten it before.
 
 ## Manual tests
 

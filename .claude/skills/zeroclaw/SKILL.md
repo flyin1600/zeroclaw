@@ -21,7 +21,7 @@ Default to a middle ground — brief explanation of what you're about to do, the
 
 ## Discovery — Before You Act
 
-Before running any ZeroClaw operation, make sure you know where things are:
+Before running any ZeroClaw operation, make sure you know where things are. When inspecting configuration, read only the fields needed for the operation and keep credential values out of tool output.
 
 1. **Find the binary.** Search in this order:
    - `which zeroclaw` (PATH)
@@ -34,35 +34,37 @@ Before running any ZeroClaw operation, make sure you know where things are:
 
 3. **Check auth status.** If the gateway requires pairing (`require_pairing = true` is the default), REST calls need a bearer token. Run `zeroclaw status` to see the current state, or check `~/.zeroclaw/config.toml` for a stored token under `[gateway]`.
 
+4. **Discover the agent alias.** Every `zeroclaw agent` invocation requires `-a <alias>` — there is no default agent. Read `~/.zeroclaw/config.toml` and find the `[agents.<alias>]` headers; that `<alias>` is what the user means when they say "my agent." If multiple agents exist, ask the user which one to target before invoking. The examples below use `<alias>` as a placeholder for the alias you discovered.
+
 Cache these findings for the conversation — don't re-discover every time.
 
 ## Important: REPL Limitation
 
-`zeroclaw agent` (interactive REPL) requires interactive stdin, which doesn't work through the Bash tool. When the user wants to chat with their agent, use single-message mode instead:
+`zeroclaw agent -a <alias>` (interactive REPL) requires interactive stdin, which doesn't work through the Bash tool. When the user wants to chat with their agent, use single-message mode instead:
 
 ```bash
-zeroclaw agent -m "the message"
+zeroclaw agent -a <alias> -m "the message"
 ```
 
-Each `-m` invocation is independent (no conversation history between calls). If the user needs multi-turn conversation, let them know they can run `zeroclaw agent` directly in their terminal, or use the WebSocket endpoint for programmatic streaming.
+Each `-m` invocation is independent (no conversation history between calls). If the user needs multi-turn conversation, let them know they can run `zeroclaw agent -a <alias>` directly in their terminal, or use the WebSocket endpoint for programmatic streaming.
 
 ## First-Time Setup
 
-If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), guide them through onboarding:
+If the user hasn't set up ZeroClaw yet (no `~/.zeroclaw/config.toml` exists), guide them through quickstart:
 
 ```bash
-zeroclaw onboard                          # Quick mode — defaults to OpenRouter
-zeroclaw onboard --provider anthropic     # Use Anthropic directly
-zeroclaw onboard                          # Guided wizard (default)
+zeroclaw quickstart                                              # Interactive — picks a provider + agent
+zeroclaw quickstart --model-provider ollama --model qwen2.5:7b   # Non-interactive
+zeroclaw config set channels.<type>.<alias>.<field> <value>     # Configure a channel after quickstart
 ```
 
-After onboarding, verify everything works:
+After quickstart, verify everything works:
 ```bash
 zeroclaw status
 zeroclaw doctor
 ```
 
-If they already have a config but something is broken, `zeroclaw onboard --channels-only` repairs just the channel configuration without overwriting everything else.
+If they already have a config but a channel is broken, edit just that channel's fields with `zeroclaw config set channels.<type>.<alias>.<field> <value>` rather than re-running quickstart (quickstart leaves an existing config alone). For example, `zeroclaw config set channels.telegram.default.bot-token` prompts for the token without putting it on the command line.
 
 ## Building from Source
 
@@ -93,7 +95,7 @@ Both surfaces can do most things. Rules of thumb:
 
 ### Sending Messages
 
-**CLI:** `zeroclaw agent -m "your message here"` — remember, always use `-m` mode, not bare `zeroclaw agent`.
+**CLI:** `zeroclaw agent -a <alias> -m "your message here"` — always use `-m` mode (not bare `zeroclaw agent -a <alias>`) so it returns instead of blocking on the REPL.
 
 **REST:**
 ```bash
@@ -115,7 +117,7 @@ Run `zeroclaw status` to see provider, model, uptime, channels, memory backend. 
 ### Memory
 
 The CLI can list, get, and clear memories but **cannot store** them directly. To store a memory:
-- Via agent: `zeroclaw agent -m "remember that my favorite color is blue"`
+- Via agent: `zeroclaw agent -a <alias> -m "remember that my favorite color is blue"`
 - Via REST: `POST /api/memory` with `{"key": "...", "content": "...", "category": "core"}`
 
 **CLI (read/delete):**
@@ -155,11 +157,12 @@ To see what's available: `GET /api/tools` (REST) lists all registered tools with
 
 ### Configuration
 
-Edit `~/.zeroclaw/config.toml` directly, or re-run `zeroclaw onboard` to reconfigure.
+Use `zeroclaw config set <path> <value>` to update configuration fields. For secret fields, omit the value and use the masked input prompt. Change only the affected fields, preserving unrelated settings and stored data.
 
 **REST:**
-- `GET /api/config` — get current config (secrets masked as `***MASKED***`)
-- `PUT /api/config` — update config (send raw TOML as body, 1MB limit)
+- `GET /api/config`: compatibility whole-config read (secrets masked as `***MASKED***`)
+- `PATCH /api/config`: atomically update config with an RFC 6902 JSON Patch document
+- `OPTIONS /api/config`: get the whole-config JSON Schema; its current `Allow` header still lists legacy `PUT`, which the router does not register
 
 ### Providers & Models
 
@@ -168,7 +171,7 @@ Edit `~/.zeroclaw/config.toml` directly, or re-run `zeroclaw onboard` to reconfi
 - `zeroclaw models refresh --all` — refresh from providers
 - `zeroclaw models set anthropic/claude-sonnet-4-6` — set default model
 
-Override per-message: `zeroclaw agent -p anthropic --model claude-sonnet-4-6 -m "hello"`
+Override per-message: `zeroclaw agent -a <alias> -p anthropic --model claude-sonnet-4-6 -m "hello"`
 
 ### Real-Time Events (SSE)
 
@@ -201,20 +204,7 @@ Confirm with the user before running any estop command — these are disruptive.
 
 ### Channels
 
-ZeroClaw supports 21 messaging channels. To add one, you need to edit `~/.zeroclaw/config.toml`. For example, to set up Telegram:
-
-```toml
-[channels]
-telegram = true
-
-[channels_config.telegram]
-bot_token = "your-bot-token-from-botfather"
-allowed_users = [123456789]
-```
-
-Then restart the daemon. Check channel health with `zeroclaw channels doctor`.
-
-For the full list of channels and their config fields, read `references/cli-reference.md` (Channels section).
+Channel availability depends on the installed build's feature set. Use `zeroclaw channels list` to inspect configured channels and `zeroclaw channel doctor` to check their health. Consult the current channel guide and generated config reference before configuring a channel; do not infer config keys from a fixed channel inventory.
 
 ### Pairing (Authentication Setup)
 
@@ -234,16 +224,16 @@ Here are multi-step sequences you're likely to need:
 3. If gateway needed: `curl -sf http://127.0.0.1:42617/health`
 
 **"Set up a new channel"**
-1. Read the current config: `cat ~/.zeroclaw/config.toml`
-2. Add the channel config (edit the TOML)
+1. Inspect the relevant channel's configuration fields without printing credentials.
+2. Configure the channel with `zeroclaw config set channels.<type>.<alias>.<field> <value>`; omit secret values to use the masked input prompt.
 3. Restart: `zeroclaw service restart` (or restart daemon manually)
-4. Verify: `zeroclaw channels doctor`
+4. Verify: `zeroclaw channel doctor`
 
 **"Switch to a different model"**
 1. Check available: `zeroclaw models list`
 2. Set it: `zeroclaw models set <provider/model>`
 3. Verify: `zeroclaw status`
-4. Test: `zeroclaw agent -m "hello, what model are you?"`
+4. Test: `zeroclaw agent -a <alias> -m "hello, what model are you?"`
 
 ## Gateway Defaults
 
@@ -251,16 +241,16 @@ Here are multi-step sequences you're likely to need:
 - **Host:** 127.0.0.1
 - **Auth:** Pairing required (bearer token)
 - **Rate limits:** 60 webhook requests/min, 10 pairing attempts/min
-- **Body limit:** 64KB (1MB for config updates)
+- **Body limit:** 64KB
 - **Timeout:** 30 seconds
 - **Idempotency:** Optional `X-Idempotency-Key` header on `/webhook` (300s TTL)
 - **Config location:** `~/.zeroclaw/config.toml`
 
 ## Reference Files
 
-For the complete API specification with every endpoint, field, and edge case, read `references/rest-api.md`.
+For a curated operational API reference, read `references/rest-api.md`. For precision-sensitive route work, verify the current gateway router and the documented subset exposed at `/api/openapi.json`.
 
-For the full CLI command tree with all flags and options, read `references/cli-reference.md`.
+For common CLI commands and options, read `references/cli-reference.md`. Use `zeroclaw --help` and `zeroclaw <command> --help` as the current command-tree authority.
 
 Only load these when you need precise details beyond what's in this file — for most operations, the quick references above are sufficient.
 
@@ -276,10 +266,10 @@ Only load these when you need precise details beyond what's in this file — for
 
 **"Too many requests" (429)** — You're hitting ZeroClaw's rate limit. Back off — the response includes `retry_after` with the number of seconds to wait.
 
-**Agent not using tools / acting limited** — Check autonomy settings in config.toml under `[autonomy]`. `level = "read_only"` disables most tools. Try `level = "supervised"` or `level = "full"`.
+**Agent not using tools / acting limited**: Inspect the affected agent's effective tool policy and the failing operation. Check whether a denied permission explains the failure and whether the restriction is intentional. If broader access is needed, explain and confirm the smallest policy change; do not use full autonomy as a generic fix.
 
 **Memory not persisting** — Check `[memory]` config. If `backend = "none"`, nothing is stored. Switch to `"sqlite"` or `"markdown"`. Also verify `auto_save = true`.
 
-**Channel not responding** — Run `zeroclaw channels doctor` for the specific channel. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
+**Channel not responding**: Run `zeroclaw channel doctor` and inspect the affected channel's result. Common issues: expired bot token, wrong allowed_users list, channel not enabled in `[channels]`.
 
 Report errors to the user with context appropriate to their expertise level. For beginners, explain what went wrong and suggest the fix. For experts, just show the error and the fix.

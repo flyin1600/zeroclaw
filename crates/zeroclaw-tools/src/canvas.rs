@@ -1,9 +1,4 @@
 //! Live Canvas (A2UI) tool — push rendered content to a web canvas in real time.
-//!
-//! The agent can render HTML/SVG/Markdown to a named canvas, snapshot its
-//! current state, clear it, or evaluate a JavaScript expression in the canvas
-//! context. Content is stored in a shared [`CanvasStore`] and broadcast to
-//! connected WebSocket clients via per-canvas channels.
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -12,7 +7,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Maximum content size per canvas frame (256 KB).
 pub const MAX_CONTENT_SIZE: usize = 256 * 1024;
@@ -50,7 +45,6 @@ struct CanvasEntry {
 }
 
 /// Shared canvas store — holds all active canvases.
-///
 /// Thread-safe and cheaply cloneable (wraps `Arc`).
 #[derive(Clone)]
 pub struct CanvasStore {
@@ -238,7 +232,7 @@ impl Tool for CanvasTool {
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing required parameter: action".to_string()),
                 });
             }
@@ -261,7 +255,7 @@ impl Tool for CanvasTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "Missing required parameter: content (for render action)"
                                     .to_string(),
@@ -273,7 +267,7 @@ impl Tool for CanvasTool {
                 if content.len() > MAX_CONTENT_SIZE {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Content exceeds maximum size of {} bytes",
                             MAX_CONTENT_SIZE
@@ -287,12 +281,13 @@ impl Tool for CanvasTool {
                         output: format!(
                             "Rendered {} content to canvas '{}' (frame: {})",
                             content_type, canvas_id, frame.frame_id
-                        ),
+                        )
+                        .into(),
                         error: None,
                     }),
                     None => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Maximum canvas count ({}) reached. Clear unused canvases first.",
                             MAX_CANVAS_COUNT
@@ -305,12 +300,13 @@ impl Tool for CanvasTool {
                 Some(frame) => Ok(ToolResult {
                     success: true,
                     output: serde_json::to_string_pretty(&frame)
-                        .unwrap_or_else(|_| frame.content.clone()),
+                        .unwrap_or_else(|_| frame.content.clone())
+                        .into(),
                     error: None,
                 }),
                 None => Ok(ToolResult {
                     success: true,
-                    output: format!("Canvas '{}' is empty", canvas_id),
+                    output: format!("Canvas '{}' is empty", canvas_id).into(),
                     error: None,
                 }),
             },
@@ -320,9 +316,9 @@ impl Tool for CanvasTool {
                 Ok(ToolResult {
                     success: true,
                     output: if existed {
-                        format!("Canvas '{}' cleared", canvas_id)
+                        format!("Canvas '{}' cleared", canvas_id).into()
                     } else {
-                        format!("Canvas '{}' was already empty", canvas_id)
+                        format!("Canvas '{}' was already empty", canvas_id).into()
                     },
                     error: None,
                 })
@@ -336,7 +332,7 @@ impl Tool for CanvasTool {
                     None => {
                         return Ok(ToolResult {
                             success: false,
-                            output: String::new(),
+                            output: ToolOutput::default(),
                             error: Some(
                                 "Missing required parameter: expression (for eval action)"
                                     .to_string(),
@@ -353,12 +349,13 @@ impl Tool for CanvasTool {
                             "Eval request sent to canvas '{}' (frame: {}). \
                              Result will be available to connected viewers.",
                             canvas_id, frame.frame_id
-                        ),
+                        )
+                        .into(),
                         error: None,
                     }),
                     None => Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!(
                             "Maximum canvas count ({}) reached. Clear unused canvases first.",
                             MAX_CANVAS_COUNT
@@ -369,7 +366,7 @@ impl Tool for CanvasTool {
 
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action: '{}'. Valid actions: render, snapshot, clear, eval",
                     other
@@ -399,6 +396,28 @@ mod tests {
     fn canvas_store_snapshot_empty_returns_none() {
         let store = CanvasStore::new();
         assert!(store.snapshot("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn canvas_tool_renders_into_shared_store() {
+        let gateway_store = CanvasStore::new();
+        let tool = CanvasTool::new(gateway_store.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "render",
+                "canvas_id": "default",
+                "content_type": "html",
+                "content": "<h1>from chat</h1>",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "render failed: {:?}", result.error);
+
+        let seen = gateway_store
+            .snapshot("default")
+            .expect("frame must be visible via the shared gateway store");
+        assert_eq!(seen.content, "<h1>from chat</h1>");
     }
 
     #[test]

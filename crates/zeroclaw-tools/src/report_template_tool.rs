@@ -1,5 +1,4 @@
 //! Report template tool — standalone access to template engine.
-//!
 //! Exposes the report template engine directly so agents can render
 //! templates with custom variable maps without going through ProjectIntelTool.
 
@@ -9,11 +8,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Standalone report template tool.
-///
-/// Provides direct access to the template engine for rendering
-/// weekly_status, sprint_review, risk_register, and milestone_report
-/// templates in en/de/fr/it.
 pub struct ReportTemplateTool;
 
 impl ReportTemplateTool {
@@ -66,7 +60,16 @@ impl Tool for ReportTemplateTool {
         let template = params
             .get("template")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing template"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "template"})),
+                    "report_template_tool: missing template parameter"
+                );
+                anyhow::Error::msg("missing template")
+            })?;
 
         let language = params
             .get("language")
@@ -76,7 +79,16 @@ impl Tool for ReportTemplateTool {
         let variables = params
             .get("variables")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| anyhow::anyhow!("variables must be object"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "variables"})),
+                    "report_template_tool: variables must be an object"
+                );
+                anyhow::Error::msg("variables must be object")
+            })?;
 
         // Convert JSON object to HashMap<String, String>
         // Non-string values are coerced to strings
@@ -99,7 +111,7 @@ impl Tool for ReportTemplateTool {
 
         Ok(ToolResult {
             success: true,
-            output: rendered,
+            output: rendered.into(),
             error: None,
         })
     }

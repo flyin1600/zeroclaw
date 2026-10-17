@@ -1,18 +1,13 @@
 //! Project delivery intelligence tool.
-//!
-//! Provides read-only analysis and generation for project management:
-//! status reports, risk detection, client communication drafting,
-//! sprint summaries, and effort estimation.
 
 use super::report_templates;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Project intelligence tool for consulting project management.
-///
 /// All actions are read-only analysis/generation; nothing is modified externally.
 pub struct ProjectIntelTool {
     default_language: String,
@@ -59,12 +54,36 @@ impl ProjectIntelTool {
             .get("project_name")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("missing required 'project_name' for status_report"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "status_report",
+                            "param": "project_name",
+                        })),
+                    "project_intel: status_report missing project_name"
+                );
+                anyhow::Error::msg("missing required 'project_name' for status_report")
+            })?;
         let period = args
             .get("period")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("missing required 'period' for status_report"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "status_report",
+                            "param": "period",
+                        })),
+                    "project_intel: status_report missing period"
+                );
+                anyhow::Error::msg("missing required 'period' for status_report")
+            })?;
         let lang = args
             .get("language")
             .and_then(|v| v.as_str())
@@ -91,7 +110,7 @@ impl ProjectIntelTool {
         let rendered = tpl.render(&vars);
         Ok(ToolResult {
             success: true,
-            output: rendered,
+            output: rendered.into(),
             error: None,
         })
     }
@@ -198,7 +217,7 @@ impl ProjectIntelTool {
 
         Ok(ToolResult {
             success: true,
-            output: tpl.render(&vars),
+            output: tpl.render(&vars).into(),
             error: None,
         })
     }
@@ -208,7 +227,19 @@ impl ProjectIntelTool {
             .get("project_name")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("missing required 'project_name' for draft_update"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "draft_update",
+                            "param": "project_name",
+                        })),
+                    "project_intel: draft_update missing project_name"
+                );
+                anyhow::Error::msg("missing required 'project_name' for draft_update")
+            })?;
         let audience = args
             .get("audience")
             .and_then(|v| v.as_str())
@@ -221,7 +252,19 @@ impl ProjectIntelTool {
             .get("highlights")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("missing required 'highlights' for draft_update"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": "draft_update",
+                            "param": "highlights",
+                        })),
+                    "project_intel: draft_update missing highlights"
+                );
+                anyhow::Error::msg("missing required 'highlights' for draft_update")
+            })?;
         let concerns = args.get("concerns").and_then(|v| v.as_str()).unwrap_or("");
 
         let greeting = match (audience, tone) {
@@ -251,7 +294,7 @@ impl ProjectIntelTool {
 
         Ok(ToolResult {
             success: true,
-            output: body,
+            output: body.into(),
             error: None,
         })
     }
@@ -292,7 +335,7 @@ impl ProjectIntelTool {
 
         Ok(ToolResult {
             success: true,
-            output: tpl.render(&vars),
+            output: tpl.render(&vars).into(),
             error: None,
         })
     }
@@ -303,7 +346,7 @@ impl ProjectIntelTool {
         if tasks.trim().is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("No task descriptions provided".into()),
             });
         }
@@ -325,7 +368,7 @@ impl ProjectIntelTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -497,10 +540,16 @@ impl Tool for ProjectIntelTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let action = args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing required 'action' parameter"))?;
+        let action = args.get("action").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "action"})),
+                "project_intel: missing action parameter"
+            );
+            anyhow::Error::msg("Missing required 'action' parameter")
+        })?;
 
         match action {
             "status_report" => self.execute_status_report(&args),
@@ -510,7 +559,7 @@ impl Tool for ProjectIntelTool {
             "effort_estimate" => self.execute_effort_estimate(&args),
             other => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Unknown action '{other}'. Valid actions: status_report, risk_scan, draft_update, sprint_summary, effort_estimate"
                 )),

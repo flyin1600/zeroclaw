@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_memory::Memory;
@@ -25,7 +25,7 @@ impl Tool for MemoryPurgeTool {
     }
 
     fn description(&self) -> &str {
-        "Remove all memories in a namespace (category) or session. Use to bulk-delete conversation context or category-scoped data. Returns the number of deleted entries. WARNING: This operation cannot be undone."
+        "Remove all memories in a namespace or session. Use to bulk-delete per-tenant or per-conversation data. Returns the number of deleted entries. WARNING: This operation cannot be undone."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -34,7 +34,7 @@ impl Tool for MemoryPurgeTool {
             "properties": {
                 "namespace": {
                     "type": "string",
-                    "description": "The namespace (category) to purge. Deletes all memories in this category."
+                    "description": "The namespace to purge. Deletes all memories whose namespace field equals this value."
                 },
                 "session_id": {
                     "type": "string",
@@ -50,8 +50,15 @@ impl Tool for MemoryPurgeTool {
         let session_id = args.get("session_id").and_then(|v| v.as_str());
 
         if namespace.is_none() && session_id.is_none() {
-            return Err(anyhow::anyhow!(
-                "Must provide either 'namespace' or 'session_id' parameter"
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"missing": "namespace_or_session_id"})),
+                "memory_purge: must provide namespace or session_id"
+            );
+            return Err(anyhow::Error::msg(
+                "Must provide either 'namespace' or 'session_id' parameter",
             ));
         }
 
@@ -61,7 +68,7 @@ impl Tool for MemoryPurgeTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -78,7 +85,7 @@ impl Tool for MemoryPurgeTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to purge namespace: {e}")),
                     });
                 }
@@ -94,7 +101,7 @@ impl Tool for MemoryPurgeTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to purge session: {e}")),
                     });
                 }
@@ -104,9 +111,9 @@ impl Tool for MemoryPurgeTool {
         Ok(ToolResult {
             success: true,
             output: if output_parts.is_empty() {
-                format!("Purged {total_purged} memories")
+                format!("Purged {total_purged} memories").into()
             } else {
-                output_parts.join("; ")
+                output_parts.join("; ").into()
             },
             error: None,
         })
@@ -119,7 +126,7 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
-    use zeroclaw_memory::{MemoryCategory, SqliteMemory};
+    use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory};
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -127,7 +134,7 @@ mod tests {
 
     fn test_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, Arc::new(mem))
     }
 
@@ -141,34 +148,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purge_namespace_removes_all_memories() {
+    async fn purge_namespace_removes_only_all_matching_memories() {
         let (_tmp, mem) = test_mem();
-        mem.store(
-            "a1",
-            "data1",
-            MemoryCategory::Custom("test_ns".into()),
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store(
-            "a2",
-            "data2",
-            MemoryCategory::Custom("test_ns".into()),
-            None,
-        )
-        .await
-        .unwrap();
-        mem.store("b1", "data3", MemoryCategory::Core, None)
+
+        mem.store_with_metadata("a", "data", MemoryCategory::Core, None, Some("ns1"), None)
+            .await
+            .unwrap();
+        mem.store_with_metadata("b", "data", MemoryCategory::Core, None, Some("ns2"), None)
             .await
             .unwrap();
 
-        let tool = MemoryPurgeTool::new(mem.clone(), test_security());
-        let result = tool.execute(json!({"namespace": "test_ns"})).await.unwrap();
-        assert!(result.success);
-        assert!(result.output.contains("2 memories"));
+        let in_ns1 =
+            |entries: &[MemoryEntry]| entries.iter().filter(|e| e.namespace == "ns1").count();
 
-        assert_eq!(mem.count().await.unwrap(), 1);
+        let before = mem.list(None, None).await.unwrap();
+        let tool = MemoryPurgeTool::new(mem.clone(), test_security());
+        let result = tool.execute(json!({"namespace": "ns1"})).await.unwrap();
+        let after = mem.list(None, None).await.unwrap();
+
+        assert!(result.success);
+        assert_eq!(in_ns1(&after), 0);
+        assert_eq!(after.len() - in_ns1(&after), before.len() - in_ns1(&before));
+    }
+
+    /// The production tool route over a principal's private handle purges
+    /// only that principal's rows; through the legacy handle, private rows
+    /// are never reachable at all.
+    #[tokio::test]
+    async fn purge_through_a_private_handle_stays_inside_the_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_memory::PrincipalPlaneMemory;
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::sqlite::SqliteMemory::new("test", tmp.path()).unwrap());
+        let alice = PrincipalScope::new("user:alice");
+        let bob = PrincipalScope::new("user:bob");
+        inner
+            .store(
+                "shared",
+                "shared-data",
+                MemoryCategory::Core,
+                Some("sess-x"),
+            )
+            .await
+            .unwrap();
+        inner
+            .store_for_principal(
+                &alice,
+                "a",
+                "alice-data",
+                MemoryCategory::Core,
+                Some("sess-x"),
+            )
+            .await
+            .unwrap();
+        inner
+            .store_for_principal(&bob, "b", "bob-data", MemoryCategory::Core, Some("sess-x"))
+            .await
+            .unwrap();
+
+        let alices_handle: Arc<dyn Memory> =
+            Arc::new(PrincipalPlaneMemory::new(Arc::clone(&inner), alice.clone()));
+        let tool = MemoryPurgeTool::new(alices_handle, test_security());
+        let result = tool
+            .execute(serde_json::json!({"session_id": "sess-x"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            inner
+                .get_for_principal(&alice, "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            inner.get_for_principal(&bob, "b").await.unwrap().is_some(),
+            "another principal's private rows survive"
+        );
+        assert!(
+            inner.get("shared").await.unwrap().is_some(),
+            "the shared row survives a private purge"
+        );
+
+        let legacy_tool = MemoryPurgeTool::new(Arc::clone(&inner), test_security());
+        legacy_tool
+            .execute(serde_json::json!({"session_id": "sess-x"}))
+            .await
+            .unwrap();
+        assert!(inner.get("shared").await.unwrap().is_none());
+        assert!(
+            inner.get_for_principal(&bob, "b").await.unwrap().is_some(),
+            "the legacy purge never reaches private rows"
+        );
     }
 
     #[tokio::test]
@@ -239,15 +311,22 @@ mod tests {
     #[tokio::test]
     async fn purge_blocked_in_readonly_mode() {
         let (_tmp, mem) = test_mem();
-        mem.store("a", "data", MemoryCategory::Custom("test".into()), None)
-            .await
-            .unwrap();
+        mem.store_with_metadata(
+            "a",
+            "data",
+            MemoryCategory::Core,
+            None,
+            Some("test-ns"),
+            None,
+        )
+        .await
+        .unwrap();
         let readonly = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
         let tool = MemoryPurgeTool::new(mem.clone(), readonly);
-        let result = tool.execute(json!({"namespace": "test"})).await.unwrap();
+        let result = tool.execute(json!({"namespace": "test-ns"})).await.unwrap();
         assert!(!result.success);
         assert!(
             result
@@ -262,15 +341,22 @@ mod tests {
     #[tokio::test]
     async fn purge_blocked_when_rate_limited() {
         let (_tmp, mem) = test_mem();
-        mem.store("a", "data", MemoryCategory::Custom("test".into()), None)
-            .await
-            .unwrap();
+        mem.store_with_metadata(
+            "a",
+            "data",
+            MemoryCategory::Core,
+            None,
+            Some("test-ns"),
+            None,
+        )
+        .await
+        .unwrap();
         let limited = Arc::new(SecurityPolicy {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
         let tool = MemoryPurgeTool::new(mem.clone(), limited);
-        let result = tool.execute(json!({"namespace": "test"})).await.unwrap();
+        let result = tool.execute(json!({"namespace": "test-ns"})).await.unwrap();
         assert!(!result.success);
         assert!(
             result

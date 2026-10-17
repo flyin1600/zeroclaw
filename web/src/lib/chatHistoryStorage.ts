@@ -10,6 +10,9 @@ export interface PersistedChatBubble {
   content: string;
   thinking?: string;
   markdown?: boolean;
+  /** Verbatim locally-composed user input — never gateway-prefixed, so the
+   *  bubble skips stripServerTimestamp for it. (Server rows omit this.) */
+  local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: string;
 }
@@ -36,6 +39,22 @@ export function saveChatHistory(sessionId: string, messages: PersistedChatBubble
     localStorage.setItem(storageKey(sessionId), JSON.stringify({ messages: slice }));
   } catch {
     // QuotaExceeded or private mode
+  }
+}
+
+/**
+ * Drop a conversation's cached transcript.
+ *
+ * Deleting a conversation has to take the local copy with it: the cache is
+ * readable in the browser long after the gateway row is gone, which is not what
+ * "delete" promises, and one key per conversation would otherwise accumulate
+ * for as long as the origin's storage lives.
+ */
+export function removeChatHistory(sessionId: string): void {
+  try {
+    localStorage.removeItem(storageKey(sessionId));
+  } catch {
+    // Private mode — nothing was cached to begin with.
   }
 }
 
@@ -84,6 +103,7 @@ export function persistedToUiMessages(
   content: string;
   thinking?: string;
   markdown?: boolean;
+  local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: Date;
 }> {
@@ -93,6 +113,7 @@ export function persistedToUiMessages(
     content: m.content,
     thinking: m.thinking,
     markdown: m.markdown,
+    local: m.local,
     toolCall: m.toolCall,
     timestamp: new Date(m.timestamp),
   }));
@@ -105,17 +126,27 @@ export function uiMessagesToPersisted(
     content: string;
     thinking?: string;
     markdown?: boolean;
+    local?: boolean;
+    ephemeral?: boolean;
     toolCall?: { name: string; args?: unknown; output?: string };
     timestamp: Date;
   }>,
 ): PersistedChatBubble[] {
-  return messages.map((m) => ({
-    id: m.id,
-    role: m.role,
-    content: m.content,
-    thinking: m.thinking,
-    markdown: m.markdown,
-    toolCall: m.toolCall,
-    timestamp: m.timestamp.toISOString(),
-  }));
+  return messages
+    // Skip messages flagged `ephemeral: true` (web slash-command output like
+    // /help, /model banners, unknown-command notices). They are throwaway UI
+    // feedback and must not be re-hydrated as fake assistant replies on reload. #7137
+    .filter((m) => !m.ephemeral)
+    .map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      thinking: m.thinking,
+      markdown: m.markdown,
+      // Preserve the verbatim-user-input flag so reloaded bubbles still skip
+      // server-timestamp stripping.
+      local: m.local,
+      toolCall: m.toolCall,
+      timestamp: m.timestamp.toISOString(),
+    }));
 }

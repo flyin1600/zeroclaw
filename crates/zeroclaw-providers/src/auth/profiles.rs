@@ -54,7 +54,7 @@ impl TokenSet {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AuthProfile {
     pub id: String,
-    pub provider: String,
+    pub model_provider: String,
     pub profile_name: String,
     pub kind: AuthProfileKind,
     #[serde(default)]
@@ -75,7 +75,7 @@ impl std::fmt::Debug for AuthProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthProfile")
             .field("id", &self.id)
-            .field("provider", &self.provider)
+            .field("model_provider", &self.model_provider)
             .field("profile_name", &self.profile_name)
             .field("kind", &self.kind)
             .field("workspace_id", &self.workspace_id)
@@ -87,12 +87,12 @@ impl std::fmt::Debug for AuthProfile {
 }
 
 impl AuthProfile {
-    pub fn new_oauth(provider: &str, profile_name: &str, token_set: TokenSet) -> Self {
+    pub fn new_oauth(model_provider: &str, profile_name: &str, token_set: TokenSet) -> Self {
         let now = Utc::now();
-        let id = profile_id(provider, profile_name);
+        let id = profile_id(model_provider, profile_name);
         Self {
             id,
-            provider: provider.to_string(),
+            model_provider: model_provider.to_string(),
             profile_name: profile_name.to_string(),
             kind: AuthProfileKind::OAuth,
             account_id: None,
@@ -105,12 +105,12 @@ impl AuthProfile {
         }
     }
 
-    pub fn new_token(provider: &str, profile_name: &str, token: String) -> Self {
+    pub fn new_token(model_provider: &str, profile_name: &str, token: String) -> Self {
         let now = Utc::now();
-        let id = profile_id(provider, profile_name);
+        let id = profile_id(model_provider, profile_name);
         Self {
             id,
-            provider: provider.to_string(),
+            model_provider: model_provider.to_string(),
             profile_name: profile_name.to_string(),
             kind: AuthProfileKind::Token,
             account_id: None,
@@ -168,6 +168,12 @@ impl AuthProfilesStore {
         self.load_locked().await
     }
 
+    pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
+        let _lock = self.acquire_lock().await?;
+        let persisted = self.read_persisted_locked().await?;
+        Ok(persisted.profiles.into_keys().collect())
+    }
+
     pub async fn upsert_profile(&self, mut profile: AuthProfile, set_active: bool) -> Result<()> {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
@@ -179,7 +185,7 @@ impl AuthProfilesStore {
 
         if set_active {
             data.active_profiles
-                .insert(profile.provider.clone(), profile.id.clone());
+                .insert(profile.model_provider.clone(), profile.id.clone());
         }
 
         data.profiles.insert(profile.id.clone(), profile);
@@ -204,7 +210,7 @@ impl AuthProfilesStore {
         Ok(true)
     }
 
-    pub async fn set_active_profile(&self, provider: &str, profile_id: &str) -> Result<()> {
+    pub async fn set_active_profile(&self, model_provider: &str, profile_id: &str) -> Result<()> {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
 
@@ -213,15 +219,15 @@ impl AuthProfilesStore {
         }
 
         data.active_profiles
-            .insert(provider.to_string(), profile_id.to_string());
+            .insert(model_provider.to_string(), profile_id.to_string());
         data.updated_at = Utc::now();
         self.save_locked(&data).await
     }
 
-    pub async fn clear_active_profile(&self, provider: &str) -> Result<()> {
+    pub async fn clear_active_profile(&self, model_provider: &str) -> Result<()> {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
-        data.active_profiles.remove(provider);
+        data.active_profiles.remove(model_provider);
         data.updated_at = Utc::now();
         self.save_locked(&data).await
     }
@@ -233,10 +239,16 @@ impl AuthProfilesStore {
         let _lock = self.acquire_lock().await?;
         let mut data = self.load_locked().await?;
 
-        let profile = data
-            .profiles
-            .get_mut(profile_id)
-            .ok_or_else(|| anyhow::anyhow!("Auth profile not found: {profile_id}"))?;
+        let profile = data.profiles.get_mut(profile_id).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"profile_id": profile_id})),
+                "auth_profiles: profile not found for update"
+            );
+            anyhow::Error::msg(format!("Auth profile not found: {profile_id}"))
+        })?;
 
         updater(profile)?;
         profile.updated_at = Utc::now();
@@ -280,7 +292,20 @@ impl AuthProfilesStore {
             let token_set = match kind {
                 AuthProfileKind::OAuth => {
                     let access = access_token.ok_or_else(|| {
-                        anyhow::anyhow!("OAuth profile missing access_token: {id}")
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "profile_id": id,
+                                "missing": "access_token",
+                            })),
+                            "auth_profiles: OAuth profile missing access_token"
+                        );
+                        anyhow::Error::msg(format!("OAuth profile missing access_token: {id}"))
                     })?;
                     Some(TokenSet {
                         access_token: access,
@@ -298,7 +323,7 @@ impl AuthProfilesStore {
                 id.clone(),
                 AuthProfile {
                     id: id.clone(),
-                    provider: p.provider.clone(),
+                    model_provider: p.model_provider.clone(),
                     profile_name: p.profile_name.clone(),
                     kind,
                     account_id: p.account_id.clone(),
@@ -351,7 +376,7 @@ impl AuthProfilesStore {
             persisted.profiles.insert(
                 id.clone(),
                 PersistedAuthProfile {
-                    provider: profile.provider.clone(),
+                    model_provider: profile.model_provider.clone(),
                     profile_name: profile.profile_name.clone(),
                     kind: profile_kind_to_string(profile.kind).to_string(),
                     account_id: profile.account_id.clone(),
@@ -469,7 +494,10 @@ impl AuthProfilesStore {
     async fn acquire_lock(&self) -> Result<AuthProfileLockGuard> {
         if let Some(parent) = self.lock_path.parent() {
             fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to create lock directory at {}", parent.display())
+                format!(
+                    "Failed to create lock directory at {}",
+                    parent.display().to_string()
+                )
             })?;
         }
 
@@ -488,7 +516,16 @@ impl AuthProfilesStore {
                         fs::remove_file(&self.lock_path)
                             .await
                             .inspect(|e| {
-                                tracing::error!("Failed to remove auth profile lock file: {e:?}");
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"e": format!("{:?}", e)})),
+                                    "Failed to remove auth profile lock file: "
+                                );
                             })
                             .ok();
                         return Err(e).with_context(|| {
@@ -560,7 +597,8 @@ impl Default for PersistedAuthProfiles {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct PersistedAuthProfile {
-    provider: String,
+    #[serde(alias = "provider")]
+    model_provider: String,
     profile_name: String,
     kind: String,
     #[serde(default)]
@@ -626,8 +664,8 @@ fn parse_datetime_with_fallback(value: &str) -> DateTime<Utc> {
     parse_datetime(value).unwrap_or_else(|_| Utc::now())
 }
 
-pub fn profile_id(provider: &str, profile_name: &str) -> String {
-    format!("{}:{}", provider.trim(), profile_name.trim())
+pub fn profile_id(model_provider: &str, profile_name: &str) -> String {
+    format!("{}:{}", model_provider.trim(), profile_name.trim())
 }
 
 #[cfg(test)]
@@ -641,6 +679,31 @@ mod tests {
             profile_id("openai-codex", "default"),
             "openai-codex:default"
         );
+    }
+
+    #[test]
+    fn persisted_profile_accepts_legacy_provider_key() {
+        let raw = r#"{
+            "schema_version": 2,
+            "updated_at": "2026-07-11T00:00:00Z",
+            "active_profiles": {
+                "openai-codex": "openai-codex:default"
+            },
+            "profiles": {
+                "openai-codex:default": {
+                    "provider": "openai-codex",
+                    "profile_name": "default",
+                    "kind": "oauth",
+                    "access_token": "access-token"
+                }
+            }
+        }"#;
+
+        let parsed: PersistedAuthProfiles = serde_json::from_str(raw).unwrap();
+        let profile = parsed.profiles.get("openai-codex:default").unwrap();
+
+        assert_eq!(profile.model_provider, "openai-codex");
+        assert_eq!(profile.profile_name, "default");
     }
 
     #[test]
@@ -682,7 +745,7 @@ mod tests {
         let data = store.load().await.unwrap();
         let loaded = data.profiles.get(&profile.id).unwrap();
 
-        assert_eq!(loaded.provider, "openai-codex");
+        assert_eq!(loaded.model_provider, "openai-codex");
         assert_eq!(loaded.profile_name, "default");
         assert_eq!(loaded.account_id.as_deref(), Some("acct_123"));
         assert_eq!(
@@ -712,5 +775,142 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
+    }
+
+    #[tokio::test]
+    async fn list_profile_ids_lists_without_decrypting_or_rewriting() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), true);
+
+        let codex = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "access-xyz".into(),
+                refresh_token: Some("refresh-xyz".into()),
+                id_token: None,
+                expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+                token_type: Some("Bearer".into()),
+                scope: None,
+            },
+        );
+        let anthropic = AuthProfile::new_token("anthropic", "default", "token-abc".into());
+        store.upsert_profile(codex.clone(), true).await.unwrap();
+        store.upsert_profile(anthropic, false).await.unwrap();
+
+        let before = tokio::fs::read(store.path()).await.unwrap();
+
+        let ids = store.list_profile_ids().await.unwrap();
+        assert!(ids.iter().any(|id| id == "openai-codex:default"));
+        assert!(ids.iter().any(|id| id == "anthropic:default"));
+
+        // No decrypt-and-migrate side effect: the store bytes are untouched.
+        let after = tokio::fs::read(store.path()).await.unwrap();
+        assert_eq!(before, after, "list_profile_ids must not rewrite the store");
+    }
+
+    #[tokio::test]
+    async fn legacy_oauth_store_loads_with_flat_tokens_reconstructed() {
+        // A store written by a release before the `provider` -> `model_provider`
+        // rename: it carries the legacy `provider` key and flat OAuth token fields
+        // rather than a nested `token_set`. Loading through the real store path must
+        // map the alias and rebuild the token set, not silently yield `token_set:
+        // None` (an authenticated profile that holds no credentials).
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+
+        let legacy = r#"{
+            "schema_version": 1,
+            "updated_at": "2026-01-01T00:00:00Z",
+            "active_profiles": {
+                "openai-codex": "openai-codex:default"
+            },
+            "profiles": {
+                "openai-codex:default": {
+                    "provider": "openai-codex",
+                    "profile_name": "default",
+                    "kind": "oauth",
+                    "account_id": "acct_legacy",
+                    "workspace_id": "ws_legacy",
+                    "access_token": "legacy-access",
+                    "refresh_token": "legacy-refresh",
+                    "id_token": "legacy-id",
+                    "expires_at": "2030-01-01T00:00:00Z",
+                    "token_type": "Bearer",
+                    "scope": "openid offline_access"
+                }
+            }
+        }"#;
+        tokio::fs::write(store.path(), legacy).await.unwrap();
+
+        let data = store.load().await.unwrap();
+        let profile = data
+            .profiles
+            .get("openai-codex:default")
+            .expect("legacy profile loads");
+
+        // Legacy `provider` key resolves to the canonical field.
+        assert_eq!(profile.model_provider, "openai-codex");
+        assert_eq!(profile.kind, AuthProfileKind::OAuth);
+        assert_eq!(profile.account_id.as_deref(), Some("acct_legacy"));
+        assert_eq!(profile.workspace_id.as_deref(), Some("ws_legacy"));
+
+        // Flat token fields are reassembled into the token set.
+        let token_set = profile.token_set.as_ref().expect("flat tokens rebuilt");
+        assert_eq!(token_set.access_token, "legacy-access");
+        assert_eq!(token_set.refresh_token.as_deref(), Some("legacy-refresh"));
+        assert_eq!(token_set.id_token.as_deref(), Some("legacy-id"));
+        assert_eq!(token_set.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(token_set.scope.as_deref(), Some("openid offline_access"));
+        assert_eq!(
+            token_set.expires_at,
+            Some(
+                DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+
+        // The active-profile pointer survives the load unchanged.
+        assert_eq!(
+            data.active_profiles.get("openai-codex").map(String::as_str),
+            Some("openai-codex:default")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_token_store_loads_flat_token_field() {
+        // Token-kind sibling of the OAuth case: a legacy `provider` key with a flat
+        // `token` field (no OAuth token set) must load with the token preserved.
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+
+        let legacy = r#"{
+            "schema_version": 1,
+            "updated_at": "2026-01-01T00:00:00Z",
+            "active_profiles": {
+                "anthropic": "anthropic:default"
+            },
+            "profiles": {
+                "anthropic:default": {
+                    "provider": "anthropic",
+                    "profile_name": "default",
+                    "kind": "token",
+                    "token": "legacy-api-key"
+                }
+            }
+        }"#;
+        tokio::fs::write(store.path(), legacy).await.unwrap();
+
+        let data = store.load().await.unwrap();
+        let profile = data
+            .profiles
+            .get("anthropic:default")
+            .expect("legacy token profile loads");
+
+        assert_eq!(profile.model_provider, "anthropic");
+        assert_eq!(profile.kind, AuthProfileKind::Token);
+        assert!(profile.token_set.is_none());
+        assert_eq!(profile.token.as_deref(), Some("legacy-api-key"));
     }
 }

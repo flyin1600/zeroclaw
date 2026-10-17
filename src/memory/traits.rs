@@ -40,6 +40,7 @@ mod tests {
     #[test]
     fn memory_entry_roundtrip_preserves_optional_fields() {
         let entry = MemoryEntry {
+            principal_id: None,
             id: "id-1".into(),
             key: "favorite_language".into(),
             content: "Rust".into(),
@@ -50,6 +51,11 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

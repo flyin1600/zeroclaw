@@ -2,7 +2,6 @@ use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use std::any::Any;
 
 /// Human-readable progress observer for interactive CLI sessions.
-///
 /// This observer prints compact `>` / `<` progress lines without exposing
 /// prompt contents. It is intended to be opt-in (e.g. `--verbose`).
 pub struct VerboseObserver;
@@ -23,14 +22,18 @@ impl Observer for VerboseObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
             ObserverEvent::LlmRequest {
-                provider,
+                model_provider,
                 model,
                 messages_count,
+                channel: _,
+                agent_alias: _,
+                parent_agent_alias: _,
+                turn_id: _,
             } => {
                 eprintln!("> Thinking");
                 eprintln!(
-                    "> Send (provider={}, model={}, messages={})",
-                    provider, model, messages_count
+                    "> Send (model_provider={}, model={}, messages={})",
+                    model_provider, model, messages_count
                 );
             }
             ObserverEvent::LlmResponse {
@@ -46,6 +49,7 @@ impl Observer for VerboseObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 eprintln!("< Tool {tool} (success={success}, duration_ms={ms})");
@@ -83,46 +87,49 @@ mod tests {
     fn verbose_events_do_not_panic() {
         let obs = VerboseObserver::new();
         obs.record_event(&ObserverEvent::LlmRequest {
-            provider: "openrouter".into(),
+            parent_agent_alias: None,
+            model_provider: "openrouter".into(),
             model: "claude".into(),
             messages_count: 3,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            parent_agent_alias: None,
+            model_provider: "openrouter".into(),
             model: "claude".into(),
             duration: Duration::from_millis(12),
             success: true,
             error_message: None,
             input_tokens: Some(50),
             output_tokens: Some(25),
+            messages: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
+            parent_agent_alias: None,
             tool: "shell".into(),
+            tool_call_id: None,
             arguments: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(2),
             success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
-    }
-
-    #[test]
-    fn verbose_hand_events_do_not_panic() {
-        let obs = VerboseObserver::new();
-        obs.record_event(&ObserverEvent::HandStarted {
-            hand_name: "review".into(),
-        });
-        obs.record_event(&ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 1500,
-            findings_count: 3,
-        });
-        obs.record_event(&ObserverEvent::HandFailed {
-            hand_name: "review".into(),
-            error: "timeout".into(),
-            duration_ms: 5000,
-        });
     }
 }

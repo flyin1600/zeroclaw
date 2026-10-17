@@ -21,6 +21,24 @@ Before opening or updating a PR body, read `.github/pull_request_template.md` an
 
 This parsed structure drives how you fill, present, and edit the PR body.
 
+## Shared: Authorship Hygiene
+
+ZeroClaw PR bodies and landed commit-message tails should not include bot or AI
+attribution such as `Co-authored-by: Claude <...>`, `Co-authored-by: Codex
+<...>`, or generated footers like `Created with Claude Code` / `Generated with
+Claude Code`.
+
+Before opening a PR, scan local commit messages and the drafted PR body:
+
+```bash
+git log origin/master..HEAD --format=%B | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
+```
+
+Before showing or submitting PR text, remove bot/AI co-author trailers and
+generated tool footers. If local unpublished commits contain those footers, tell
+the user and ask before rewriting commit history. Do not rewrite a pushed branch
+or contributor branch solely for attribution cleanup without explicit approval.
+
 ---
 
 ## Mode: Open a New PR
@@ -44,20 +62,21 @@ rustc --version 2>/dev/null
 
 Also review the changed files and commit messages to understand the nature of the change (bug fix, feature, refactor, docs, chore, etc.) and which subsystems are affected.
 
-### Step 1a: Run the Validation Battery (required before drafting)
+### Step 1a: Gather Validation Evidence (required before drafting)
 
-Before drafting the PR body, actually run the commands the PR template's "Validation Evidence" section asks for. Do not paraphrase results, do not write "tests pass" from memory, do not skip on the assumption that CI will catch it. The evidence section needs literal output from a real local run:
+Before drafting the PR body, identify the evidence that covers the changed surface. Fresh required CI is valid evidence when it ran on the current head and covers the same target, feature set, and behavior boundary. Do not require duplicate local Cargo merely to repeat that coverage. Add focused local checks or manual verification for a concrete gap, such as a platform that only received compile checks, a path outside the lint job, desktop coverage that did not trigger, a release target outside the PR matrix, or stale or unavailable CI.
 
-```bash
+These are examples for Rust/code changes when the changed surface or a coverage gap calls for them:
+
+```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo build
 cargo test
 ```
 
-For docs-only changes, replace the Rust battery with markdown lint and link-integrity checks per `AGENTS.md`, and if touching bootstrap scripts add `bash -n install.sh`.
+For docs-only changes, run `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`. If touching bootstrap scripts, add `bash -n install.sh`.
 
-Capture the tail of each command's output. You will paste the relevant excerpts (last 5–10 lines, any failures, any warnings) into the PR body's Validation Evidence section. If a command fails, stop and fix the underlying issue before drafting the PR — do not draft a PR on a broken tree.
+Record the required CI checks being relied on, why they cover the change, and any known gap. For commands you run locally, capture the relevant output tail, failures, and warnings for the PR body's `How I tested` subsection. If a required check or local command fails, stop and fix the underlying issue before drafting the PR; do not draft on a broken tree.
 
 If a command is intentionally skipped (e.g., platform-blocked), note it explicitly in the evidence with a one-line reason. "Skipped" without explanation is not acceptable.
 
@@ -65,15 +84,17 @@ If the validation run emits any `WARN` / `ERROR` / `warning:` lines, investigate
 
 ### Step 2: Pre-Fill the Template
 
-When populating the "Validation Evidence" section, paste the actual tail output of the commands from Step 1a — do not paraphrase. The reviewer will be looking for literal strings to diff against their own validation run.
+When populating `How I tested`, name the fresh CI checks and local commands actually used, explain their coverage, paste relevant output tails for commands you ran, and state any remaining gap or honest skip reason. Do not present pending CI as evidence or paraphrase a local command as passing when it did not run.
 
 Using the parsed template structure and gathered context, draft a complete PR body:
 
 - For each `## ` section from the template, fill in the bullet points and fields based on context from the commits, diff, and changed files.
 - Use the field descriptions and placeholder text in the template as guidance for what each field expects.
-- For Yes/No fields, infer from the diff (e.g., if no files in `src/security/` changed, security impact is likely all No).
+- For Yes/No fields, infer from the diff (e.g., if files in `src/security/` changed, security impact is likely).
 - For required sections, always provide a substantive answer. For optional sections, fill if there's enough context, otherwise leave the template prompts in place.
 - Draft a conventional commit-style PR title based on the changes (e.g., `feat(provider): add retry budget override`, `fix(channel): handle disconnect gracefully`, `chore(ci): update workflow targets`).
+- Apply the shared authorship-hygiene check before showing or submitting the PR
+  body.
 
 ### Step 3: Present Draft for Review
 
@@ -186,9 +207,12 @@ When the user wants to sync the PR description after pushing new changes:
 
 2. Re-read the PR template. Analyze which sections are now stale based on the new changes — use the template's section names and field descriptions to identify what needs updating rather than relying on hardcoded assumptions.
 
-3. **If any of the new commits touch code (not pure docs)**, re-run the validation battery from Step 1a before updating the Validation Evidence section. Stale validation evidence is worse than no evidence — it misleads the reviewer.
+3. Reassess the evidence under Step 1a against the new head before updating `How I tested`. Re-run only the local checks whose evidence became stale or whose coverage is not supplied by fresh required CI. Stale validation evidence is worse than no evidence because it misleads the reviewer.
 
-4. Present proposed updates section-by-section and confirm before applying.
+4. Apply the shared authorship-hygiene check before showing or submitting the
+   update.
+
+5. Present proposed updates section-by-section and confirm before applying.
 
 ### Step 6: Apply Updates
 
@@ -227,6 +251,8 @@ Return the PR URL.
 - **For updates, only modify requested sections.** Preserve everything else exactly as-is.
 - **Always show diffs before applying body edits.** Present current vs proposed for each changed section.
 - **Never include personal/sensitive data** in PR content per ZeroClaw's privacy contract.
+- **Never include bot/AI attribution footers** in PR body text. Follow
+  **Shared: Authorship Hygiene** before showing or submitting PR text.
 - **For label changes**, only use labels that exist in the repository. Check with `gh label list` if unsure.
 - **Fetch the latest body before editing** to avoid clobbering concurrent changes.
 - **For new PRs**, push the branch before creating (with `-u` to set upstream tracking).

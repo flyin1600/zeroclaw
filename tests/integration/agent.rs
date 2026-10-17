@@ -1,17 +1,11 @@
 //! End-to-end integration tests for agent orchestration.
-//!
-//! These tests exercise the full agent turn cycle through the public API,
-//! using mock providers and tools to validate orchestration behavior without
-//! external service dependencies. They complement the unit tests in
-//! `src/agent/tests.rs` by running at the integration test boundary.
-//!
-//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 6)
 
 use crate::support::helpers::{
-    StaticMemoryLoader, build_agent, build_agent_xml, build_recording_agent, text_response,
+    StaticRecallMemory, build_agent, build_agent_xml, build_recording_agent, text_response,
     tool_response,
 };
-use crate::support::{CountingTool, EchoTool, MockProvider, RecordingProvider};
+use crate::support::{CountingTool, EchoTool, MockModelProvider, RecordingModelProvider};
+use std::sync::Arc;
 use zeroclaw::providers::traits::ChatMessage;
 use zeroclaw::providers::{ChatResponse, ConversationMessage, ToolCall};
 
@@ -19,22 +13,20 @@ use zeroclaw::providers::{ChatResponse, ConversationMessage, ToolCall};
 // E2E smoke tests — full agent turn cycle
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Validates the simplest happy path: user message → LLM text response.
 #[tokio::test]
 async fn e2e_simple_text_response() {
-    let provider = Box::new(MockProvider::new(vec![text_response(
-        "Hello from mock provider",
+    let model_provider = Box::new(MockModelProvider::new(vec![text_response(
+        "Hello from mock model_provider",
     )]));
-    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let mut agent = build_agent(model_provider, vec![Box::new(EchoTool)]);
 
     let response = agent.turn("hi").await.unwrap();
     assert!(!response.is_empty(), "Expected non-empty text response");
 }
 
-/// Validates single tool call → tool execution → final LLM response.
 #[tokio::test]
 async fn e2e_single_tool_call_cycle() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "echo".into(),
@@ -44,7 +36,7 @@ async fn e2e_single_tool_call_cycle() {
         text_response("Tool executed successfully"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let mut agent = build_agent(model_provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("run echo").await.unwrap();
     assert!(
         !response.is_empty(),
@@ -52,12 +44,11 @@ async fn e2e_single_tool_call_cycle() {
     );
 }
 
-/// Validates multi-step tool chain: tool A → tool B → tool C → final response.
 #[tokio::test]
 async fn e2e_multi_step_tool_chain() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "counter".into(),
@@ -73,7 +64,7 @@ async fn e2e_multi_step_tool_chain() {
         text_response("Done after 2 tool calls"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
+    let mut agent = build_agent(model_provider, vec![Box::new(counting_tool)]);
     let response = agent.turn("count twice").await.unwrap();
     assert!(
         !response.is_empty(),
@@ -82,10 +73,9 @@ async fn e2e_multi_step_tool_chain() {
     assert_eq!(*count.lock().unwrap(), 2);
 }
 
-/// Validates that the XML dispatcher path also works end-to-end.
 #[tokio::test]
 async fn e2e_xml_dispatcher_tool_call() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         ChatResponse {
             text: Some(
                 r#"<tool_call>
@@ -100,7 +90,7 @@ async fn e2e_xml_dispatcher_tool_call() {
         text_response("XML tool executed"),
     ]));
 
-    let mut agent = build_agent_xml(provider, vec![Box::new(EchoTool)]);
+    let mut agent = build_agent_xml(model_provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("test xml dispatch").await.unwrap();
     assert!(
         !response.is_empty(),
@@ -108,16 +98,15 @@ async fn e2e_xml_dispatcher_tool_call() {
     );
 }
 
-/// Validates that multiple sequential turns maintain conversation coherence.
 #[tokio::test]
 async fn e2e_multi_turn_conversation() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         text_response("First response"),
         text_response("Second response"),
         text_response("Third response"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let mut agent = build_agent(model_provider, vec![Box::new(EchoTool)]);
 
     let r1 = agent.turn("turn 1").await.unwrap();
     assert!(!r1.is_empty(), "Expected non-empty first response");
@@ -131,10 +120,9 @@ async fn e2e_multi_turn_conversation() {
     assert_ne!(r2, r3, "Sequential turn responses should be distinct");
 }
 
-/// Validates that the agent handles unknown tool names gracefully.
 #[tokio::test]
 async fn e2e_unknown_tool_recovery() {
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![ToolCall {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
@@ -144,7 +132,7 @@ async fn e2e_unknown_tool_recovery() {
         text_response("Recovered from unknown tool"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let mut agent = build_agent(model_provider, vec![Box::new(EchoTool)]);
     let response = agent.turn("call missing tool").await.unwrap();
     assert!(
         !response.is_empty(),
@@ -152,12 +140,11 @@ async fn e2e_unknown_tool_recovery() {
     );
 }
 
-/// Validates parallel tool dispatch in a single response.
 #[tokio::test]
 async fn e2e_parallel_tool_dispatch() {
     let (counting_tool, count) = CountingTool::new();
 
-    let provider = Box::new(MockProvider::new(vec![
+    let model_provider = Box::new(MockModelProvider::new(vec![
         tool_response(vec![
             ToolCall {
                 id: "tc1".into(),
@@ -175,7 +162,7 @@ async fn e2e_parallel_tool_dispatch() {
         text_response("Both tools ran"),
     ]));
 
-    let mut agent = build_agent(provider, vec![Box::new(counting_tool)]);
+    let mut agent = build_agent(model_provider, vec![Box::new(counting_tool)]);
     let response = agent.turn("run both").await.unwrap();
     assert!(
         !response.is_empty(),
@@ -188,17 +175,15 @@ async fn e2e_parallel_tool_dispatch() {
 // Multi-turn history fidelity & memory enrichment tests
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Validates that multi-turn conversation correctly accumulates history
-/// and passes growing message sequences to the provider on each turn.
 #[tokio::test]
 async fn e2e_multi_turn_history_fidelity() {
-    let (provider, recorded) = RecordingProvider::new(vec![
+    let (model_provider, recorded) = RecordingModelProvider::new(vec![
         text_response("response 1"),
         text_response("response 2"),
         text_response("response 3"),
     ]);
 
-    let mut agent = build_recording_agent(Box::new(provider), vec![], None);
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], None);
 
     let r1 = agent.turn("msg 1").await.unwrap();
     assert_eq!(r1, "response 1");
@@ -210,7 +195,7 @@ async fn e2e_multi_turn_history_fidelity() {
     assert_eq!(r3, "response 3");
 
     let requests = recorded.lock().unwrap();
-    assert_eq!(requests.len(), 3, "Provider should receive 3 requests");
+    assert_eq!(requests.len(), 3, "ModelProvider should receive 3 requests");
 
     // Request 1: system + user("msg 1")
     let req1 = &requests[0];
@@ -260,21 +245,19 @@ async fn e2e_multi_turn_history_fidelity() {
     );
 }
 
-/// Validates that a custom MemoryLoader injects RAG context into user
-/// messages before they reach the provider.
 #[tokio::test]
 async fn e2e_memory_enrichment_injects_context() {
-    let (provider, recorded) = RecordingProvider::new(vec![text_response("enriched response")]);
+    let (model_provider, recorded) =
+        RecordingModelProvider::new(vec![text_response("enriched response")]);
 
-    let memory_context = "[Memory context]\n- user_name: test_user\n[/Memory context]\n\n";
-    let loader = StaticMemoryLoader::new(memory_context);
+    let mem = Arc::new(StaticRecallMemory::new(&[("user_name", "test_user")]));
 
-    let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(mem));
 
     let response = agent.turn("hello").await.unwrap();
     assert_eq!(response, "enriched response");
 
-    // Provider received enriched message
+    // ModelProvider received enriched message
     let requests = recorded.lock().unwrap();
     assert_eq!(requests.len(), 1);
     let user_msg = requests[0].iter().find(|m| m.role == "user").unwrap();
@@ -293,29 +276,28 @@ async fn e2e_memory_enrichment_injects_context() {
         user_msg.content,
     );
 
-    // Agent history also stores enriched message
+    // Agent history stores the CLEAN message: the engine injects the
+    // memory block per turn onto the outgoing request, and it is not
+    // persisted into conversation history (no stale-block accumulation).
     let history = agent.history();
     match &history[1] {
         ConversationMessage::Chat(c) => {
             assert_eq!(c.role, "user");
-            assert!(c.content.contains("[Memory context]"));
+            assert!(!c.content.contains("[Memory context]"));
             assert!(c.content.ends_with("hello"));
         }
         other => panic!("Expected Chat variant for user message, got: {other:?}"),
     }
 }
 
-/// Validates multi-turn conversation with memory enrichment: every user
-/// message is enriched, and the provider sees the full enriched history.
 #[tokio::test]
 async fn e2e_multi_turn_with_memory_enrichment() {
-    let (provider, recorded) =
-        RecordingProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
+    let (model_provider, recorded) =
+        RecordingModelProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
-    let memory_context = "[Memory context]\n- project: zeroclaw\n[/Memory context]\n\n";
-    let loader = StaticMemoryLoader::new(memory_context);
+    let mem = Arc::new(StaticRecallMemory::new(&[("project", "zeroclaw")]));
 
-    let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(mem));
 
     let r1 = agent.turn("first question").await.unwrap();
     assert_eq!(r1, "answer 1");
@@ -332,15 +314,15 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert!(req1_user.content.contains("project: zeroclaw"));
     assert!(req1_user.content.ends_with("first question"));
 
-    // Turn 2: both user messages enriched, assistant from turn 1 present
+    // Turn 2: only the CURRENT turn's user message is enriched. The
+    // engine injects per turn onto the outgoing request; earlier user
+    // messages stay clean in history (no stale-block accumulation).
     let req2_users: Vec<&ChatMessage> = requests[1].iter().filter(|m| m.role == "user").collect();
     assert_eq!(req2_users.len(), 2, "Request 2 should have 2 user messages");
 
-    // Turn 1 user message still enriched in history
-    assert!(req2_users[0].content.contains("[Memory context]"));
+    assert!(!req2_users[0].content.contains("[Memory context]"));
     assert!(req2_users[0].content.ends_with("first question"));
 
-    // Turn 2 user message also enriched
     assert!(req2_users[1].content.contains("[Memory context]"));
     assert!(req2_users[1].content.ends_with("second question"));
 
@@ -356,15 +338,14 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     assert_eq!(agent.history().len(), 5);
 }
 
-/// Validates that empty memory context does not prepend memory text.
-/// A per-turn datetime prefix may still be present.
 #[tokio::test]
 async fn e2e_empty_memory_context_passthrough() {
-    let (provider, recorded) = RecordingProvider::new(vec![text_response("plain response")]);
+    let (model_provider, recorded) =
+        RecordingModelProvider::new(vec![text_response("plain response")]);
 
-    let loader = StaticMemoryLoader::new("");
+    let mem = Arc::new(StaticRecallMemory::new(&[]));
 
-    let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));
+    let mut agent = build_recording_agent(Box::new(model_provider), vec![], Some(mem));
 
     let response = agent.turn("hello").await.unwrap();
     assert_eq!(response, "plain response");

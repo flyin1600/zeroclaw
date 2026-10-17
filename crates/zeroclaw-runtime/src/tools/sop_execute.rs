@@ -2,16 +2,19 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
-use tracing::warn;
 
 use crate::sop::types::{SopEvent, SopRunAction, SopTriggerSource};
 use crate::sop::{SopAuditLogger, SopEngine};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Manually trigger an SOP by name. Returns the run ID and first step instruction.
 pub struct SopExecuteTool {
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
+    /// The agent this tool instance belongs to. Recorded on runs it starts, so a
+    /// procedure that parks at an approval can still resume as the agent that
+    /// started it once the turn is gone.
+    initiator: Option<String>,
 }
 
 impl SopExecuteTool {
@@ -19,7 +22,16 @@ impl SopExecuteTool {
         Self {
             engine,
             audit: None,
+            initiator: None,
         }
+    }
+
+    /// Record `alias` as the initiating agent on runs this tool starts.
+    #[must_use]
+    pub fn with_initiator(mut self, alias: impl Into<String>) -> Self {
+        let alias = alias.into();
+        self.initiator = (!alias.trim().is_empty()).then_some(alias);
+        self
     }
 
     pub fn with_audit(mut self, audit: Arc<SopAuditLogger>) -> Self {
@@ -56,10 +68,17 @@ impl Tool for SopExecuteTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let sop_name = args
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'name' parameter"))?;
+        let sop_name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "name"})),
+                "tool argument validation failed"
+            );
+
+            anyhow::Error::msg("Missing 'name' parameter")
+        })?;
 
         let payload = args
             .get("payload")
@@ -75,12 +94,19 @@ impl Tool for SopExecuteTool {
 
         // Lock engine, start run, snapshot run for audit, then drop lock
         let (action, run_snapshot) = {
-            let mut engine = self
-                .engine
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Engine lock poisoned: {e}"))?;
+            let mut engine = self.engine.lock().map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "SOP engine lock poisoned"
+                );
 
-            match engine.start_run(sop_name, event) {
+                anyhow::Error::msg(format!("Engine lock poisoned: {e}"))
+            })?;
+
+            match engine.start_run_owned(sop_name, event, self.initiator.as_deref()) {
                 Ok(action) => {
                     let run_id = action_run_id(&action);
                     let snapshot = run_id.and_then(|id| engine.get_run(id).cloned());
@@ -95,7 +121,21 @@ impl Tool for SopExecuteTool {
             && let Some(ref run) = run_snapshot
             && let Err(e) = audit.log_run_start(run).await
         {
-            warn!("SOP audit log_run_start failed: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "SOP audit log_run_start failed"
+            );
+        }
+
+        if let Ok(ref action) = action {
+            crate::sop::executor::enqueue_live_action(
+                Arc::clone(&self.engine),
+                self.audit.clone(),
+                action,
+            );
         }
 
         match action {
@@ -114,6 +154,9 @@ impl Tool for SopExecuteTool {
                     SopRunAction::Completed { run_id, sop_name } => {
                         format!("SOP '{sop_name}' run {run_id} completed immediately (no steps).")
                     }
+                    SopRunAction::Cancelled { run_id, sop_name } => {
+                        format!("SOP '{sop_name}' run {run_id} was cancelled.")
+                    }
                     SopRunAction::Failed { run_id, reason, .. } => {
                         format!("SOP run {run_id} failed: {reason}")
                     }
@@ -129,16 +172,24 @@ impl Tool for SopExecuteTool {
                             step.title
                         )
                     }
+                    SopRunAction::Pending {
+                        run_id,
+                        step,
+                        reason,
+                        ..
+                    } => {
+                        format!("SOP run {run_id} pending before step {step}: {reason}")
+                    }
                 };
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Failed to start SOP: {e}")),
             }),
         }
@@ -151,9 +202,11 @@ fn action_run_id(action: &SopRunAction) -> Option<&str> {
         SopRunAction::ExecuteStep { run_id, .. }
         | SopRunAction::WaitApproval { run_id, .. }
         | SopRunAction::Completed { run_id, .. }
+        | SopRunAction::Cancelled { run_id, .. }
         | SopRunAction::Failed { run_id, .. }
         | SopRunAction::DeterministicStep { run_id, .. }
-        | SopRunAction::CheckpointWait { run_id, .. } => Some(run_id),
+        | SopRunAction::CheckpointWait { run_id, .. }
+        | SopRunAction::Pending { run_id, .. } => Some(run_id),
     }
 }
 
@@ -183,6 +236,7 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
                 SopStep {
                     number: 2,
@@ -192,12 +246,17 @@ mod tests {
                     requires_confirmation: false,
                     kind: SopStepKind::default(),
                     schema: None,
+                    ..SopStep::default()
                 },
             ],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
             deterministic: false,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+            decision: None,
         }
     }
 

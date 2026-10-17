@@ -1,11 +1,4 @@
-//! TG7: Provider Schema Conformance Tests
-//!
-//! Prevents: Pattern 7 — External schema compatibility bugs (7% of user bugs).
-//! Issues: #769, #843
-//!
-//! Tests request/response serialization to verify required fields are present
-//! for each provider's API specification. Validates ChatMessage, ChatResponse,
-//! ToolCall, and AuthStyle serialization contracts.
+//! TG7: ModelProvider Schema Conformance Tests
 
 use zeroclaw::providers::compatible::AuthStyle;
 use zeroclaw::providers::traits::{ChatMessage, ChatResponse, ToolCall};
@@ -67,7 +60,7 @@ fn chat_message_json_roundtrip() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ToolCall serialization (#843 - tool_call_id field)
+// ToolCall serialization- tool_call_id field)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -250,46 +243,50 @@ fn auth_style_custom_header() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Provider naming consistency
+// ModelProvider naming consistency
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn provider_construction_with_different_names() {
-    use zeroclaw::providers::compatible::OpenAiCompatibleProvider;
+    use zeroclaw::providers::compatible::OpenAiCompatibleModelProvider;
 
     // Construction with various names should succeed
-    let _p1 = OpenAiCompatibleProvider::new(
-        "DeepSeek",
-        "https://api.deepseek.com",
-        Some("test-key"),
-        AuthStyle::Bearer,
-    );
-    let _p2 =
-        OpenAiCompatibleProvider::new("deepseek", "https://api.test.com", None, AuthStyle::Bearer);
+    let _p1 = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("DeepSeek")
+        .base_url("https://api.deepseek.com")
+        .credential(Some("test-key"))
+        .auth_style(AuthStyle::Bearer)
+        .build();
+    let _p2 = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("deepseek")
+        .base_url("https://api.test.com")
+        .credential(None)
+        .auth_style(AuthStyle::Bearer)
+        .build();
 }
 
 #[test]
 fn provider_construction_with_different_auth_styles() {
-    use zeroclaw::providers::compatible::OpenAiCompatibleProvider;
+    use zeroclaw::providers::compatible::OpenAiCompatibleModelProvider;
 
-    let _bearer = OpenAiCompatibleProvider::new(
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::Bearer,
-    );
-    let _xapi = OpenAiCompatibleProvider::new(
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::XApiKey,
-    );
-    let _custom = OpenAiCompatibleProvider::new(
-        "Test",
-        "https://api.test.com",
-        Some("key"),
-        AuthStyle::Custom("X-My-Auth".into()),
-    );
+    let _bearer = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("Test")
+        .base_url("https://api.test.com")
+        .credential(Some("key"))
+        .auth_style(AuthStyle::Bearer)
+        .build();
+    let _xapi = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("Test")
+        .base_url("https://api.test.com")
+        .credential(Some("key"))
+        .auth_style(AuthStyle::XApiKey)
+        .build();
+    let _custom = OpenAiCompatibleModelProvider::builder("test")
+        .display_name("Test")
+        .base_url("https://api.test.com")
+        .credential(Some("key"))
+        .auth_style(AuthStyle::Custom("X-My-Auth".into()))
+        .build();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
